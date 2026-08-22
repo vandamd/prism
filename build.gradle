@@ -1,0 +1,17 @@
+buildscript {
+    ext.kotlin_version = "2.2.10"
+
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath "com.android.tools.build:gradle:9.0.1"
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+plugins {
+    id "org.jetbrains.kotlin.plugin.compose" version "2.2.10" apply false
+}

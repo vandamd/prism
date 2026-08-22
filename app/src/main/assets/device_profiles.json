@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "tlp301-00ww-1-440000",
+      "product": {
+        "device": "LightPhoneIII",
+        "model": "TLP301",
+        "manufacturer": "Light",
+        "board": "LightPhoneIII",
+        "platform": "parrot",
+        "hardware": "qcom",
+        "soc_model": "SM4450",
+        "soc_manufacturer": "QTI"
+      },
+      "system": {
+        "display_id": "00WW_1_440000",
+        "build_id": "UKQ1.240321.001",
+        "incremental": "00WW_1_440000",
+        "release": "14",
+        "sdk": 34,
+        "security_patch": "2025-03-01",
+        "fingerprint": "Light/LightPhoneIII/LightPhoneIII:14/UKQ1.240321.001/00WW_1_440000:user/release-keys"
+      },
+      "kernel": {
+        "release": "5.10.198-android12-9-g1a2636627c17",
+        "build": "#1 SMP PREEMPT Tue Jun 25 13:43:08 UTC 2024",
+        "architecture": "arm64",
+        "page_size": 4096,
+        "va_bits": 39,
+        "credential_layout": {
+          "cred_group_info_offset": "0x90",
+          "cred_rcu_offset": "0x98",
+          "cred_security_offset": "0x78",
+          "cred_user_ns_offset": "0x88",
+          "cred_user_offset": "0x80",
+          "task_real_cred_offset": "0x778",
+          "task_cred_offset": "0x780",
+          "debug_credentials": false,
+          "randstruct": false,
+          "shell_securebits": 47,
+          "ucounts_present": false
+        },
+        "ctlbuf_repair": {
+          "allocation_size": 128,
+          "saved_x23_from_frame_pointer": 56,
+          "sendmsg_return_offset": "0x240"
+        },
+        "image_sha256": "9b62cc985b0ab4f1a344e44f4fcccf3d40aa9de5b7916178694e3f7fe0f7a8c5",
+        "link_address": "0xffffffc008000000",
+        "symbols": {
+          "____sys_sendmsg": "0x0129d464",
+          "unix_dgram_sendmsg": "0x015139f4",
+          "unix_dgram_sendmsg_cfi_jt": "0x0183d070",
+          "eventfd_fops": "0x02156800",
+          "fair_sched_class": "0x022e6bc0",
+          "init_task": "0x0278bec0",
+          "init_cred": "0x027a0ae0",
+          "selinux_state": "0x02a30b98",
+          "selinux_blob_sizes": "0x022e81b8",
+          "binder_procs": "0x02a61e90"
+        }
+      },
+      "boot": {
+        "header_version": 4,
+        "header_size": 1584,
+        "os_version": "12.0.0",
+        "os_patch_level": "2025-03",
+        "partition_size": 100663296,
+        "original_image_size": 48705536,
+        "partition_sha256": "ae2f5a99048d8ed2c9847b14a4d09d385c8dbfc8c849d57d9abb9d544c974868",
+        "kernel_size": 46775820,
+        "ramdisk_size": 1921919,
+        "ramdisk_compression": "lz4",
+        "ramdisk_sha256": "23332eab88fd1907b04c2c2884cbd11c67f49d23273cbcde5aafb96c29307650",
+        "fingerprint": "Light/LightPhoneIII/LightPhoneIII:12/SKQ1.240314.001/00WW_1_440000:user/release-keys",
+        "avb": {
+          "vbmeta_offset": 48705536,
+          "vbmeta_size": 896,
+          "vbmeta_digest_sha256": "97c484ef0d9f49592012536a2558f8b10ad71d837e953cb7349b9f2fe321efb3",
+          "hash_salt": "12584d2e3c2bc674e37eb9280143b90ae26e9f39028ced07acbb37b42ec3aff7",
+          "hash_digest": "b3629f3948beba7db073c1575ef6276c3c7b1f04c91c30ef60dd658035917204"
+        }
+      },
+      "required_boot_state": {
+        "verified_boot": "green",
+        "flash_locked": true,
+        "virtual_ab": true,
+        "dynamic_partitions": true
+      }
+    }
+  ]
+}

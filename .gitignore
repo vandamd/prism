@@ -1,0 +1,19 @@
+.gradle/
+.kotlin/
+.idea/
+.DS_Store
+local.properties
+**/.cxx/
+**/build/
+*.apk
+*.aab
+*.img
+captures/
+artifacts/
+/tools/
+/work/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

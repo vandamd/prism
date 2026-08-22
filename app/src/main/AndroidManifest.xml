@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+        <package android:name="com.resukisu.resukisu" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_prism"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Prism">
+        <activity
+            android:name=".PrismActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Prism.SplashScreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <service
+            android:name=".HarnessService"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
+        <service
+            android:name=".PrismAppBridgeService"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:stopWithTask="false" />
+
+        <service
+            android:name=".OwnerService"
+            android:exported="false"
+            android:process=":owner" />
+        <service
+            android:name=".OwnerService2"
+            android:exported="false"
+            android:process=":owner2" />
+
+        <service
+            android:name=".BatchClientService"
+            android:exported="false"
+            android:process=":client" />
+        <service
+            android:name=".BatchClient2Service"
+            android:exported="false"
+            android:process=":client2" />
+
+        <service
+            android:name=".RawTargetService"
+            android:exported="false"
+            android:process=":target" />
+
+        <service
+            android:name=".RawBClientService"
+            android:exported="false"
+            android:process=":rawclient" />
+        <service
+            android:name=".RawBClient1Service"
+            android:exported="false"
+            android:process=":rawclient1" />
+        <service
+            android:name=".RawBClient2Service"
+            android:exported="false"
+            android:process=":rawclient2" />
+        <service
+            android:name=".RawBClient3Service"
+            android:exported="false"
+            android:process=":rawclient3" />
+        <service
+            android:name=".RawBClient4Service"
+            android:exported="false"
+            android:process=":rawclient4" />
+        <service
+            android:name=".RawBClient5Service"
+            android:exported="false"
+            android:process=":rawclient5" />
+        <service
+            android:name=".RawBClient6Service"
+            android:exported="false"
+            android:process=":rawclient6" />
+        <service
+            android:name=".RawBClient7Service"
+            android:exported="false"
+            android:process=":rawclient7" />
+        <service
+            android:name=".RawBClient8Service"
+            android:exported="false"
+            android:process=":rawclient8" />
+        <service
+            android:name=".RawBClient9Service"
+            android:exported="false"
+            android:process=":rawclient9" />
+        <service
+            android:name=".RawBClient10Service"
+            android:exported="false"
+            android:process=":rawclient10" />
+        <service
+            android:name=".RawBClient11Service"
+            android:exported="false"
+            android:process=":rawclient11" />
+        <service
+            android:name=".RawBClient12Service"
+            android:exported="false"
+            android:process=":rawclient12" />
+        <service
+            android:name=".RawBClient13Service"
+            android:exported="false"
+            android:process=":rawclient13" />
+        <service
+            android:name=".RawBClient14Service"
+            android:exported="false"
+            android:process=":rawclient14" />
+        <service
+            android:name=".RawBClient15Service"
+            android:exported="false"
+            android:process=":rawclient15" />
+        <service
+            android:name=".RawBClient16Service"
+            android:exported="false"
+            android:process=":rawclient16" />
+        <service
+            android:name=".RawBClient17Service"
+            android:exported="false"
+            android:process=":rawclient17" />
+        <service
+            android:name=".RawBClient18Service"
+            android:exported="false"
+            android:process=":rawclient18" />
+
+        <service
+            android:name=".AnchorHolderService"
+            android:exported="false"
+            android:process=":anchor" />
+
+        <service
+            android:name=".IsolatedRefService"
+            android:exported="false"
+            android:isolatedProcess="true" />
+    </application>
+</manifest>

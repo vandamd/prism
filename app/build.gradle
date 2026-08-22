@@ -1,0 +1,73 @@
+apply plugin: "com.android.application"
+apply plugin: "org.jetbrains.kotlin.plugin.compose"
+
+android {
+    namespace "com.vandam.prism"
+    compileSdk 35
+    ndkVersion "28.2.13676358"
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    defaultConfig {
+        applicationId "com.vandam.prism"
+        minSdk 34
+        maxSdk {
+            version = release(34)
+        }
+        targetSdk 28
+        versionCode 1
+        versionName "1.0.0"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -Wall -Wextra -Werror"
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    buildFeatures {
+        aidl true
+        buildConfig true
+        compose true
+    }
+
+    lint {
+        disable "ExpiredTargetSdkVersion"
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    implementation "androidx.core:core-ktx:1.15.0"
+    implementation "androidx.core:core-splashscreen:1.2.0"
+    implementation "androidx.activity:activity-compose:1.9.3"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7"
+    implementation platform("androidx.compose:compose-bom:2024.12.01")
+    implementation "androidx.compose.material:material"
+    implementation "androidx.compose.ui:ui"
+    implementation "androidx.compose.ui:ui-tooling-preview"
+    implementation "dev.rikka.shizuku:api:13.1.5"
+    implementation "dev.rikka.shizuku:provider:13.1.5"
+
+    debugImplementation "androidx.compose.ui:ui-tooling"
+}
