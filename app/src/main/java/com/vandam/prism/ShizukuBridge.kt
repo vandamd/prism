@@ -3,10 +3,13 @@ package com.vandam.prism
 import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import java.io.File
 import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
@@ -15,6 +18,9 @@ import rikka.shizuku.Shizuku
 class ShizukuBridge(context: Context) {
     private val context = context.applicationContext
     private val component = ComponentName(context.packageName, PrismUserService::class.java.name)
+    private val userServiceVersion =
+        (context.applicationInfo.sourceDir.hashCode() and Int.MAX_VALUE)
+            .takeIf { it != 0 } ?: BuildConfig.VERSION_CODE
 
     fun isAvailable(): Boolean = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
 
@@ -37,8 +43,9 @@ class ShizukuBridge(context: Context) {
                         .daemon(false)
                         .processNameSuffix("prism_shell")
                         .debuggable(false)
-                        .version(BuildConfig.VERSION_CODE)
+                        .version(userServiceVersion)
                         .tag("prism-preflight")
+                val unbindScheduled = AtomicBoolean()
                 val connection =
                     object : ServiceConnection {
                         override fun onServiceConnected(
@@ -51,7 +58,7 @@ class ShizukuBridge(context: Context) {
                                         .asInterface(service)
                                         .preflight(randomNonce())
                                 }.getOrElse { "status=fail reason=${it.javaClass.simpleName}" }
-                            runCatching { Shizuku.unbindUserService(arguments, this, true) }
+                            scheduleUnbind(arguments, this, true, unbindScheduled)
                             if (continuation.isActive) continuation.resume(result)
                         }
 
@@ -62,7 +69,7 @@ class ShizukuBridge(context: Context) {
                         }
                     }
                 continuation.invokeOnCancellation {
-                    runCatching { Shizuku.unbindUserService(arguments, connection, true) }
+                    scheduleUnbind(arguments, connection, true, unbindScheduled)
                 }
                 runCatching { Shizuku.bindUserService(arguments, connection) }
                     .onFailure {
@@ -186,6 +193,7 @@ class ShizukuBridge(context: Context) {
         withTimeout(15_000L) {
             suspendCancellableCoroutine { continuation ->
                 val arguments = serviceArguments()
+                val unbindScheduled = AtomicBoolean()
                 val connection =
                     object : ServiceConnection {
                         override fun onServiceConnected(
@@ -195,7 +203,7 @@ class ShizukuBridge(context: Context) {
                             val result =
                                 runCatching { action(IPrismUserService.Stub.asInterface(service)) }
                                     .getOrElse { "status=fail reason=${it.javaClass.simpleName}" }
-                            runCatching { Shizuku.unbindUserService(arguments, this, false) }
+                            scheduleUnbind(arguments, this, false, unbindScheduled)
                             if (continuation.isActive) continuation.resume(result)
                         }
 
@@ -206,7 +214,7 @@ class ShizukuBridge(context: Context) {
                         }
                     }
                 continuation.invokeOnCancellation {
-                    runCatching { Shizuku.unbindUserService(arguments, connection, false) }
+                    scheduleUnbind(arguments, connection, false, unbindScheduled)
                 }
                 runCatching { Shizuku.bindUserService(arguments, connection) }
                     .onFailure {
@@ -217,12 +225,24 @@ class ShizukuBridge(context: Context) {
             }
         }
 
+    private fun scheduleUnbind(
+        arguments: Shizuku.UserServiceArgs,
+        connection: ServiceConnection,
+        remove: Boolean,
+        scheduled: AtomicBoolean,
+    ) {
+        if (!scheduled.compareAndSet(false, true)) return
+        mainHandler.post {
+            runCatching { Shizuku.unbindUserService(arguments, connection, remove) }
+        }
+    }
+
     private fun serviceArguments(): Shizuku.UserServiceArgs =
         Shizuku.UserServiceArgs(component)
             .daemon(true)
             .processNameSuffix("prism_activation")
             .debuggable(false)
-            .version(BuildConfig.VERSION_CODE)
+            .version(userServiceVersion)
             .tag("prism-activation")
 
     companion object {
@@ -231,6 +251,7 @@ class ShizukuBridge(context: Context) {
         private const val PENDING_SESSION = "session"
         private const val PENDING_BOOT_ID = "boot-id"
         private const val PENDING_STARTED_AT = "started-at-elapsed-millis"
+        private val mainHandler = Handler(Looper.getMainLooper())
         private val BUSY_PREARM = Regex(
             "^status=fail stage=app-bridge-prearm reason=busy " +
                 "session=([0-9a-f]{64}) boot_id=" +
