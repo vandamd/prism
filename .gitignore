@@ -10,7 +10,6 @@ local.properties
 *.img
 captures/
 artifacts/
-/tools/
 /work/
 
 # Python

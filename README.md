@@ -13,7 +13,7 @@ Root for the Light Phone III. It uses CVE-2024-46740 and integrates with ReSukiS
 
 ## Installation
 
-The latest `.apk` file is available in [releases](https://github.com/vandamd/light-side-of-the-moon/releases/latest).
+The latest `.apk` file is available in [releases](https://github.com/vandamd/prism/releases/latest).
 
 ## Getting started
 
