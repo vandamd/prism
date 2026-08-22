@@ -31,6 +31,19 @@ The latest `.apk` file is available in [releases](https://github.com/vandamd/pri
 - An unsuccessful attempt may restart the phone automatically. This is a normal safety measure and does not erase your data. Start Shizuku again after the phone boots, then retry. A successful activation does not restart the phone.
 - For Shizuku's wireless pairing `adb shell cmd statusbar expand-notifications` may be useful.
 
+## Collecting failure logs
+
+After an unsuccessful attempt or safety restart, logs can be obtained with:
+
+```sh
+adb pull /data/local/tmp/prism-controller.trace .
+adb exec-out run-as com.vandam.prism cat files/direct.result > direct.result
+adb exec-out run-as com.vandam.prism cat files/chain.progress > chain.progress
+adb exec-out run-as com.vandam.prism cat files/app-bridge.failure > app-bridge.failure
+```
+
+`app-bridge.failure` may be empty when no bridge failure was recorded.
+
 ## Building
 
 ```

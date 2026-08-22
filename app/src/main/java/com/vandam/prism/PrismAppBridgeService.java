@@ -315,7 +315,7 @@ public final class PrismAppBridgeService extends Service {
                         currentBootId)) {
                     return "status=fail stage=app-bridge-close reason=storage";
                 }
-                if (receipted && !clearPidScopedRawClientResults()) {
+                if (receipted && !clearTransientResultFiles()) {
                     android.util.Log.w(
                             "PrismActivation",
                             "Successful diagnostics cleanup was incomplete");
@@ -824,8 +824,11 @@ public final class PrismAppBridgeService extends Service {
                             TRUSTED_LOCAL.remove();
                         }
                         return;
-                    } catch (EOFException | SocketTimeoutException ignored) {
+                    } catch (EOFException | SocketTimeoutException exception) {
                         if (authenticated) {
+                            recordBridgeFailure(
+                                    "authenticated-read-" +
+                                            exception.getClass().getSimpleName());
                             return;
                         }
                         // Ignore unauthenticated clients until the bounded deadline.
@@ -835,6 +838,8 @@ public final class PrismAppBridgeService extends Service {
         } catch (EOFException ignored) {
             // The shell controller closed its bounded session.
         } catch (Exception exception) {
+            recordBridgeFailure(
+                    "server-" + exception.getClass().getSimpleName());
             android.util.Log.e("PrismActivation", "App bridge socket failed", exception);
         } finally {
             synchronized (lock) {
@@ -1467,20 +1472,44 @@ public final class PrismAppBridgeService extends Service {
                 return false;
             }
         }
-        return clearPidScopedRawClientResults();
+        return clearTransientResultFiles();
     }
 
-    private boolean clearPidScopedRawClientResults() {
+    private void recordBridgeFailure(String reason) {
+        synchronized (lock) {
+            if (!rootChainStarted) {
+                return;
+            }
+        }
+        try {
+            writeAtomic(
+                    "app-bridge.failure",
+                    android.os.SystemClock.elapsedRealtime() + " " + reason);
+        } catch (Exception exception) {
+            android.util.Log.e(
+                    "PrismActivation",
+                    "App bridge failure evidence could not be stored",
+                    exception);
+        }
+    }
+
+    private boolean clearTransientResultFiles() {
         File[] files = getFilesDir().listFiles();
         if (files == null) {
             return false;
         }
-        boolean cleared = true;
-        String prefix = "raw-client.result.";
+        File bridgeFailure = new File(getFilesDir(), "app-bridge.failure");
+        boolean cleared = !bridgeFailure.exists() || bridgeFailure.delete();
+        String rawPrefix = "raw-client.result.";
+        String atomicPrefix = "direct.result.tmp.";
         for (File file : files) {
             String name = file.getName();
-            if (name.startsWith(prefix) &&
-                    name.substring(prefix.length()).matches("[1-9][0-9]*") &&
+            boolean rawResult = name.startsWith(rawPrefix) &&
+                    name.substring(rawPrefix.length()).matches("[1-9][0-9]*");
+            boolean atomicResidue = name.startsWith(atomicPrefix) &&
+                    name.substring(atomicPrefix.length()).matches(
+                            "[1-9][0-9]*\\.[1-9][0-9]*");
+            if ((rawResult || atomicResidue) &&
                     !file.delete()) {
                 cleared = false;
             }

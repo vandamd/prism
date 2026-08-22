@@ -595,11 +595,9 @@ public final class HarnessService extends Service {
 
     private void publish(String result) {
         Log.i(TAG, result);
-        File output = new File(getFilesDir(), "direct.result");
-        try (FileOutputStream stream = new FileOutputStream(output, false)) {
-            stream.write((result + "\n").getBytes(StandardCharsets.UTF_8));
-            stream.getFD().sync();
-        } catch (IOException exception) {
+        try {
+            writePrivateAtomic("direct.result", result);
+        } catch (Exception exception) {
             Log.e(TAG, "result-write", exception);
         }
     }
