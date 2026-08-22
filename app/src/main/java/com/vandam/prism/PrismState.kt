@@ -12,6 +12,7 @@ enum class PrismAction {
 
 enum class RootStatus(val displayName: String) {
     Checking("Checking"),
+    Unknown("Unknown"),
     Inactive("Inactive"),
     Activating("Activating"),
     Active("Active"),

@@ -136,6 +136,7 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
             val currentActivation = mutableState.value.activation ?: return
+            if (parsed.terminal) activationJob = null
             mutableState.value =
                 mutableState.value.copy(
                     rootStatus =
@@ -153,20 +154,18 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     activationVisible = parsed.phase != ActivationPhase.Succeeded,
                     action =
-                        if (parsed.phase == ActivationPhase.Succeeded) {
-                            PrismAction.OpenReSukiSU
-                        } else {
-                            mutableState.value.action
+                        when (parsed.phase) {
+                            ActivationPhase.Working -> mutableState.value.action
+                            ActivationPhase.Succeeded -> PrismAction.OpenReSukiSU
+                            ActivationPhase.Failed -> PrismAction.Retry
                         },
                     actionLabel =
-                        if (parsed.phase == ActivationPhase.Succeeded) {
-                            "Open ReSukiSU"
-                        } else {
-                            mutableState.value.actionLabel
+                        when (parsed.phase) {
+                            ActivationPhase.Working -> mutableState.value.actionLabel
+                            ActivationPhase.Succeeded -> "Open ReSukiSU"
+                            ActivationPhase.Failed -> "Retry"
                         },
-                    actionEnabled =
-                        parsed.phase == ActivationPhase.Succeeded ||
-                            mutableState.value.actionEnabled,
+                    actionEnabled = parsed.phase != ActivationPhase.Working,
                 )
             if (parsed.terminal) return
             delay(ACTIVATION_POLL_MILLIS)
@@ -224,9 +223,13 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun showActivationFailure(message: String) {
         val previous = mutableState.value.activation ?: return
+        activationJob = null
         mutableState.value =
             mutableState.value.copy(
                 rootStatus = RootStatus.Inactive,
+                action = PrismAction.Retry,
+                actionLabel = "Retry",
+                actionEnabled = true,
                 activation =
                     ActivationState(
                         lines = previous.lines + "[-] $message",
@@ -298,7 +301,8 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
                 when {
                     !supported -> RootStatus.Unsupported
                     shizukuInspection.rootActive -> RootStatus.Active
-                    else -> RootStatus.Inactive
+                    shizukuInspection.status == ShizukuStatus.Running -> RootStatus.Inactive
+                    else -> RootStatus.Unknown
                 },
             shizukuStatus = shizukuInspection.status,
             reSukiSUStatus = reSukiSUStatus,
