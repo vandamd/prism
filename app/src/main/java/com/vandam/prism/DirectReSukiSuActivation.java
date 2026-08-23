@@ -243,7 +243,8 @@ final class DirectReSukiSuActivation {
                             : failure.getMessage());
         } catch (Exception exception) {
             controllerTrace("controller-exception type=" +
-                    exception.getClass().getSimpleName());
+                    exception.getClass().getSimpleName() + " message=" +
+                    traceToken(exception.getMessage()));
             if (safeResetDurable) {
                 reporter.log("Safe reset remains pending: " +
                         exception.getClass().getSimpleName());
@@ -345,20 +346,31 @@ final class DirectReSukiSuActivation {
             }
             String result = readApp(PrismAppBridgeService.SIGNAL_RESULT);
             if (result.startsWith("status=") && !rootActionComplete) {
-                controllerTrace("chain-result-observed");
                 String token = readApp(
                         PrismAppBridgeService.SIGNAL_PROC_TEARDOWN_TOKEN);
                 ActivationProofs.InitialAcquisitionMissProof proof =
                         ActivationProofs.parseInitialAcquisitionMiss(
                                 result, progress, token);
+                boolean safeMiss = isSafeMiss(progress, result);
+                controllerTrace("chain-result-observed result_sha256=" +
+                        sha256(result) + " result_bytes=" +
+                        result.getBytes(StandardCharsets.UTF_8).length +
+                        " progress_sha256=" + sha256(progress) +
+                        " progress_bytes=" +
+                        progress.getBytes(StandardCharsets.UTF_8).length +
+                        " initial_miss=" + (proof != null ? 1 : 0) +
+                        " safe_miss=" + (safeMiss ? 1 : 0));
                 if (proof != null) {
                     controllerTrace("process-teardown-proof-parsed");
                     require(proof.bindsTo(
                                     bridgeNonce, bootId, helperPid, helperStart),
                             "process-teardown-token", true,
                             "The process teardown token is invalid");
+                    String teardownArm = app.validateProcessTeardown(token);
+                    controllerTrace("process-teardown-arm-result response=[" +
+                            teardownArm + "]");
                     requirePass(
-                            app.validateProcessTeardown(token),
+                            teardownArm,
                             "process-teardown-arm",
                             true);
                     controllerTrace("process-teardown-proof-armed");
@@ -370,7 +382,7 @@ final class DirectReSukiSuActivation {
                             "initial-acquisition-miss", false,
                             "The acquisition missed and requested a same-boot reset");
                 }
-                if (isSafeMiss(progress, result)) {
+                if (safeMiss) {
                     preMutationResetRequested = true;
                     persistSafeMissProof(result, progress);
                     throw new ActivationFailure(
@@ -2558,6 +2570,21 @@ final class DirectReSukiSuActivation {
         } catch (Exception exception) {
             return "";
         }
+    }
+
+    private static String traceToken(String value) {
+        if (value == null || value.isEmpty()) {
+            return "none";
+        }
+        StringBuilder token = new StringBuilder();
+        for (int index = 0; index < value.length() && token.length() < 240;
+             index++) {
+            char character = value.charAt(index);
+            token.append(Character.isLetterOrDigit(character) ||
+                            "._:=/-".indexOf(character) >= 0
+                    ? character : '_');
+        }
+        return token.toString();
     }
 
     private static boolean linePresent(String text, String expected) {

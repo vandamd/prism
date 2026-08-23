@@ -564,9 +564,11 @@ public final class PrismAppBridgeService extends Service {
                 return "status=fail stage=app-bridge-teardown-arm reason=binding";
             }
             synchronized (lock) {
-                if (!validProcessTeardownToken(
-                        requestedSession, token, true)) {
-                    return "status=fail stage=app-bridge-teardown-arm reason=proof";
+                String rejection = processTeardownTokenRejection(
+                        requestedSession, token, true);
+                if (!rejection.isEmpty()) {
+                    return "status=fail stage=app-bridge-teardown-arm reason=" +
+                            rejection;
                 }
                 if (!setCapabilityState(
                         PrismAppBridgeService.this,
@@ -1126,15 +1128,29 @@ public final class PrismAppBridgeService extends Service {
 
     private boolean validProcessTeardownToken(
             String requestedSession, String token, boolean processesMustBeLive) {
+        return processTeardownTokenRejection(
+                requestedSession, token, processesMustBeLive).isEmpty();
+    }
+
+    private String processTeardownTokenRejection(
+            String requestedSession, String token,
+            boolean processesMustBeLive) {
         try {
             if (token == null || token.length() > 4096 ||
-                    token.indexOf('\n') >= 0 || token.indexOf('\r') >= 0 ||
-                    !token.equals(readSmall(
-                            new File(getFilesDir(), "proc-teardown.token"))) ||
-                    !"0".equals(readSmall(
-                            new File(getFilesDir(), "controlled-free.enable.0"))) ||
-                    new File(getFilesDir(), "controlled-free.result.0").exists()) {
-                return false;
+                    token.indexOf('\n') >= 0 || token.indexOf('\r') >= 0) {
+                return "token-format";
+            }
+            if (!token.equals(readSmall(
+                    new File(getFilesDir(), "proc-teardown.token")))) {
+                return "token-file";
+            }
+            if (!"0".equals(readSmall(
+                    new File(getFilesDir(), "controlled-free.enable.0")))) {
+                return "free-gate";
+            }
+            if (new File(getFilesDir(),
+                    "controlled-free.result.0").exists()) {
+                return "free-result";
             }
             SharedPreferences preferences = capabilityPreferences(this);
             String storedNonce = preferences.getString(
@@ -1144,28 +1160,51 @@ public final class PrismAppBridgeService extends Service {
                     CAPABILITY_HELPER_START, "");
             ActivationProofs.ProcessTeardownProof proof =
                     ActivationProofs.parseProcessTeardownToken(token);
-            if (proof == null || !proof.bindsTo(
+            if (proof == null) {
+                return "token-parse";
+            }
+            if (!proof.bindsTo(
                     storedNonce,
                     bootId,
                     storedHelperPid,
-                    storedHelperStart) ||
-                    !requestedSession.equals(session)) {
-                return false;
+                    storedHelperStart)) {
+                return "binding";
             }
-            boolean appProcessesMatch =
-                    processIdentityMatches(proof.harness()) &&
-                    processIdentityMatches(proof.rawTarget()) &&
-                    processIdentityMatches(proof.rawClient());
-            boolean helperMatches = processIdentityMatches(
-                    storedHelperPid, storedHelperStart);
-            return processesMustBeLive
-                    ? appProcessesMatch && helperMatches
-                    : !processIdentityMatches(proof.harness()) &&
-                            !processIdentityMatches(proof.rawTarget()) &&
-                            !processIdentityMatches(proof.rawClient()) &&
-                            !helperMatches;
+            if (!requestedSession.equals(session)) {
+                return "session";
+            }
+            if (processesMustBeLive) {
+                if (!processIdentityMatches(proof.harness())) {
+                    return "harness-dead";
+                }
+                if (!processIdentityMatches(proof.rawTarget())) {
+                    return "raw-target-dead";
+                }
+                if (!processIdentityMatches(proof.rawClient())) {
+                    return "raw-client-dead";
+                }
+                if (!processIdentityMatches(
+                        storedHelperPid, storedHelperStart)) {
+                    return "helper-dead";
+                }
+            } else {
+                if (processIdentityMatches(proof.harness())) {
+                    return "harness-live";
+                }
+                if (processIdentityMatches(proof.rawTarget())) {
+                    return "raw-target-live";
+                }
+                if (processIdentityMatches(proof.rawClient())) {
+                    return "raw-client-live";
+                }
+                if (processIdentityMatches(
+                        storedHelperPid, storedHelperStart)) {
+                    return "helper-live";
+                }
+            }
+            return "";
         } catch (Exception exception) {
-            return false;
+            return "exception-" + exception.getClass().getSimpleName();
         }
     }
 

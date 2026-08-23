@@ -1373,7 +1373,6 @@ public final class ShellBridgeMain {
                         " type=" + exception.getClass().getSimpleName());
             }
         }, "lp3-proc-teardown-watchdog");
-        watchdog.setDaemon(true);
         watchdog.start();
     }
 
