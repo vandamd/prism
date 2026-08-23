@@ -53,13 +53,13 @@ final class ReSukiSuActivationController {
             new Payload(
                     "lp3-resukisu-ksud",
                     "/data/local/tmp/lp3-resukisu-ksud",
-                    4_214_888L,
-                    "7765acff69651e31629433fa6095a41b7ca034b62e17f9180c2a820b1f177483"),
+                    4_215_752L,
+                    "ceb8f4741ef4fba52e080828105771080bf9a5325b8e56454e121a968fb83d60"),
             new Payload(
                     "lp3-resukisu-loader.so",
                     "/data/local/tmp/lp3-resukisu-loader.so",
-                    1_301_464L,
-                    "1fe42682ad736f43eb5acb42dc0ebba79828a6090f61e47970277b12fdb61275"),
+                    1_301_272L,
+                    "e5afd38dbab906da06e6ce27d675545023bb8f53eb790c991a4da58b6f87a698"),
     };
 
     private final Context context;
@@ -835,6 +835,23 @@ final class ReSukiSuActivationController {
 
     private void returnToPrism() {
         DirectReSukiSuActivation.controllerTrace("return-to-prism-enter");
+        try {
+            executeFixed(
+                    "/system/bin/am", "force-stop", "--user", "0",
+                    RESUKISU_PACKAGE);
+            executeFixed(
+                    "/system/bin/am", "start", "--user", "0", "-W",
+                    "-f", "0x24000000", "-n",
+                    RESUKISU_PACKAGE + "/.ui.MainActivity");
+            DirectReSukiSuActivation.controllerTrace(
+                    "return-to-prism-manager-pass");
+        } catch (Exception exception) {
+            DirectReSukiSuActivation.controllerTrace(
+                    "return-to-prism-manager-fail type=" +
+                            exception.getClass().getSimpleName());
+            android.util.Log.w(
+                    "PrismActivation", "Could not open ReSukiSU", exception);
+        }
         try {
             executeFixed(
                     "/system/bin/am", "start", "--user", "0",

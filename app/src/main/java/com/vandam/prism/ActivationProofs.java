@@ -18,10 +18,14 @@ final class ActivationProofs {
     private static final BigInteger ONE = BigInteger.ONE;
     private static final BigInteger TWO = BigInteger.valueOf(2);
     private static final BigInteger FOUR = BigInteger.valueOf(4);
+    private static final BigInteger THREE = BigInteger.valueOf(3);
+    private static final BigInteger FIVE = BigInteger.valueOf(5);
     private static final BigInteger SIX = BigInteger.valueOf(6);
     private static final BigInteger SEVEN = BigInteger.valueOf(7);
     private static final BigInteger TWELVE = BigInteger.valueOf(12);
     private static final BigInteger EIGHTEEN = BigInteger.valueOf(18);
+    private static final BigInteger ONE_HUNDRED_TWENTY_EIGHT =
+            BigInteger.valueOf(128);
     private static final BigInteger UINT32_MAX = new BigInteger("ffffffff", 16);
     private static final BigInteger RESUME_MAGIC =
             new BigInteger("4c5033524553554d", 16);
@@ -151,6 +155,7 @@ final class ActivationProofs {
             "anchor_probe",
             "anchor_probe_errno",
             "anchor_retired",
+            "raw_holder_contexts",
             "isolated_total",
             "isolated_retired",
             "primitive_fds",
@@ -215,6 +220,7 @@ final class ActivationProofs {
             "raw_target_retired",
             "owner_retired",
             "anchor_retired",
+            "raw_holder_contexts",
             "native_fds_retired",
             "watchdogs_retired");
 
@@ -1327,8 +1333,8 @@ final class ActivationProofs {
                         .add(number(fields, "collateral_retired")).equals(ONE)
                 || !validHostDonorState(
                         raw.get("host_donor_tids"), raw.get("host_donor_states"))
-                || !is(fields, "required_writes", SIX)
-                || !is(fields, "successful_writes", SIX)
+                || !is(fields, "required_writes", 4)
+                || !is(fields, "successful_writes", 4)
                 || number(fields, "used_victims").compareTo(
                         number(fields, "successful_writes")) < 0
                 || negative(fields, "internal_write_misses")
@@ -1394,7 +1400,7 @@ final class ActivationProofs {
                 || !is(fields, "poisoned_sprays", ZERO)
                 || !is(fields, "spray_active", ZERO)
                 || !is(fields, "spray_expected", ZERO)
-                || !is(fields, "binder_controlled_unlinks", SEVEN)
+                || !is(fields, "binder_controlled_unlinks", FIVE)
                 || !positive(fields, "raw_target_pid")
                 || !is(fields, "raw_target_probe", -1)
                 || !is(fields, "raw_target_probe_errno", 3)
@@ -1404,8 +1410,8 @@ final class ActivationProofs {
                 || !positive(fields, "anchor_pid")
                 || !is(fields, "anchor_probe", -1)
                 || !is(fields, "anchor_probe_errno", 3)
-                || !is(fields, "isolated_total", 64)
-                || !is(fields, "isolated_retired", 64)
+                || !is(fields, "isolated_total", ONE_HUNDRED_TWENTY_EIGHT)
+                || !is(fields, "isolated_retired", ONE_HUNDRED_TWENTY_EIGHT)
                 || !is(fields, "primitive_fds", ZERO)
                 || !is(fields, "fake_node_fds", ZERO)) {
             return null;

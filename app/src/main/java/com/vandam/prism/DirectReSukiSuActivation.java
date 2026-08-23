@@ -114,7 +114,9 @@ final class DirectReSukiSuActivation {
     private String bootId;
     private String bridgeNonce;
     private String commandToken;
+    private String ctlbufRescuePlan;
     private ProcIdentity donor;
+    private long donorLifetimeGuard;
     private ProcIdentity ueventd;
     private ProcIdentity helperBaseline;
     private int helperPid;
@@ -276,6 +278,11 @@ final class DirectReSukiSuActivation {
             if (app != null) {
                 app.close();
             }
+            if (donorLifetimeGuard != 0) {
+                NativeBridge.discardProcessLifetimeGuard(
+                        donorLifetimeGuard);
+                donorLifetimeGuard = 0;
+            }
             if (!safeResetDurable || safeResetCompleted) {
                 removeShellControlFiles();
             }
@@ -304,8 +311,20 @@ final class DirectReSukiSuActivation {
         reporter.log("Device health before activation verified");
         recoverStaleControllerResidue();
 
-        donor = waitForStableProcess(
+        donor = requireProcess(
                 "update_engine", "update_engine", "u:r:update_engine:s0", 0, 22);
+        donorLifetimeGuard = NativeBridge.armProcessLifetimeGuard(donor.pid);
+        require(donorLifetimeGuard != 0 &&
+                        NativeBridge.isProcessLifetimeGuardAlive(
+                                donorLifetimeGuard),
+                "donor-lifetime-guard", false,
+                "The kernel donor lifetime guard could not be armed");
+        ProcIdentity donorConfirmation = requireProcess(
+                "update_engine", "update_engine", "u:r:update_engine:s0", 0, 22);
+        require(donorConfirmation.pid == donor.pid &&
+                        donorConfirmation.startTime.equals(donor.startTime),
+                "donor-lifetime-binding", false,
+                "The kernel donor changed while its lifetime guard was armed");
         reporter.log("Kernel donor process verified");
         ueventd = requireProcess(
                 "ueventd", "ueventd", "u:r:ueventd:s0", 0, 16);
@@ -340,6 +359,11 @@ final class DirectReSukiSuActivation {
         boolean rootActionComplete = false;
 
         while (elapsed() < deadline) {
+            require(donorLifetimeGuard != 0 &&
+                            NativeBridge.isProcessLifetimeGuardAlive(
+                                    donorLifetimeGuard),
+                    "donor-lifetime", mutationObserved,
+                    "The kernel donor lifetime guard fired");
             String progress = readApp(PrismAppBridgeService.SIGNAL_PROGRESS);
             if (!progress.isEmpty()) {
                 observeProgress(progress);
@@ -360,6 +384,8 @@ final class DirectReSukiSuActivation {
                         progress.getBytes(StandardCharsets.UTF_8).length +
                         " initial_miss=" + (proof != null ? 1 : 0) +
                         " safe_miss=" + (safeMiss ? 1 : 0));
+                controllerTrace("chain-failure-signature " +
+                        failureSignature(result));
                 if (proof != null) {
                     controllerTrace("process-teardown-proof-parsed");
                     require(proof.bindsTo(
@@ -548,7 +574,7 @@ final class DirectReSukiSuActivation {
 
     private void performRootAction() throws Exception {
         reporter.phase("root-action", "Activating ReSukiSU in the guarded root window");
-        validateRootWindow(donor.context);
+        validateSubjectiveRootWindow(donor.context);
         socketOutput.write(2);
         socketOutput.flush();
         Frame initial = readFrame("LP3_SU_EXIT_" + commandToken + "=", 1_048_576);
@@ -588,7 +614,8 @@ final class DirectReSukiSuActivation {
         socketOutput.flush();
         Frame stage = readFrame("LP3_SU_STAGE_" + commandToken + "=", 65_536);
         String expectedStage = "LP3_RESUKISU_STAGE status=pass " +
-                "stage=resukisu-stage result=0 relocation=0 kernel_base=0x" +
+                "stage=resukisu-stage result=0 relocation=0" +
+                " action_relocation=0 action_stage=0 kernel_base=0x" +
                 Long.toUnsignedString(kernelBase, 16) + " kaslr_slide=0x" +
                 Long.toUnsignedString(kaslrSlide, 16);
         require("0".equals(stage.terminalValue) &&
@@ -624,11 +651,32 @@ final class DirectReSukiSuActivation {
         writeGate(PrismAppBridgeService.GATE_CTLBUF_DONOR_FROZEN, frozenGate);
 
         waitForProgress("root-window-security-ready", 90_000);
-        validateRootWindow("u:r:ueventd:s0");
+        controllerTrace("root-window-security-progress-pass");
+        ctlbufRescuePlan = waitForAppSignal(
+                PrismAppBridgeService.SIGNAL_CTLBUF_RESCUE_PLAN,
+                "status=pass stage=ctlbuf-rescue-plan ", 10_000);
+        controllerTrace("root-window-security-signal-pass");
+        validateCtlbufRescuePlan(ctlbufRescuePlan, kernelBase);
+        controllerTrace("root-window-security-plan-pass");
+        validateSubjectiveRootWindow("u:r:ueventd:s0");
+        controllerTrace("root-window-security-host-pass");
+        byte[] rescueBytes = ctlbufRescuePlan.getBytes(StandardCharsets.UTF_8);
+        socketOutput.write(9);
+        socketOutput.write(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+                .putInt(rescueBytes.length).array());
+        socketOutput.write(rescueBytes);
+        socketOutput.flush();
+        waitForHelperLine(
+                "BRIDGE_COMMAND_CTLBUF_RESCUE_PLAN_READY nonce=" + bridgeNonce +
+                        " state=[status=pass stage=ctlbuf-rescue-plan-install]",
+                10_000);
         socketOutput.write(7);
         socketOutput.flush();
         Frame finalAction = readFrame(
                 "LP3_SU_FINAL_" + commandToken + "=", 1_048_576);
+        controllerTrace(
+                "resukisu-action-frame terminal=" + finalAction.terminalValue +
+                        " lines=" + String.join("|", finalAction.lines));
         require("0".equals(finalAction.terminalValue) &&
                         finalAction.lines.size() == 1 &&
                         ("LP3_RESUKISU status=pass stage=resukisu-action " +
@@ -649,21 +697,11 @@ final class DirectReSukiSuActivation {
         String rescuePlan = waitForAppSignal(
                 PrismAppBridgeService.SIGNAL_CTLBUF_RESCUE_PLAN,
                 "status=pass stage=ctlbuf-rescue-plan ", 10_000);
-        String rescuePrefix = "status=pass stage=ctlbuf-rescue-plan nonce=" +
-                bridgeNonce + " module_sha256=" +
-                "2b4e520b65f252c1c7a51c303f8bc228663f6804cbca00f2ebc6005c9a9f26f8" +
-                " params=";
-        require(rescuePlan.startsWith(rescuePrefix) &&
-                        rescuePlan.length() <= 3072 &&
-                        rescuePlan.contains(" kernel_base=0x" +
-                                Long.toUnsignedString(kernelBase, 16) + " "),
-                "ctlbuf-rescue-plan", true,
-                "The ctlbuf rescue plan is invalid");
-        byte[] rescueBytes = rescuePlan.getBytes(StandardCharsets.UTF_8);
+        require(rescuePlan.equals(ctlbufRescuePlan),
+                "ctlbuf-rescue-plan-stability", true,
+                "The ctlbuf rescue plan changed after the guarded action");
+        validateCtlbufRescuePlan(rescuePlan, kernelBase);
         socketOutput.write(3);
-        socketOutput.write(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
-                .putInt(rescueBytes.length).array());
-        socketOutput.write(rescueBytes);
         socketOutput.flush();
 
         String normalisedPrefix = "BRIDGE_COMMAND_NORMALISED nonce=" +
@@ -735,6 +773,22 @@ final class DirectReSukiSuActivation {
         reporter.log("Helper normalisation and retirement verified");
     }
 
+    private void validateCtlbufRescuePlan(
+            String rescuePlan, long kernelBase) throws ActivationFailure {
+        String rescuePrefix = "status=pass stage=ctlbuf-rescue-plan nonce=" +
+                bridgeNonce + " module_sha256=" +
+                "f0be198e4a4d2da59691156593b463ec138ab96ea6558fb66f2a1551386343c3" +
+                " params=";
+        require(rescuePlan.startsWith(rescuePrefix) &&
+                        rescuePlan.length() <= 3072 &&
+                        rescuePlan.contains(" kernel_base=0x" +
+                                Long.toUnsignedString(kernelBase, 16) + " ") &&
+                        rescuePlan.contains(" helper_tid=" + helperPid + " ") &&
+                        rescuePlan.contains(" donor_pid=" + donor.pid + " "),
+                "ctlbuf-rescue-plan", true,
+                "The ctlbuf rescue plan is invalid");
+    }
+
     private void waitForStrictTerminalCleanup() throws Exception {
         reporter.phase("terminal-cleanup", "Waiting for strict terminal cleanup");
         long deadline = elapsed() + 180_000;
@@ -799,20 +853,19 @@ final class DirectReSukiSuActivation {
         boolean passed = false;
         try {
             reporter.phase("postflight", "Verifying the clean same-boot result");
-            long dwellStarted = elapsed();
             requireExactPostflightBaseline("postflight-identity");
-            Thread.sleep(10_000);
-            requireExactPostflightBaseline("postflight-dwell");
+            require(donorLifetimeGuard != 0 &&
+                            NativeBridge.isProcessLifetimeGuardAlive(
+                                    donorLifetimeGuard),
+                    "postflight-donor-lifetime", true,
+                    "The kernel donor lifetime guard fired");
+            requireExactPostflightBaseline("postflight-confirmation");
             CommandResult version = runCommand(
                     "/data/local/tmp/lp3-resukisu-ksud", "debug", "version");
             require(version.exit == 0 &&
                             "Kernel Version: 35088".equals(version.output.trim()),
                     "resukisu-active-proof", true,
                     "ReSukiSU did not remain active after cleanup");
-            long dwellMillis = elapsed() - dwellStarted;
-            require(dwellMillis >= 10_000,
-                    "postflight-dwell-duration", true,
-                    "The strict postflight dwell was too short");
             int jobs = registeredJobCount();
             require(jobs < 1000, "postflight-jobs", true,
                     "The postflight JobScheduler count is unsafe");
@@ -824,7 +877,7 @@ final class DirectReSukiSuActivation {
                     "version=1 kind=strict-clean session=" + session +
                             " boot_id=" + bootId +
                             " proof_sha256=" + strictCleanProofDigest +
-                            " dwell_ms=" + dwellMillis +
+                            " event_bound=1 baseline_samples=2" +
                             " jobs=" + jobs +
                             " ksud=35088 profile=exact health=normal" +
                             " donor=unique helper=absent watchdog=absent";
@@ -844,6 +897,11 @@ final class DirectReSukiSuActivation {
     private void startHarness() throws Exception {
         requireHelperIdentity(false);
         requireControllerWatchdogIdentity();
+        require(donorLifetimeGuard != 0 &&
+                        NativeBridge.isProcessLifetimeGuardAlive(
+                                donorLifetimeGuard),
+                "donor-lifetime-dispatch", false,
+                "The kernel donor lifetime guard fired before dispatch");
         controllerTrace("harness-dispatch-enter");
         harnessDispatchAttempted = true;
         String state = app.startRootChain(
@@ -1274,19 +1332,39 @@ final class DirectReSukiSuActivation {
         return identity;
     }
 
-    private void validateRootWindow(String expectedContext) throws Exception {
+    private void validateSubjectiveRootWindow(
+            String expectedWatchdogContext) throws Exception {
+        controllerTrace("subjective-root-helper-read-enter");
         ProcIdentity helper = readProc(helperPid);
+        controllerTrace("subjective-root-helper-read-pass");
         ProcIdentity watchdog = readProcTask(helperPid, watchdogTid);
-        require(helper.idsEqual("Uid", 0) && helper.idsEqual("Gid", 0) &&
-                        donor.field("CapEff").equals(helper.field("CapEff")) &&
-                        expectedContext.equals(helper.context) &&
+        controllerTrace("subjective-root-watchdog-read-pass");
+        Set<Integer> expectedTids = new HashSet<>(helperTidsBeforeRoot);
+        expectedTids.add(watchdogTid);
+        controllerTrace("subjective-root-task-list-enter");
+        Set<Integer> currentTids = taskIds(helperPid);
+        controllerTrace("subjective-root-task-list-pass count=" +
+                currentTids.size());
+        boolean donorSame = donor.isSameProcess();
+        controllerTrace("subjective-root-donor-pass value=" + donorSame);
+        boolean helperSame = helperIsSameProcess();
+        controllerTrace("subjective-root-helper-pass value=" + helperSame);
+        boolean bootSame = sameBoot();
+        controllerTrace("subjective-root-boot-pass value=" + bootSame);
+        require(helper.idsEqual("Uid", 2000) &&
+                        helper.idsEqual("Gid", 2000) &&
+                        helperBaseline.field("CapEff").equals(
+                                helper.field("CapEff")) &&
+                        helperBaseline.context.equals(helper.context) &&
+                        helperBaseline.namespaces.equals(helper.namespaces) &&
                         Integer.toString(helperPid).equals(watchdog.field("Tgid")) &&
                         watchdog.idsEqual("Uid", 0) && watchdog.idsEqual("Gid", 0) &&
                         donor.field("CapEff").equals(watchdog.field("CapEff")) &&
-                        expectedContext.equals(watchdog.context) &&
-                        donor.isSameProcess() && helperIsSameProcess() && sameBoot(),
-                "root-window-host-gate", true,
-                "The external root window identity gate failed");
+                        expectedWatchdogContext.equals(watchdog.context) &&
+                        currentTids.equals(expectedTids) &&
+                        donorSame && helperSame && bootSame,
+                "subjective-root-window-host-gate", true,
+                "The split subjective root window identity gate failed");
     }
 
     private void validateFinaliseProof(Map<String, String> fields)
@@ -1593,10 +1671,19 @@ final class DirectReSukiSuActivation {
                         .matcher(marker);
                 if (write.matches()) {
                     int step = Integer.parseInt(write.group(1));
+                    int sequence = step <= 2 ? step : step - 2;
+                    if (sequence > 0) {
+                        return "pass".equals(write.group(2))
+                                ? "[+] Kernel write " + sequence +
+                                        "/4 completed (semantic " + step + ")"
+                                : "[!] Kernel write " + sequence +
+                                        "/4 (semantic " + step +
+                                        ") missed safely; retrying";
+                    }
                     return "pass".equals(write.group(2))
-                            ? "[+] Kernel write " + step + "/6 completed"
-                            : "[!] Kernel write " + step +
-                                    "/6 missed safely; retrying";
+                            ? "[+] Kernel semantic write " + step + " completed"
+                            : "[!] Kernel semantic write " + step +
+                                    " missed safely; retrying";
                 }
                 return null;
         }
@@ -2507,6 +2594,20 @@ final class DirectReSukiSuActivation {
             }
         }
         return result;
+    }
+
+    private static String failureSignature(String value) {
+        Matcher matcher = Pattern.compile(
+                "status=(?:fail|miss) stage=[a-z0-9-]+" +
+                "(?: reason=[a-z0-9-]+)?").matcher(value);
+        StringBuilder signature = new StringBuilder();
+        while (matcher.find() && signature.length() < 384) {
+            if (signature.length() > 0) {
+                signature.append(" | ");
+            }
+            signature.append(matcher.group());
+        }
+        return signature.length() == 0 ? "none" : signature.toString();
     }
 
     private static String unwrap(String line, String prefix) {

@@ -5,6 +5,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.Process;
@@ -16,6 +17,7 @@ import java.nio.file.Files;
 
 public class BatchClientService extends Service {
     private static final int BLOCKER_COUNT = 16;
+    private final Binder lifetime = new Binder();
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
@@ -55,7 +57,7 @@ public class BatchClientService extends Service {
 
     @Override
     public IBinder onBind(Intent intent) {
-        return null;
+        return lifetime;
     }
 
     private void run(IBinder owner) throws Exception {
@@ -86,27 +88,6 @@ public class BatchClientService extends Service {
         int cpu = Integer.parseInt(waitingState.substring(
                 waitingState.indexOf('=') + 1));
 
-        IBinder[] fragments;
-        Parcel fragmentData = Parcel.obtain();
-        Parcel fragmentReply = Parcel.obtain();
-        try {
-            fragmentData.writeInt(cpu);
-            owner.transact(OwnerService.TRANSACTION_FRAGMENT_BATCH,
-                    fragmentData, fragmentReply, 0);
-            fragmentReply.readException();
-            int count = fragmentReply.readInt();
-            if (count != OwnerService.FRAGMENT_COUNT) {
-                throw new IllegalStateException("fragment-count");
-            }
-            fragments = new IBinder[count];
-            for (int index = 0; index < count; index++) {
-                fragments[index] = fragmentReply.readStrongBinder();
-            }
-        } finally {
-            fragmentReply.recycle();
-            fragmentData.recycle();
-        }
-
         File saturated = new File(getFilesDir(),
                 "blockers-saturated.ready");
         saturated.delete();
@@ -117,17 +98,14 @@ public class BatchClientService extends Service {
         }
         waitFor(saturated, 5000);
         write("epitem-reader.start", "1");
-
-        for (int index = 0;
-             index < OwnerService.FRAGMENT_TRANSACTION_COUNT; index++) {
-            Parcel data = Parcel.obtain();
-            try {
-                fragments[index].transact(
-                        OwnerService.TRANSACTION_FRAGMENT_HOLD,
-                        data, null, IBinder.FLAG_ONEWAY);
-            } finally {
-                data.recycle();
-            }
+        if (NativeBridge.pinCurrentThread(cpu) != cpu) {
+            throw new IllegalStateException("fragment-client-affinity");
+        }
+        String fragmentState = NativeBridge.runEpitemFragmentClient();
+        write("epitem-fragment.result", fragmentState);
+        if (!fragmentState.startsWith("status=pass")) {
+            throw new IllegalStateException(
+                    "native-fragment-client " + fragmentState);
         }
         waitFor(new File(getFilesDir(), "epitem-reader.fragmented"), 60000);
         if (new File(getFilesDir(), "controlled-reader.request").exists()) {

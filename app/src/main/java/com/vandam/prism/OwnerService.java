@@ -57,7 +57,7 @@ public class OwnerService extends Service {
     static final int TRANSACTION_IDENTITY =
             IBinder.FIRST_CALL_TRANSACTION + 18;
     static final int COHORT_SIZE = 1152;
-    static final int FRAGMENT_COUNT = 8192;
+    static final int FRAGMENT_COUNT = 4096;
     static final int FRAGMENT_TRANSACTION_COUNT = 2304;
     static final int FILLER_REF_COUNT = 1536;
     static final int TRANSACTION_FRAGMENT_HOLD = 0x4265;

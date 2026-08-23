@@ -1333,7 +1333,8 @@ public final class PrismAppBridgeService extends Service {
                     "^version=1 kind=strict-clean" +
                             Pattern.quote(binding) +
                             " proof_sha256=([0-9a-f]{64})" +
-                            " dwell_ms=([1-9][0-9]*) jobs=([0-9]{1,3})" +
+                            " event_bound=1 baseline_samples=2" +
+                            " jobs=([0-9]{1,3})" +
                             " ksud=35088 profile=exact health=normal" +
                             " donor=unique helper=absent watchdog=absent$")
                     .matcher(receipt);
@@ -1341,8 +1342,7 @@ public final class PrismAppBridgeService extends Service {
                 return false;
             }
             try {
-                return Long.parseLong(matcher.group(2)) >= 10_000 &&
-                        Integer.parseInt(matcher.group(3)) < 1000;
+                return Integer.parseInt(matcher.group(2)) < 1000;
             } catch (NumberFormatException exception) {
                 return false;
             }

@@ -15,7 +15,9 @@ data.
 - Android NDK: `29.0.14206865`
 - Target: `aarch64-linux-android`, API 29
 - Source patch: `patches/light-phone-iii.patch`
-- Patch SHA-256: `d36b2efbbec7422dffbd05c2a758133479d40bfacd454c6bafed66ef293a3546`
+- Patch SHA-256: `98cab77fe32c6b328d57773df93a793bbf4044774eeae7a91d76d9d7c6c38a75`
+- Fast action patch: `patches/lp3-fast-action.patch`
+- Fast action patch SHA-256: `a8e6f7a89a70d73e403ed8abbf5bfb6e1e032c585537cdb23e33e8f8bf98bcf6`
 
 The patch adds the exact LP3 symbol map and relocation loader, synchronous
 manager-UID hand-off for late loading, and the SELinux `exec_sid` correction.
@@ -30,6 +32,7 @@ Start from the exact ReSukiSU commit, then apply the preserved patch:
 ```sh
 git checkout 746686390b0cf2256818a97b2f620eadbd079995
 git apply /path/to/light-side-of-the-moon/resukisu/patches/light-phone-iii.patch
+git apply /path/to/light-side-of-the-moon/resukisu/patches/lp3-fast-action.patch
 ```
 
 Before building the loader, create its binary directory and copy the proven
@@ -107,8 +110,8 @@ Expected production outputs:
 
 | Output | Size | SHA-256 |
 | --- | ---: | --- |
-| `ksud` | 4214888 | `7765acff69651e31629433fa6095a41b7ca034b62e17f9180c2a820b1f177483` |
-| `liblp3_resukisu_loader.so` | 1301464 | `1fe42682ad736f43eb5acb42dc0ebba79828a6090f61e47970277b12fdb61275` |
+| `ksud` | 4215752 | `ceb8f4741ef4fba52e080828105771080bf9a5325b8e56454e121a968fb83d60` |
+| `liblp3_resukisu_loader.so` | 1301272 | `e5afd38dbab906da06e6ce27d675545023bb8f53eb790c991a4da58b6f87a698` |
 
 The loader deliberately embeds the non-diagnostic rescue module. Do not add
 kernel-log capture to the rescue module in production artefacts.

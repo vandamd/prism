@@ -60,8 +60,9 @@ public final class ShellBridgeMain {
     private static final String RESCUE_MODULE_ENTRY =
             "assets/lp3_ctlbuf_rescue.ko";
     private static final String RESCUE_MODULE_SHA256 =
-            "2b4e520b65f252c1c7a51c303f8bc228663f6804cbca00f2ebc6005c9a9f26f8";
-    private static final int RESCUE_MODULE_SIZE = 560_040;
+            "f0be198e4a4d2da59691156593b463ec138ab96ea6558fb66f2a1551386343c3";
+    private static final int RESCUE_MODULE_SIZE = 119_648;
+    private static byte[] rescueModuleBytes;
     private static FileDescriptor rescueModuleFd;
     private static FileDescriptor rescueVendorFd;
     private static final Binder TARGET = new Binder() {
@@ -142,13 +143,13 @@ public final class ShellBridgeMain {
     private static final String RESUKISU_PATH =
             "/data/local/tmp/lp3-resukisu-ksud";
     private static final String RESUKISU_SHA256 =
-            "7765acff69651e31629433fa6095a41b7ca034b62e17f9180c2a820b1f177483";
-    private static final long RESUKISU_SIZE = 4_214_888L;
+            "ceb8f4741ef4fba52e080828105771080bf9a5325b8e56454e121a968fb83d60";
+    private static final long RESUKISU_SIZE = 4_215_752L;
     private static final String RESUKISU_LOADER_PATH =
             "/data/local/tmp/lp3-resukisu-loader.so";
     private static final String RESUKISU_LOADER_SHA256 =
-            "1fe42682ad736f43eb5acb42dc0ebba79828a6090f61e47970277b12fdb61275";
-    private static final long RESUKISU_LOADER_SIZE = 1_301_464L;
+            "e5afd38dbab906da06e6ce27d675545023bb8f53eb790c991a4da58b6f87a698";
+    private static final long RESUKISU_LOADER_SIZE = 1_301_272L;
     private static FileDescriptor reSukiFd;
     private static final String COMMAND_TOKEN =
             "/data/local/tmp/light-side-su.token";
@@ -355,6 +356,16 @@ public final class ShellBridgeMain {
                                 runNonce + " state=[" + finaliseStatus + "]");
                         rebootForever("ctlbuf-finalise-invalid");
                     }
+                    String resumeStatus =
+                            NativeBridge.ctlbufDonorResumeStatus();
+                    if (!resumeStatus.startsWith(
+                            "status=pass stage=donor-resume ")) {
+                        marker("COMMAND_CTLBUF_DONOR_RESUME_INVALID nonce=" +
+                                runNonce + " state=[" + resumeStatus + "]");
+                        rebootForever("ctlbuf-donor-resume-invalid");
+                    }
+                    marker("COMMAND_CTLBUF_DONOR_RESUME_STATE nonce=" +
+                            runNonce + " state=[" + resumeStatus + "]");
                     marker("COMMAND_CTLBUF_FINALISED nonce=" + runNonce +
                             " state=[" + finaliseStatus + "]");
                     marker("COMMAND_NORMALISED nonce=" + runNonce +
@@ -543,10 +554,33 @@ public final class ShellBridgeMain {
                     0);
             rescueModuleFd = moduleFd;
             rescueVendorFd = vendorFd;
+            rescueModuleBytes = module;
         } catch (Exception exception) {
             closeDescriptor(moduleFd);
             closeDescriptor(vendorFd);
             throw exception;
+        }
+    }
+
+    private static void refreshRescueModule() throws Exception {
+        if (rescueModuleFd == null || rescueModuleBytes == null ||
+                rescueModuleBytes.length != RESCUE_MODULE_SIZE ||
+                !RESCUE_MODULE_SHA256.equals(sha256(rescueModuleBytes))) {
+            throw new IllegalStateException("rescue-module-refresh-state");
+        }
+        byte[] readback = new byte[RESCUE_MODULE_SIZE];
+        int offset = 0;
+        while (offset < readback.length) {
+            int count = Os.pread(
+                    rescueModuleFd, readback, offset,
+                    readback.length - offset, offset);
+            if (count <= 0) {
+                throw new IOException("rescue-module-refresh-read");
+            }
+            offset += count;
+        }
+        if (!RESCUE_MODULE_SHA256.equals(sha256(readback))) {
+            throw new IOException("rescue-module-refresh-digest");
         }
     }
 
@@ -981,6 +1015,7 @@ public final class ShellBridgeMain {
                     }
                     String actionResult = "";
                     int actionExit = 0;
+                    boolean rescuePlanInstalled = false;
                     boolean deferredActivate = command.startsWith(
                             RESUKISU_ACTIVATE_COMMAND);
                     if (deferredActivate) {
@@ -990,6 +1025,11 @@ public final class ShellBridgeMain {
                         actionResult = NativeBridge.runReSukiAction(
                                 reSukiFd, rescueModuleFd,
                                 reSukiManagerUid(command), false);
+                        if (actionResult.startsWith(
+                                "status=pass stage=resukisu-action ")) {
+                            marker("COMMAND_RESCUE_MODULE_RESTORED nonce=" +
+                                    runNonce + " proof=loader");
+                        }
                         closeDescriptor(reSukiFd);
                         reSukiFd = null;
                         actionExit = actionResult.startsWith(
@@ -1078,6 +1118,35 @@ public final class ShellBridgeMain {
                     marker("COMMAND_CTLBUF_DONOR_FROZEN nonce=" +
                             runNonce + " pid=" + cleanDonorPid);
                     if (deferredActivate) {
+                        if (input.read() != 9) {
+                            throw new IllegalStateException(
+                                    "transport-rescue-plan-request");
+                        }
+                        int rescuePlanLength = readInt(input);
+                        if (rescuePlanLength < 1 || rescuePlanLength > 3072) {
+                            throw new IllegalStateException(
+                                    "transport-rescue-plan-size");
+                        }
+                        String rescuePlan = StandardCharsets.UTF_8.newDecoder()
+                                .onMalformedInput(CodingErrorAction.REPORT)
+                                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                                .decode(ByteBuffer.wrap(readExact(
+                                        input, rescuePlanLength)))
+                                .toString();
+                        String rescuePlanState =
+                                NativeBridge.installCtlbufRescuePlan(
+                                        rescuePlan, rescueModuleFd,
+                                        privateCredentialCallerPid);
+                        if (!rescuePlanState.startsWith("status=pass")) {
+                            marker("COMMAND_CTLBUF_RESCUE_PLAN_INVALID nonce=" +
+                                    runNonce + " state=[" + rescuePlanState +
+                                    "]");
+                            throw new IllegalStateException(
+                                    "transport-rescue-plan-invalid");
+                        }
+                        rescuePlanInstalled = true;
+                        marker("COMMAND_CTLBUF_RESCUE_PLAN_READY nonce=" +
+                                runNonce + " state=[" + rescuePlanState + "]");
                         if (input.read() != 7) {
                             throw new IllegalStateException(
                                     "transport-resukisu-execute");
@@ -1085,6 +1154,13 @@ public final class ShellBridgeMain {
                         actionResult = NativeBridge.runReSukiAction(
                                 reSukiFd, rescueModuleFd,
                                 reSukiManagerUid(command), true);
+                        marker("COMMAND_RESUKISU_ACTION_RESULT nonce=" +
+                                runNonce + " state=[" + actionResult + "]");
+                        if (actionResult.startsWith(
+                                "status=pass stage=resukisu-action ")) {
+                            marker("COMMAND_RESCUE_MODULE_RESTORED nonce=" +
+                                    runNonce + " proof=loader");
+                        }
                         closeDescriptor(reSukiFd);
                         reSukiFd = null;
                         actionExit = actionResult.startsWith(
@@ -1101,30 +1177,32 @@ public final class ShellBridgeMain {
                         throw new IllegalStateException(
                                 "transport-normalise-request");
                     }
-                    int rescuePlanLength = readInt(input);
-                    if (rescuePlanLength < 1 || rescuePlanLength > 3072) {
-                        throw new IllegalStateException(
-                                "transport-rescue-plan-size");
+                    if (!rescuePlanInstalled) {
+                        int rescuePlanLength = readInt(input);
+                        if (rescuePlanLength < 1 || rescuePlanLength > 3072) {
+                            throw new IllegalStateException(
+                                    "transport-rescue-plan-size");
+                        }
+                        String rescuePlan = StandardCharsets.UTF_8.newDecoder()
+                                .onMalformedInput(CodingErrorAction.REPORT)
+                                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                                .decode(ByteBuffer.wrap(readExact(
+                                        input, rescuePlanLength)))
+                                .toString();
+                        String rescuePlanState =
+                                NativeBridge.installCtlbufRescuePlan(
+                                        rescuePlan, rescueModuleFd,
+                                        privateCredentialCallerPid);
+                        if (!rescuePlanState.startsWith("status=pass")) {
+                            marker("COMMAND_CTLBUF_RESCUE_PLAN_INVALID nonce=" +
+                                    runNonce + " state=[" + rescuePlanState +
+                                    "]");
+                            throw new IllegalStateException(
+                                    "transport-rescue-plan-invalid");
+                        }
+                        marker("COMMAND_CTLBUF_RESCUE_PLAN_READY nonce=" +
+                                runNonce + " state=[" + rescuePlanState + "]");
                     }
-                    String rescuePlan = StandardCharsets.UTF_8.newDecoder()
-                            .onMalformedInput(CodingErrorAction.REPORT)
-                            .onUnmappableCharacter(CodingErrorAction.REPORT)
-                            .decode(ByteBuffer.wrap(readExact(
-                                    input, rescuePlanLength)))
-                            .toString();
-                    String rescuePlanState =
-                            NativeBridge.installCtlbufRescuePlan(
-                                    rescuePlan, rescueModuleFd,
-                                    privateCredentialCallerPid);
-                    if (!rescuePlanState.startsWith("status=pass")) {
-                        marker("COMMAND_CTLBUF_RESCUE_PLAN_INVALID nonce=" +
-                                runNonce + " state=[" + rescuePlanState +
-                                "]");
-                        throw new IllegalStateException(
-                                "transport-rescue-plan-invalid");
-                    }
-                    marker("COMMAND_CTLBUF_RESCUE_PLAN_READY nonce=" +
-                            runNonce + " state=[" + rescuePlanState + "]");
                     NativeBridge.signalCredentialNormalisation();
                     long rescueDeadline = System.nanoTime() +
                             TRANSPORT_TIMEOUT_MILLIS * 1_000_000L;

@@ -1,0 +1,23 @@
+buffers {
+  size_kb: 131072
+  fill_policy: RING_BUFFER
+}
+data_sources {
+  config {
+    name: "linux.ftrace"
+    target_buffer: 0
+    ftrace_config {
+      ftrace_events: "kmem/kmem_cache_alloc"
+      ftrace_events: "kmem/kmem_cache_free"
+      ftrace_events: "kmem/kmalloc"
+      ftrace_events: "kmem/kfree"
+      ftrace_events: "binder/binder_transaction_node_to_ref"
+      ftrace_events: "binder/binder_transaction_ref_to_ref"
+      ftrace_events: "binder/binder_transaction_ref_to_node"
+      symbolize_ksyms: true
+    }
+  }
+}
+duration_ms: 10000
+write_into_file: true
+file_write_period_ms: 1000
