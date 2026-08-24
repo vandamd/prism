@@ -31,6 +31,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -40,6 +44,9 @@ final class DirectReSukiSuActivation {
     interface Reporter {
         void phase(String value, String message);
         void log(String message);
+        void beginManagerReturn();
+        void beginPrismReturn();
+        void awaitRootRelease() throws Exception;
     }
 
     static final class Result {
@@ -165,8 +172,11 @@ final class DirectReSukiSuActivation {
         try {
             prepare();
             controllerTrace("prepare-pass");
+            reporter.awaitRootRelease();
+            startHarness();
             executeChain();
             controllerTrace("chain-pass");
+            reporter.beginPrismReturn();
             strictPostflight();
             controllerTrace("postflight-pass");
             requirePass(app.closeSession(), "app-bridge-close", false);
@@ -307,12 +317,18 @@ final class DirectReSukiSuActivation {
                 "The registered JobScheduler count is unsafe");
         reporter.log("Registered system jobs before activation: " +
                 registeredJobs);
+        controllerTrace("prepare-jobs-pass");
         requireNormalDeviceHealth("health-preflight", false);
+        controllerTrace("prepare-health-pass");
         reporter.log("Device health before activation verified");
         recoverStaleControllerResidue();
+        controllerTrace("prepare-residue-pass");
 
+        bridgeNonce = randomHex(16);
+        commandToken = randomHex(32);
         donor = requireProcess(
-                "update_engine", "update_engine", "u:r:update_engine:s0", 0, 22);
+                "update_engine", "update_engine",
+                "u:r:update_engine:s0", 0, 22);
         donorLifetimeGuard = NativeBridge.armProcessLifetimeGuard(donor.pid);
         require(donorLifetimeGuard != 0 &&
                         NativeBridge.isProcessLifetimeGuardAlive(
@@ -320,34 +336,44 @@ final class DirectReSukiSuActivation {
                 "donor-lifetime-guard", false,
                 "The kernel donor lifetime guard could not be armed");
         ProcIdentity donorConfirmation = requireProcess(
-                "update_engine", "update_engine", "u:r:update_engine:s0", 0, 22);
+                "update_engine", "update_engine",
+                "u:r:update_engine:s0", 0, 22);
         require(donorConfirmation.pid == donor.pid &&
                         donorConfirmation.startTime.equals(donor.startTime),
                 "donor-lifetime-binding", false,
                 "The kernel donor changed while its lifetime guard was armed");
+        controllerTrace("prepare-donor-pass");
         reporter.log("Kernel donor process verified");
         ueventd = requireProcess(
                 "ueventd", "ueventd", "u:r:ueventd:s0", 0, 16);
-        require("0".equals(ueventd.field("Seccomp")), "ueventd-gate", false,
+        require("0".equals(ueventd.field("Seccomp")),
+                "ueventd-gate", false,
                 "ueventd seccomp state changed");
-        String vendorLabel = fixedCommand("/system/bin/ls", "-Zd", "/vendor")
+        String vendorLabel = fixedCommand(
+                "/system/bin/ls", "-Zd", "/vendor")
                 .trim().split("\\s+", 2)[0];
         require("u:object_r:vendor_file:s0".equals(vendorLabel),
                 "vendor-gate", false, "The /vendor label changed");
         require(!moduleVisible(), "rescue-module-gate", false,
                 "The ctlbuf rescue module is already live");
+        controllerTrace("prepare-kernel-subjects-pass");
 
-        bridgeNonce = randomHex(16);
-        commandToken = randomHex(32);
         app = PrismAppBridgeClient.connect(context, session, bootId);
         requirePass(app.openSession(), "app-bridge-open", false);
+        controllerTrace("prepare-app-bridge-pass");
 
         prepareShellControlFiles();
+        controllerTrace("prepare-shell-files-pass");
         startArmHolder();
+        controllerTrace("prepare-arm-holder-pass");
         startHelper();
+        controllerTrace("prepare-helper-pass");
         startControllerWatchdog();
+        controllerTrace("prepare-controller-watchdog-pass");
         rootChainCohort = stablePrismAppCohort();
-        startHarness();
+        controllerTrace("prepare-app-cohort-pass");
+        establishCommandTransportCore();
+        controllerTrace("prepare-command-transport-pass");
     }
 
     private void executeChain() throws Exception {
@@ -421,7 +447,7 @@ final class DirectReSukiSuActivation {
             }
 
             if (!commandReady && privateCredentialRequestReady(progress)) {
-                establishCommandTransport();
+                acceptPrivateCredentialRequest();
                 commandReady = true;
             }
             if (commandReady && !writeArmed &&
@@ -447,16 +473,9 @@ final class DirectReSukiSuActivation {
                 "The root window did not arrive before timeout");
     }
 
-    private void establishCommandTransport() throws Exception {
+    private void establishCommandTransportCore() throws Exception {
+        controllerTrace("command-transport-enter");
         reporter.phase("private-credential", "Binding the private shell credential");
-        String expectedRequest = "nonce=" + bridgeNonce +
-                " helper_pid=" + helperPid +
-                " helper_start_time=" + helperStart +
-                " main_tid=" + helperPid +
-                " boot_id=" + bootId;
-        String request = readApp(PrismAppBridgeService.SIGNAL_PRIVATE_CREDENTIAL);
-        require(expectedRequest.equals(request), "private-credential-request", false,
-                "The private credential request binding changed");
         requireHelperIdentity(false);
 
         String helperLog = readHelperLog();
@@ -464,10 +483,12 @@ final class DirectReSukiSuActivation {
                         "BRIDGE_COMMAND_ARMED nonce=" + bridgeNonce),
                 "command-arm", false, "The helper armed before controller release");
         stopArmHolder();
+        controllerTrace("command-arm-holder-stopped");
         waitForHelperLine(
                 "BRIDGE_COMMAND_ARMED nonce=" + bridgeNonce, 10_000);
         waitForHelperLine(
                 "BRIDGE_COMMAND_LISTENING nonce=" + bridgeNonce, 10_000);
+        controllerTrace("command-helper-listening");
 
         socket = new Socket();
         socket.connect(new InetSocketAddress(
@@ -486,6 +507,28 @@ final class DirectReSukiSuActivation {
         String ack = readSocketLine(512);
         require(("LP3_SU_AUTH_" + commandToken + "=1").equals(ack),
                 "command-auth", false, "The command helper authentication failed");
+        controllerTrace("command-auth-pass");
+
+        waitForHelperLine(
+                "BRIDGE_COMMAND_BUFFERED nonce=" + bridgeNonce, 10_000);
+
+        controllerTrace("command-transport-prepared");
+        reporter.log("Activation command transport prepared");
+    }
+
+    private void acceptPrivateCredentialRequest() throws Exception {
+        String expectedRequest = "nonce=" + bridgeNonce +
+                " helper_pid=" + helperPid +
+                " helper_start_time=" + helperStart +
+                " main_tid=" + helperPid +
+                " boot_id=" + bootId;
+        String request = readApp(PrismAppBridgeService.SIGNAL_PRIVATE_CREDENTIAL);
+        require(expectedRequest.equals(request), "private-credential-request", false,
+                "The private credential request binding changed");
+        require(socketOutput != null && socketInput != null,
+                "command-transport", false,
+                "The prepared command transport is unavailable");
+        requireHelperIdentity(false);
 
         String waiting = "BRIDGE_COMMAND_PRIVATE_CREDENTIAL_WAITING nonce=" +
                 bridgeNonce + " pid=" + helperPid + " start=" + helperStart +
@@ -505,8 +548,7 @@ final class DirectReSukiSuActivation {
                 " securebits_after_errno=0 shell_before=1 shell_after=1]";
         require(expectedPrivate.equals(privateLine), "private-credential-proof", false,
                 "The private shell credential proof changed");
-        waitForHelperLine(
-                "BRIDGE_COMMAND_BUFFERED nonce=" + bridgeNonce, 10_000);
+        controllerTrace("private-credential-helper-proof-pass");
 
         helperBaseline = readProc(helperPid);
         helperTidsBeforeRoot = taskIds(helperPid);
@@ -521,6 +563,7 @@ final class DirectReSukiSuActivation {
                 "private-shell-baseline", false,
                 "The private shell baseline is invalid");
         requireHelperIdentity(false);
+        controllerTrace("private-credential-host-proof-pass");
 
         String gate = "nonce=" + bridgeNonce +
                 " helper_pid=" + helperPid +
@@ -529,10 +572,12 @@ final class DirectReSukiSuActivation {
                 " boot_id=" + bootId +
                 " host_helper_identity=1";
         writeGate(PrismAppBridgeService.GATE_PRIVATE_CREDENTIAL_ARM, gate);
+        controllerTrace("command-transport-pass");
         reporter.log("Private shell credential verified");
     }
 
     private void armRootWatchdog() throws Exception {
+        controllerTrace("root-watchdog-arm-enter");
         reporter.phase("root-watchdog", "Arming the root watchdog");
         require(socketOutput != null, "root-watchdog-transport", mutationObserved,
                 "The watchdog transport is unavailable");
@@ -541,6 +586,7 @@ final class DirectReSukiSuActivation {
         String prefix = "BRIDGE_COMMAND_ROOT_WATCHDOG_READY nonce=" +
                 bridgeNonce + " tid=";
         String line = waitForHelperPrefix(prefix, 45_000);
+        controllerTrace("root-watchdog-helper-ready");
         Pattern pattern = Pattern.compile(Pattern.quote(prefix) +
                 "([1-9][0-9]*) identity=\\[status=pass stage=" +
                 "command-root-watchdog pid=" + helperPid +
@@ -567,8 +613,10 @@ final class DirectReSukiSuActivation {
                         donor.isSameProcess() && helperIsSameProcess() && sameBoot(),
                 "root-watchdog-host-gate", true,
                 "The external watchdog identity gate failed");
+        controllerTrace("root-watchdog-host-proof-pass");
         String gate = watchdogGate();
         writeGate(PrismAppBridgeService.GATE_ROOT_WATCHDOG_ARM, gate);
+        controllerTrace("root-watchdog-arm-pass");
         reporter.log("Root watchdog identity verified");
     }
 
@@ -666,12 +714,16 @@ final class DirectReSukiSuActivation {
                 .putInt(rescueBytes.length).array());
         socketOutput.write(rescueBytes);
         socketOutput.flush();
+        controllerTrace("resukisu-rescue-plan-sent bytes=" + rescueBytes.length);
         waitForHelperLine(
                 "BRIDGE_COMMAND_CTLBUF_RESCUE_PLAN_READY nonce=" + bridgeNonce +
                         " state=[status=pass stage=ctlbuf-rescue-plan-install]",
                 10_000);
+        controllerTrace("resukisu-rescue-plan-ready");
+        controllerTrace("resukisu-action-dispatch-enter");
         socketOutput.write(7);
         socketOutput.flush();
+        controllerTrace("resukisu-action-dispatch-pass");
         Frame finalAction = readFrame(
                 "LP3_SU_FINAL_" + commandToken + "=", 1_048_576);
         controllerTrace(
@@ -684,6 +736,8 @@ final class DirectReSukiSuActivation {
                                 .equals(finalAction.lines.get(0)),
                 "resukisu-activate", true,
                 "The final ReSukiSU action proof failed");
+        reporter.beginManagerReturn();
+        reporter.beginPrismReturn();
         writeGate(PrismAppBridgeService.GATE_ROOT_ACTION_SECURITY, watchdogGate());
         reporter.log("ReSukiSU activation returned success");
 
@@ -777,7 +831,7 @@ final class DirectReSukiSuActivation {
             String rescuePlan, long kernelBase) throws ActivationFailure {
         String rescuePrefix = "status=pass stage=ctlbuf-rescue-plan nonce=" +
                 bridgeNonce + " module_sha256=" +
-                "f0be198e4a4d2da59691156593b463ec138ab96ea6558fb66f2a1551386343c3" +
+                "ff4e063cc09b926c09b55a777705d386734a1d1db6428d3e41081486c07bbb86" +
                 " params=";
         require(rescuePlan.startsWith(rescuePrefix) &&
                         rescuePlan.length() <= 3072 &&
@@ -793,6 +847,7 @@ final class DirectReSukiSuActivation {
         reporter.phase("terminal-cleanup", "Waiting for strict terminal cleanup");
         long deadline = elapsed() + 180_000;
         String cleanup = "";
+        String observedProgress = "";
         while (elapsed() < deadline) {
             require(sameBoot(), "terminal-cleanup-boot", true,
                     "The boot identity changed during terminal cleanup");
@@ -802,6 +857,25 @@ final class DirectReSukiSuActivation {
                 throw new ActivationFailure(
                         "terminal-donor-retirement", true,
                         "The donor retirement proof failed");
+            }
+            String progress = readApp(
+                    PrismAppBridgeService.SIGNAL_PROGRESS);
+            if (!progress.equals(observedProgress)) {
+                observedProgress = progress;
+                String[] lines = progress.trim().split("\\n");
+                if (lines.length > 0 && !lines[lines.length - 1].isEmpty()) {
+                    controllerTrace("terminal-progress " +
+                            lines[lines.length - 1]);
+                }
+            }
+            String result = readApp(PrismAppBridgeService.SIGNAL_RESULT);
+            if (result.startsWith("status=fail") ||
+                    result.startsWith("status=miss")) {
+                controllerTrace("terminal-chain-failure " +
+                        failureSignature(result));
+                throw new ActivationFailure(
+                        "terminal-chain-result", true,
+                        "The app chain failed during terminal cleanup");
             }
             cleanup = readApp(PrismAppBridgeService.SIGNAL_TERMINAL_CLEANUP);
             if (cleanup.startsWith("status=")) {
@@ -859,17 +933,24 @@ final class DirectReSukiSuActivation {
                                     donorLifetimeGuard),
                     "postflight-donor-lifetime", true,
                     "The kernel donor lifetime guard fired");
-            requireExactPostflightBaseline("postflight-confirmation");
+            int jobs = requireExactPostflightBaseline(
+                    "postflight-confirmation");
             CommandResult version = runCommand(
-                    "/data/local/tmp/lp3-resukisu-ksud", "debug", "version");
+                    "/data/local/tmp/lp3-resukisu-ksud", "debug", "info");
+            String expectedInfo = "version: 35088\n" +
+                    "full_version: v4.2.0-rc1-74668639-dirty@ReSukiSU\n" +
+                    "flags: 0x5\n" +
+                    "uapi_version: 2\n" +
+                    "features: 0x5\n" +
+                    "lkm: true\n" +
+                    "late_load: true\n" +
+                    "runtime_mode: late-load\n" +
+                    "pr_build: false";
             require(version.exit == 0 &&
-                            "Kernel Version: 35088".equals(version.output.trim()),
+                            expectedInfo.equals(version.output.trim()),
                     "resukisu-active-proof", true,
                     "ReSukiSU did not remain active after cleanup");
-            int jobs = registeredJobCount();
-            require(jobs < 1000, "postflight-jobs", true,
-                    "The postflight JobScheduler count is unsafe");
-            reporter.log("ReSukiSU active version 35088 verified");
+            reporter.log("ReSukiSU live late-load kernel 35088 verified");
             reporter.log("Registered system jobs after activation: " +
                     jobs);
             reporter.log("Device health after activation verified");
@@ -2166,19 +2247,51 @@ final class DirectReSukiSuActivation {
         requireNormalDeviceHealth(phase + "-health", true);
     }
 
-    private void requireExactPostflightBaseline(String phase) throws Exception {
-        String gate = DeviceGate.verify(context);
-        require(cleanupClaimedClean && helperRetired &&
-                        "status=pass stage=device-gate "
-                                .concat("profile=tlp301-00ww-1-440000")
-                                .equals(gate) &&
-                        sameBoot() && donor.isSameProcess() &&
-                        ueventd.isSameProcess() && uniqueDonor() &&
-                        !moduleVisible() && registeredJobCount() < 1000 &&
-                        helperAndRootWatchdogAbsent(),
-                phase, true,
-                "The exact postflight process or profile baseline changed");
-        requireNormalDeviceHealth(phase + "-health", true);
+    private int requireExactPostflightBaseline(String phase) throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(6);
+        try {
+            Future<String> gate = executor.submit(
+                    () -> DeviceGate.verify(context));
+            Future<Integer> jobs = executor.submit(
+                    DirectReSukiSuActivation::registeredJobCount);
+            Future<Boolean> uniqueDonor = executor.submit(this::uniqueDonor);
+            Future<Boolean> moduleAbsent = executor.submit(
+                    () -> !moduleVisible());
+            Future<Boolean> helperAbsent = executor.submit(
+                    this::helperAndRootWatchdogAbsent);
+            Future<Boolean> health = executor.submit(() -> {
+                requireNormalDeviceHealth(phase + "-health", true);
+                return true;
+            });
+            String gateValue = awaitFuture(gate);
+            int jobCount = awaitFuture(jobs);
+            require(cleanupClaimedClean && helperRetired &&
+                            "status=pass stage=device-gate "
+                                    .concat("profile=tlp301-00ww-1-440000")
+                                    .equals(gateValue) &&
+                            sameBoot() && donor.isSameProcess() &&
+                            ueventd.isSameProcess() &&
+                            awaitFuture(uniqueDonor) &&
+                            awaitFuture(moduleAbsent) && jobCount < 1000 &&
+                            awaitFuture(helperAbsent) && awaitFuture(health),
+                    phase, true,
+                    "The exact postflight process or profile baseline changed");
+            return jobCount;
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private static <T> T awaitFuture(Future<T> future) throws Exception {
+        try {
+            return future.get();
+        } catch (ExecutionException exception) {
+            Throwable cause = exception.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            throw exception;
+        }
     }
 
     private boolean uniqueDonor() {

@@ -24,8 +24,8 @@ final class ActivationProofs {
     private static final BigInteger SEVEN = BigInteger.valueOf(7);
     private static final BigInteger TWELVE = BigInteger.valueOf(12);
     private static final BigInteger EIGHTEEN = BigInteger.valueOf(18);
-    private static final BigInteger ONE_HUNDRED_TWENTY_EIGHT =
-            BigInteger.valueOf(128);
+    private static final BigInteger FIVE_HUNDRED_TWELVE =
+            BigInteger.valueOf(512);
     private static final BigInteger UINT32_MAX = new BigInteger("ffffffff", 16);
     private static final BigInteger RESUME_MAGIC =
             new BigInteger("4c5033524553554d", 16);
@@ -704,6 +704,11 @@ final class ActivationProofs {
             "staged_wake",
             "staged_state2",
             "staged_stable",
+            "target_read_ready",
+            "read_go",
+            "boundary_signal",
+            "victim_work_ready",
+            "read_continue",
             "global_published",
             "all_entered",
             "all_state2",
@@ -750,6 +755,8 @@ final class ActivationProofs {
             "buffer_freed",
             "polling",
             "wait_cpu",
+            "read_go",
+            "victim_boundary",
             "read_calls",
             "responses",
             "transactions",
@@ -818,11 +825,16 @@ final class ActivationProofs {
                     "generation_captured", 1,
                     "generation_valid", 1,
                     "expected", 1024,
-                    "staged_expected", 32,
-                    "staged_active", 32,
+                    "staged_expected", 512,
+                    "staged_active", 512,
                     "staged_wake", 1,
-                    "staged_state2", 32,
+                    "staged_state2", 512,
                     "staged_stable", 1,
+                    "target_read_ready", 1,
+                    "read_go", 1,
+                    "boundary_signal", 1,
+                    "victim_work_ready", 1,
+                    "read_continue", 1,
                     "global_published", 1,
                     "all_entered", 1,
                     "all_state2", 1024,
@@ -871,6 +883,8 @@ final class ActivationProofs {
                     "exact_payload", 0,
                     "buffer_freed", 0,
                     "polling", 1,
+                    "read_go", 1,
+                    "victim_boundary", 1,
                     "worker_index", -1);
 
     private static final String INITIAL_MISS_FIRST_PREFIX =
@@ -883,7 +897,7 @@ final class ActivationProofs {
 
     private static final String[] INITIAL_MISS_PROGRESS_TAIL = {
             "arbitrary-read-start",
-            "isolated-retirement-proof-pass",
+            "raw-holder-retirement-deferred",
             "arbitrary-read-reclaim-armed",
             "arbitrary-read-prepared",
             "arbitrary-read-proc-teardown-required"
@@ -1410,8 +1424,8 @@ final class ActivationProofs {
                 || !positive(fields, "anchor_pid")
                 || !is(fields, "anchor_probe", -1)
                 || !is(fields, "anchor_probe_errno", 3)
-                || !is(fields, "isolated_total", ONE_HUNDRED_TWENTY_EIGHT)
-                || !is(fields, "isolated_retired", ONE_HUNDRED_TWENTY_EIGHT)
+                || !is(fields, "isolated_total", FIVE_HUNDRED_TWELVE)
+                || !is(fields, "isolated_retired", FIVE_HUNDRED_TWELVE)
                 || !is(fields, "primitive_fds", ZERO)
                 || !is(fields, "fake_node_fds", ZERO)) {
             return null;
@@ -1821,7 +1835,7 @@ final class ActivationProofs {
                 || !cookie.mod(BigInteger.valueOf(8)).equals(ZERO)
                 || !is(record, "wait_cpu", ONE)
                 || !number(record, "raw_index").equals(
-                        pointer.and(BigInteger.valueOf(0x3ff)))
+                        pointer.and(BigInteger.valueOf(0x1fff)))
                 || !is(record, "transactions", ONE)
                 || !is(record, "last_response", 0x80407202L)
                 || !is(record, "last_code", 0x4266)

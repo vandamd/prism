@@ -57,7 +57,7 @@ std::uint64_t monotonic_nanoseconds() {
             : 0;
 }
 
-constexpr off_t kReSukiLoaderSize = 1'301'272;
+constexpr off_t kReSukiLoaderSize = 1'323'008;
 constexpr off_t kReSukiExecutableSize = 4'215'752;
 constexpr char kCompletionPrefix[] =
         "/data/local/tmp/lp3-ksud-completion.";
@@ -636,10 +636,16 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "spray-benchmark") == 0) {
         return spray_benchmark(argc, argv);
     }
+    if (argc == 4 && std::strcmp(argv[1], "route-probe") == 0) {
+        prism::primitive::Result result = prism::primitive::probe_route(
+                argv[2], argv[3], event, nullptr);
+        return result.passed ? 0 : 1;
+    }
     if (argc != 2) {
         std::fputs(
                 "usage: prism-primitive"
-                " probe|broker-probe|clone-probe|spray-benchmark"
+                " probe|broker-probe|clone-probe|route-probe"
+                " <service-template> <start-template>|spray-benchmark"
                 "|action-supervisor ...\n",
                 stderr);
         return 64;
@@ -655,7 +661,8 @@ int main(int argc, char** argv) {
     } else {
         std::fputs(
                 "usage: prism-primitive"
-                " probe|broker-probe|clone-probe|spray-benchmark"
+                " probe|broker-probe|clone-probe|route-probe"
+                " <service-template> <start-template>|spray-benchmark"
                 "|action-supervisor ...\n",
                 stderr);
         return 64;

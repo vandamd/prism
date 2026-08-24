@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -36,6 +37,7 @@ SHELL_LOGS = (
     "/data/local/tmp/light-side-of-the-moon-safe-reset.journal",
     "/data/local/tmp/lp3-native-watchdog.trace",
     "/data/local/tmp/lp3-action-phase",
+    "/data/local/tmp/lp3-action-result",
     "/data/local/tmp/lp3-ksud-stage",
 )
 
@@ -59,6 +61,7 @@ class Adb:
                 check=False,
                 timeout=timeout,
                 text=text,
+                errors="replace" if text else None,
             )
         except subprocess.TimeoutExpired as error:
             if check:
@@ -98,6 +101,131 @@ class Adb:
             timeout=timeout,
             text=False,
         ).stdout
+
+
+class ForegroundObserver:
+    EVENT_PATTERN = re.compile(
+        r"^\s*([0-9]+(?:\.[0-9]+)?)\s+\d+\s+\d+\s+I\s+"
+        r"wm_set_resumed_activity:\s+\[\d+,([^/\],]+)/"
+    )
+    ACTIVE_FRAME_PATTERN = re.compile(
+        r"^\s*([0-9]+(?:\.[0-9]+)?)\s+\d+\s+\d+\s+I\s+"
+        r"PrismVisibleState:\s+active_frame\s+uptime_ns=([0-9]+)$"
+    )
+
+    def __init__(self) -> None:
+        self.process = subprocess.Popen(
+            [
+                "adb",
+                "logcat",
+                "-b",
+                "events",
+                "-b",
+                "main",
+                "-v",
+                "monotonic",
+                "-T",
+                "1",
+                "wm_set_resumed_activity:I",
+                "PrismVisibleState:I",
+                "*:S",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+            bufsize=1,
+        )
+        self.lock = threading.Lock()
+        self.started_uptime: float | None = None
+        self.events: list[dict[str, object]] = []
+        self.last_package = ""
+        self.reader = threading.Thread(
+            target=self.read_events,
+            name="prism-foreground-observer",
+            daemon=True,
+        )
+        self.reader.start()
+
+    def begin(self, started_uptime: float) -> None:
+        with self.lock:
+            self.started_uptime = started_uptime
+            self.events.clear()
+            self.last_package = ""
+
+    def read_events(self) -> None:
+        if self.process.stdout is None:
+            return
+        for line in self.process.stdout:
+            active_match = self.ACTIVE_FRAME_PATTERN.match(line)
+            if active_match is not None:
+                observed_uptime = float(active_match.group(1))
+                with self.lock:
+                    if (
+                        self.started_uptime is None
+                        or observed_uptime < self.started_uptime
+                    ):
+                        continue
+                    event = {
+                        "elapsed_seconds": round(
+                            observed_uptime - self.started_uptime, 3
+                        ),
+                        "event": "prism-active-frame",
+                        "source": "frame-metrics-live",
+                        "foreground_sampled": False,
+                        "foreground_observed": False,
+                    }
+                    self.events.append(event)
+                print(
+                    f"  {event['elapsed_seconds']:6.1f}s "
+                    "Prism Active frame completed",
+                    flush=True,
+                )
+                continue
+            match = self.EVENT_PATTERN.match(line)
+            if match is None:
+                continue
+            observed_uptime = float(match.group(1))
+            package = match.group(2)
+            if package not in {PRISM_PACKAGE, RESUKISU_PACKAGE}:
+                continue
+            with self.lock:
+                if (
+                    self.started_uptime is None
+                    or observed_uptime < self.started_uptime
+                    or package == self.last_package
+                ):
+                    continue
+                self.last_package = package
+                event = {
+                    "elapsed_seconds": round(
+                        observed_uptime - self.started_uptime, 3
+                    ),
+                    "package": package,
+                    "source": "wm_set_resumed_activity-stream",
+                    "foreground_sampled": False,
+                    "foreground_observed": True,
+                }
+                self.events.append(event)
+            print(
+                f"  {event['elapsed_seconds']:6.1f}s "
+                f"foreground={package} source=android-lifecycle-live",
+                flush=True,
+            )
+
+    def snapshot(self) -> list[dict[str, object]]:
+        with self.lock:
+            return [dict(event) for event in self.events]
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=2)
+        self.reader.join(timeout=2)
 
 
 class PrismRuns:
@@ -163,6 +291,7 @@ class PrismRuns:
         boot_id = ""
         saw_resukisu = False
         focus_events: list[dict[str, object]] = []
+        foreground_observer: ForegroundObserver | None = None
         print(f"\nRun {run_number}/{self.requested_runs}", flush=True)
 
         try:
@@ -179,8 +308,9 @@ class PrismRuns:
             )
             if self.trace:
                 self.start_trace()
+            foreground_observer = ForegroundObserver()
             activation_started, activation_uptime = self.tap_text(
-                preflight, "ROOT"
+                preflight, "ROOT", foreground_observer
             )
             print("Root pressed", flush=True)
 
@@ -190,12 +320,18 @@ class PrismRuns:
                     run_directory,
                     activation_started,
                     activation_uptime,
+                    foreground_observer,
                 )
             )
+            foreground_observer.stop()
+            foreground_observer = None
             activation_duration = round(
                 activation_finished - activation_started, 3
             )
             self.stop_trace(run_directory)
+            self.confirm_active(boot_id)
+            self.confirm_manager_working(boot_id, run_directory)
+            self.open_prism()
             self.confirm_active(boot_id)
             run_duration = round(time.monotonic() - started_monotonic, 3)
             print(
@@ -218,6 +354,15 @@ class PrismRuns:
                 "focus_events": focus_events,
             }
         except (RunFailure, OSError, ET.ParseError) as error:
+            if foreground_observer is not None:
+                streamed_events = foreground_observer.snapshot()
+                focus_events.extend(streamed_events)
+                saw_resukisu = saw_resukisu or any(
+                    event.get("package") == RESUKISU_PACKAGE
+                    for event in streamed_events
+                )
+                foreground_observer.stop()
+                self.write_foreground_events(run_directory, focus_events)
             run_duration = round(time.monotonic() - started_monotonic, 3)
             activation_duration = (
                 round(time.monotonic() - activation_started, 3)
@@ -323,7 +468,7 @@ class PrismRuns:
             )
 
         start_server()
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 30
         next_retry = time.monotonic() + 3
         attempts = 1
         stable_samples = 0
@@ -335,7 +480,11 @@ class PrismRuns:
                 match = re.search(r"^Uid:\s+(\d+)", status, re.MULTILINE)
                 running_as_shell = bool(match and match.group(1) == "2000")
             stable_samples = stable_samples + 1 if running_as_shell else 0
-            if stable_samples == 5:
+            # The Shizuku boot receiver can race the manual starter several
+            # seconds after Android reports boot completion. Require a longer
+            # uninterrupted shell-server window so that race is observed and
+            # recovered before Prism opens.
+            if stable_samples == 10:
                 break
             if (not running_as_shell and attempts < 3 and
                     time.monotonic() >= next_retry):
@@ -409,7 +558,11 @@ class PrismRuns:
             last_text = ", ".join(texts)
             required = {"root status", "inactive", "shizuku status", "running",
                         "resukisu status", "installed", "root"}
-            if required.issubset(set(texts)):
+            controller_trace = self.current_controller_trace(boot_id)
+            prepared = re.search(
+                r"^[0-9]+ prepare-pass$", controller_trace, re.MULTILINE
+            ) is not None
+            if required.issubset(set(texts)) and prepared:
                 return xml
             if "active" in texts:
                 raise RunFailure("root was already active before Root was pressed")
@@ -472,12 +625,17 @@ class PrismRuns:
         run_directory: Path,
         started: float,
         started_uptime: float,
+        foreground_observer: ForegroundObserver,
     ) -> tuple[bool, list[dict[str, object]], float]:
         deadline = time.monotonic() + self.run_timeout
         saw_resukisu = False
         last_focus = ""
         ui_failures = 0
         events: list[dict[str, object]] = []
+        streamed_event_count = 0
+        dispatch_retries = 0
+        next_dispatch_check = started + 2
+        live_action_captured = False
 
         while time.monotonic() < deadline:
             current_boot = self.try_boot_id()
@@ -487,6 +645,16 @@ class PrismRuns:
                 raise RunFailure(
                     f"device rebooted during activation ({boot_id} -> {current_boot})"
                 )
+
+            streamed_events = foreground_observer.snapshot()
+            if len(streamed_events) > streamed_event_count:
+                new_events = streamed_events[streamed_event_count:]
+                events.extend(new_events)
+                saw_resukisu = saw_resukisu or any(
+                    event.get("package") == RESUKISU_PACKAGE
+                    for event in new_events
+                )
+                streamed_event_count = len(streamed_events)
 
             focus = self.focused_package()
             if focus != last_focus:
@@ -508,6 +676,49 @@ class PrismRuns:
                 saw_resukisu = True
             elif focus == PRISM_PACKAGE:
                 controller_trace = self.current_controller_trace(boot_id)
+                if (
+                    not live_action_captured
+                    and "resukisu-action-dispatch-pass" in controller_trace
+                ):
+                    self.capture_live_action_state(run_directory)
+                    live_action_captured = True
+                if (
+                    not controller_trace
+                    and time.monotonic() >= next_dispatch_check
+                ):
+                    try:
+                        xml = self.ui_xml()
+                    except RunFailure:
+                        current_boot = self.try_boot_id()
+                        if current_boot and current_boot != boot_id:
+                            raise RunFailure(
+                                "device rebooted during activation "
+                                f"({boot_id} -> {current_boot})"
+                            )
+                        time.sleep(0.5)
+                        continue
+                    texts = self.ui_texts(xml)
+                    if (
+                        "inactive" in texts
+                        and "root" in texts
+                        and dispatch_retries < 2
+                    ):
+                        self.tap_text_without_clock(xml, "ROOT")
+                        dispatch_retries += 1
+                        next_dispatch_check = time.monotonic() + 2
+                        elapsed = time.monotonic() - started
+                        print(
+                            f"  {elapsed:6.1f}s Root dispatch retry "
+                            f"{dispatch_retries}",
+                            flush=True,
+                        )
+                        time.sleep(0.1)
+                        continue
+                    if dispatch_retries >= 2:
+                        raise RunFailure(
+                            "Root input did not dispatch the activation "
+                            "controller"
+                        )
                 terminal = re.search(
                     r"^[0-9]+ activation-result status=(pass|fail) ",
                     controller_trace,
@@ -549,11 +760,44 @@ class PrismRuns:
                     )
                     raise RunFailure("Prism reported an activation failure")
                 if "active" in texts:
-                    active_observed = time.monotonic()
-                    lifecycle_events = self.lifecycle_foreground_events(
-                        started_uptime
+                    streamed_events = foreground_observer.snapshot()
+                    if len(streamed_events) > streamed_event_count:
+                        events.extend(streamed_events[streamed_event_count:])
+                        streamed_event_count = len(streamed_events)
+                    if not self.has_foreground_round_trip(events):
+                        events.extend(self.lifecycle_foreground_events(
+                            started_uptime
+                        ))
+                    active_frames = [
+                        event for event in events
+                        if event.get("event") == "prism-active-frame"
+                    ]
+                    prism_returns = [
+                        float(event.get("elapsed_seconds", -1.0))
+                        for event in events
+                        if event.get("package") == PRISM_PACKAGE
+                        and event.get("source")
+                            == "wm_set_resumed_activity-stream"
+                        and any(
+                            earlier.get("package") == RESUKISU_PACKAGE
+                            and float(earlier.get("elapsed_seconds", -1.0))
+                                < float(event.get("elapsed_seconds", -1.0))
+                            for earlier in events
+                        )
+                    ]
+                    visible_active_frames = [
+                        event for event in active_frames
+                        if prism_returns
+                        and float(event["elapsed_seconds"])
+                            >= prism_returns[-1]
+                    ]
+                    if not visible_active_frames:
+                        time.sleep(0.1)
+                        continue
+                    active_elapsed = float(
+                        visible_active_frames[-1]["elapsed_seconds"]
                     )
-                    events.extend(lifecycle_events)
+                    active_observed = started + active_elapsed
                     saw_resukisu = any(
                         event.get("package") == RESUKISU_PACKAGE
                         for event in events
@@ -570,20 +814,42 @@ class PrismRuns:
                         events.append(receipt)
                         print(
                             f"  {receipt['elapsed_seconds']:6.1f}s "
-                            "manager-return-receipt "
-                            "foreground-observed=no",
+                            "manager-return-receipt source=controller-trace",
                             flush=True,
                         )
                     self.write_foreground_events(run_directory, events)
-                    if not saw_resukisu:
+                    if not self.has_foreground_round_trip(events):
                         raise RunFailure(
-                            "ReSukiSU foreground was not observed by the "
-                            "lifecycle or focus instrumentation"
+                            "the foreground sequence did not show ReSukiSU "
+                            "followed by the return to Prism"
                         )
                     return saw_resukisu, events, active_observed
             time.sleep(0.5)
         missing = "ReSukiSU transition" if not saw_resukisu else "return to active Prism"
         raise RunFailure(f"activation timed out waiting for {missing}")
+
+    def capture_live_action_state(self, run_directory: Path) -> None:
+        helper_log = self.adb.shell(
+            "cat",
+            "/data/local/tmp/light-side-of-the-moon-helper.log",
+            check=False,
+            timeout=2,
+        )
+        matches = re.findall(r"BRIDGE_READY .* pid=([1-9][0-9]*)", helper_log)
+        if not matches:
+            return
+        pid = matches[-1]
+        script = (
+            f"echo HELPER_PID={pid}; "
+            f"ps -T -p {pid} -o PID,TID,STAT,WCHAN:32,NAME,ARGS"
+        )
+        snapshot = self.adb.shell(
+            "sh", "-c", script, check=False, timeout=8
+        )
+        (run_directory / "live-action-state.txt").write_text(
+            snapshot or f"HELPER_PID={pid}\nCAPTURE_FAILED\n",
+            encoding="utf-8",
+        )
 
     def controller_opened_manager(self, boot_id: str) -> bool:
         trace = self.current_controller_trace(boot_id)
@@ -611,6 +877,51 @@ class PrismRuns:
             if "active" not in texts or "running" not in texts:
                 raise RunFailure("active root status did not remain stable")
             time.sleep(1)
+
+    def confirm_manager_working(
+        self, boot_id: str, run_directory: Path
+    ) -> None:
+        self.require_same_boot(boot_id)
+        self.adb.shell(
+            "am", "force-stop", "--user", "0", RESUKISU_PACKAGE,
+            timeout=10,
+        )
+        self.adb.shell(
+            "am", "start", "--user", "0", "-W", "-n",
+            RESUKISU_PACKAGE + "/.ui.MainActivity",
+            timeout=15,
+        )
+        deadline = time.monotonic() + 15
+        last_xml = ""
+        last_texts: set[str] = set()
+        while time.monotonic() < deadline:
+            self.require_same_boot(boot_id)
+            if self.focused_package() != RESUKISU_PACKAGE:
+                time.sleep(0.2)
+                continue
+            last_xml = self.ui_xml()
+            last_texts = self.ui_texts(last_xml)
+            if {
+                "working", "lkm", "jailbreak mode"
+            }.issubset(last_texts):
+                if "not installed" in last_texts or (
+                    "failed to grant root!" in last_texts
+                ):
+                    break
+                (run_directory / "manager-ui.xml").write_text(
+                    last_xml, encoding="utf-8"
+                )
+                return
+            time.sleep(0.2)
+        if last_xml:
+            (run_directory / "manager-ui-failure.xml").write_text(
+                last_xml, encoding="utf-8"
+            )
+        raise RunFailure(
+            "ReSukiSU Manager did not report Working, LKM, and "
+            "Jailbreak mode without a root warning: "
+            + ", ".join(sorted(last_texts))
+        )
 
     def wait_for_device_return(self, overall_deadline: float) -> str:
         deadline = min(overall_deadline, time.monotonic() + self.boot_timeout)
@@ -701,6 +1012,24 @@ class PrismRuns:
         return events
 
     @staticmethod
+    def has_foreground_round_trip(
+        events: list[dict[str, object]],
+    ) -> bool:
+        saw_resukisu = False
+        for event in sorted(
+            events,
+            key=lambda candidate: float(
+                candidate.get("elapsed_seconds", 0.0)
+            ),
+        ):
+            package = event.get("package")
+            if package == RESUKISU_PACKAGE:
+                saw_resukisu = True
+            elif package == PRISM_PACKAGE and saw_resukisu:
+                return True
+        return False
+
+    @staticmethod
     def write_foreground_events(
         run_directory: Path, events: list[dict[str, object]]
     ) -> None:
@@ -735,7 +1064,12 @@ class PrismRuns:
             if (text := node.attrib.get("text", "").strip())
         ]
 
-    def tap_text(self, xml: str, expected: str) -> tuple[float, float]:
+    def tap_text(
+        self,
+        xml: str,
+        expected: str,
+        foreground_observer: ForegroundObserver,
+    ) -> tuple[float, float]:
         root = ET.fromstring(xml)
         for node in root.iter():
             if node.attrib.get("text", "").casefold() != expected.casefold():
@@ -758,11 +1092,31 @@ class PrismRuns:
                 self.adb.shell("cat", "/proc/uptime").split()[0]
             )
             activation_started = time.monotonic()
-            self.adb.shell(
-                "input", "tap", str((left + right) // 2), str((top + bottom) // 2)
-            )
+            foreground_observer.begin(device_uptime)
+            self.tap_bounds(left, top, right, bottom)
             return activation_started, device_uptime
         raise RunFailure(f"could not find the enabled {expected} button")
+
+    def tap_text_without_clock(self, xml: str, expected: str) -> None:
+        root = ET.fromstring(xml)
+        for node in root.iter():
+            if node.attrib.get("text", "").casefold() != expected.casefold():
+                continue
+            if node.attrib.get("enabled") != "true":
+                continue
+            match = re.fullmatch(
+                r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                node.attrib.get("bounds", ""),
+            )
+            if match:
+                self.tap_bounds(*map(int, match.groups()))
+                return
+        raise RunFailure(f"could not retry the enabled {expected} button")
+
+    def tap_bounds(self, left: int, top: int, right: int, bottom: int) -> None:
+        self.adb.shell(
+            "input", "tap", str((left + right) // 2), str((top + bottom) // 2)
+        )
 
     def collect_evidence(self, directory: Path, full: bool) -> None:
         self.stop_trace(directory)

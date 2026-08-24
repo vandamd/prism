@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
+import android.os.ParcelFileDescriptor;
 import android.os.Process;
 
 import java.io.File;
@@ -22,10 +23,17 @@ public final class RawTargetService extends Service {
     static final int TRANSACTION_BLOCK = 0x4280;
     static final int TRANSACTION_COHORT_SETTLE = 0x42a1;
     static final int TRANSACTION_IDENTITY = 0x42a3;
+    static final int TRANSACTION_BOUNDARY_SIGNAL = 0x42a4;
     static final int BLOCKER_COUNT = 16;
 
     private final CountDownLatch release = new CountDownLatch(1);
     private final AtomicInteger blocked = new AtomicInteger();
+    private String ownerNonce = "";
+    private String ownerBootId = "";
+    private boolean ownerTerminalCleanup;
+    private boolean ownerMetadataValid;
+    private long ownerStartTime;
+    private boolean ownerArmed;
     private final Binder target = new Binder() {
         @Override
         protected boolean onTransact(int code, Parcel data, Parcel reply,
@@ -34,6 +42,35 @@ public final class RawTargetService extends Service {
                 reply.writeNoException();
                 reply.writeInt(Process.myPid());
                 reply.writeLong(ProcessIdentity.currentStartTime());
+                return true;
+            }
+            if (code == TRANSACTION_BOUNDARY_SIGNAL) {
+                ParcelFileDescriptor boundarySignal =
+                        data.readFileDescriptor();
+                int boundarySignalFd = boundarySignal == null
+                        ? -1 : boundarySignal.detachFd();
+                boolean armed = false;
+                boolean ownershipTransferred = false;
+                synchronized (RawTargetService.this) {
+                    if (!ownerArmed && ownerMetadataValid &&
+                            boundarySignalFd >= 0) {
+                        ownershipTransferred = true;
+                        armed = NativeBridge.armRawTargetOwner(
+                                getFilesDir().getAbsolutePath(),
+                                ownerNonce, ownerBootId, ownerStartTime,
+                                ownerTerminalCleanup, boundarySignalFd);
+                        ownerArmed = armed;
+                    }
+                }
+                if (!ownershipTransferred && boundarySignalFd >= 0) {
+                    try {
+                        ParcelFileDescriptor.adoptFd(
+                                boundarySignalFd).close();
+                    } catch (Exception ignored) {
+                    }
+                }
+                reply.writeNoException();
+                reply.writeInt(armed ? 1 : 0);
                 return true;
             }
             if (code != TRANSACTION_BLOCK) {
@@ -78,10 +115,13 @@ public final class RawTargetService extends Service {
         boolean terminalMetadata = !terminalCleanup ||
                 (isValidNonce(nonce) && isValidBootId(bootId) &&
                         bootId.equals(currentBootId()));
-        if (!terminalMetadata || startTime <= 0 ||
-                !NativeBridge.armRawTargetOwner(
-                        getFilesDir().getAbsolutePath(), nonce, bootId,
-                        startTime, terminalCleanup)) {
+        ownerNonce = nonce;
+        ownerBootId = bootId;
+        ownerTerminalCleanup = terminalCleanup;
+        ownerStartTime = startTime;
+        ownerMetadataValid = terminalMetadata && startTime > 0;
+        ownerArmed = false;
+        if (!ownerMetadataValid) {
             write("raw-target.result",
                     "status=fail stage=raw-target reason=arm");
         }

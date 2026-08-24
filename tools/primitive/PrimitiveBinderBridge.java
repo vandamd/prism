@@ -11,6 +11,7 @@ import android.os.IInterface;
 import android.os.Looper;
 import android.os.Parcel;
 import android.os.RemoteException;
+import android.util.Base64;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -29,9 +30,13 @@ public final class PrimitiveBinderBridge {
         if (arguments.length != 2 ||
                 !("receive".equals(arguments[0]) ||
                   "send".equals(arguments[0]) ||
-                  "inspect".equals(arguments[0])) ||
+                  "inspect".equals(arguments[0]) ||
+                  "dump-route".equals(arguments[0]) ||
+                  "route".equals(arguments[0]) ||
+                  "route-hold".equals(arguments[0])) ||
                 !arguments[1].matches("[0-9a-f]{32}")) {
-            throw new IllegalArgumentException("receive|send|inspect nonce");
+            throw new IllegalArgumentException(
+                    "receive|send|inspect|dump-route|route|route-hold nonce");
         }
         if ("inspect".equals(arguments[0])) {
             for (String className : new String[] {
@@ -48,12 +53,129 @@ public final class PrimitiveBinderBridge {
             }
             return;
         }
+        if ("dump-route".equals(arguments[0])) {
+            dumpRouteTemplate();
+            return;
+        }
         String action = "com.vandam.prism.primitive.BINDER." + arguments[1];
-        if ("receive".equals(arguments[0])) {
+        if ("route".equals(arguments[0]) ||
+                "route-hold".equals(arguments[0])) {
+            route(activityManager(), arguments[1],
+                    "route-hold".equals(arguments[0]));
+        } else if ("receive".equals(arguments[0])) {
             receive(activityManager(), action, arguments[1]);
         } else {
             send(activityManager(), action, arguments[1]);
         }
+    }
+
+    private static void dumpRouteTemplate() {
+        Parcel serviceManager = Parcel.obtain();
+        Parcel startService = Parcel.obtain();
+        try {
+            Binder callback = new Binder();
+            serviceManager.writeInterfaceToken("android.os.IServiceManager");
+            serviceManager.writeString("activity");
+            Intent intent = new Intent();
+            intent.setClassName(
+                    "com.vandam.prism", "com.vandam.prism.HarnessService");
+            intent.putExtra("stage", "raw-binder-broker");
+            Bundle extras = intent.getExtras();
+            if (extras == null) {
+                extras = new Bundle();
+            }
+            extras.putBinder("raw_broker_callback", callback);
+            extras.putBoolean("raw_broker_holder", false);
+            intent.replaceExtras(extras);
+            startService.writeInterfaceToken("android.app.IActivityManager");
+            startService.writeStrongBinder(null);
+            startService.writeTypedObject(intent, 0);
+            startService.writeString(null);
+            startService.writeBoolean(false);
+            startService.writeString("com.vandam.prism");
+            startService.writeString(null);
+            startService.writeInt(0);
+            dumpParcel("SERVICE", serviceManager);
+            dumpParcel("START", startService);
+        } finally {
+            startService.recycle();
+            serviceManager.recycle();
+        }
+    }
+
+    private static void dumpParcel(String name, Parcel parcel) {
+        byte[] bytes = parcel.marshall();
+        StringBuilder binderOffsets = new StringBuilder();
+        for (int offset = 0; offset + 4 <= bytes.length; offset += 4) {
+            int value = (bytes[offset] & 0xff) |
+                    ((bytes[offset + 1] & 0xff) << 8) |
+                    ((bytes[offset + 2] & 0xff) << 16) |
+                    ((bytes[offset + 3] & 0xff) << 24);
+            if (value == 0x73622a85) {
+                if (binderOffsets.length() > 0) {
+                    binderOffsets.append(',');
+                }
+                binderOffsets.append(offset);
+            }
+        }
+        System.out.println(name + "_SIZE=" + bytes.length);
+        System.out.println(name + "_BINDER_OFFSETS=" + binderOffsets);
+        System.out.println(name + "_BASE64=" +
+                Base64.encodeToString(bytes, Base64.NO_WRAP));
+    }
+
+    private static void route(Object activityManager, String nonce,
+                              boolean hold)
+            throws Exception {
+        CountDownLatch called = new CountDownLatch(1);
+        Binder callback = new Binder() {
+            @Override
+            protected boolean onTransact(int code, Parcel data, Parcel reply,
+                                         int flags) throws RemoteException {
+                if (code != 0x42b0 || data.readInt() != 0x50524252) {
+                    return false;
+                }
+                IBinder marker = data.readStrongBinder();
+                if (marker == null || !marker.isBinderAlive()) {
+                    return false;
+                }
+                System.out.println("ROUTE_PASS client_pid=" +
+                        android.os.Process.myPid() + " marker_remote=" +
+                        (marker instanceof Binder ? 0 : 1) +
+                        " nonce=" + nonce);
+                System.out.flush();
+                called.countDown();
+                return true;
+            }
+        };
+        Intent intent = new Intent();
+        intent.setClassName(
+                "com.vandam.prism", "com.vandam.prism.HarnessService");
+        intent.putExtra("stage", "raw-binder-broker");
+        Bundle extras = intent.getExtras();
+        if (extras == null) {
+            extras = new Bundle();
+        }
+        extras.putBinder("raw_broker_callback", callback);
+        extras.putBoolean("raw_broker_holder", hold);
+        extras.putBoolean("raw_broker_foreground", true);
+        intent.replaceExtras(extras);
+        Method startService = findMethod(
+                activityManager.getClass(), "startService", 7);
+        long started = android.os.SystemClock.elapsedRealtimeNanos();
+        Object result = startService.invoke(
+                activityManager, null, intent, null, true,
+                "com.vandam.prism", null, 0);
+        boolean passed = called.await(5, TimeUnit.SECONDS);
+        long duration = android.os.SystemClock.elapsedRealtimeNanos() - started;
+        System.out.println("ROUTE_RESULT status=" +
+                (passed ? "pass" : "fail") + " component=" + result +
+                " duration_ns=" + duration);
+        System.out.flush();
+        if (passed && hold) {
+            Thread.sleep(2_000);
+        }
+        System.exit(passed ? 0 : 1);
     }
 
     private static Object activityManager() throws Exception {

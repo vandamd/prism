@@ -135,6 +135,12 @@ consecutive fresh-boot runs without weakening cleanup or reliability.
 | S068 | Replace the root path's isolated holders with 128 raw Binder contexts, a direct victim-node transfer, and one death-notified anchor ref per context | Primitive probe `20260823-103348-198489` passed both disclosures with 20 selected controlled-node hits and 20 observed death-bearing anchor records. It then failed closed before arbitrary-read mutation because teardown cleared zero of 128 death notifications: release ran on a thread that had not entered each Binder context, so clear completions remained unavailable. All 128 callback deaths still arrived and every mapping and descriptor closed, but no release proof was accepted | Retain the direct victim-owner transfer and separate anchor geometry. Enter the teardown thread as a looper on every context before issuing `BC_CLEAR_DEATH_NOTIFICATION`; continue to require all 128 clear completions, all handle releases, all context closes, and all callback deaths before mutation |
 | S069 | Enter every raw Binder context on the teardown thread before clearing anchor death notifications | Fresh primitive probe `20260823-103649-493667` passed the complete raw-holder retirement gate in 219 ms, before arming arbitrary-read reclaim. Both disclosures passed; the raw root path reached arbitrary-read preparation 8.389 seconds after `root-flow-start`. The first unlink then produced `exact_payload=0`, an existing safely contained acquisition miss, and the controller confirmed its planned `reboot,shell` | Accept the exact raw-context retirement mechanism. Repeat from a fresh boot to distinguish ordinary arbitrary-read allocator variance from a topology regression; never retry the unlink on the same boot after the miss |
 | S070 | Repeat S069 from a second fresh boot | Primitive probe `20260823-103809-144081` again passed raw-holder retirement, this time in 226 ms, and again reached arbitrary-read preparation in 8.273 seconds. The first unlink produced the identical safe `exact_payload=0` miss | Classify the miss as structural. Raw teardown frees 7,360 held Binder refs on the CPU-2 critical allocator immediately before arbitrary-read reclaim, unlike the dispersed deferred release of 64 isolated processes. Perform the already-proven exact teardown on CPU 0, restore CPU 2 explicitly, and retest from a fresh boot |
+| S071 | Retire all raw-holder resources on CPU 0, then restore CPU 2 before reclaim | Fresh probe `20260823-232129-677052` passed the exact 128-context retirement gate in 232 ms, acquired and validated the arbitrary-read carrier, and reached helper profiling in 8.51 seconds from root-flow start. It then failed closed before credential mutation because the shell leader still shared a usage-479 credential instead of the required private usage-2 credential; the planned `reboot,shell` completed | Accept CPU-separated retirement. The faster path exposed a latent helper-ordering assumption. For primitive-probe mode only, isolate the leader with the same raw same-ID `setresuid` operation already proven by the clean-command path before publishing its Binder target |
+| S072 | Isolate the primitive-probe shell leader with same-ID `setresuid` before target registration | Fresh probe `20260823-232616-046612` again passed raw retirement and arbitrary-read acquisition, but the helper credential remained at usage 479. The raw syscall returned success, so same-ID `setresuid` alone was a no-op for credential ownership | Reject the incomplete sequence. Publish the Binder target first, then use the production sequence: verify ambient `CAP_CHOWN` is clear, lower it, perform same-ID `setresuid`, and revalidate securebits, ambient state and shell IDs |
+| S073 | Apply the proven ambient-lower plus same-ID `setresuid` sequence after target publication | Fresh probe `20260823-232943-855088` passed on its first attempt. The helper leader had exact usage 2, both disclosures and the 128-context retirement proof passed, arbitrary-read acquisition completed, and root profiling reached `primitive-reboot-required` 9.613 seconds after `root-flow-start`; the planned reboot completed | Accept for primitive-probe mode. Carry the raw-holder topology into one full Root-to-visible-Active run without changing the four semantic writes, action, rescue or strict cleanup gates |
+| S074 | Exercise the accepted raw-holder topology in the full Root-to-visible-Active path | Run `20260824-003004` failed safely during the first disclosure, before raw holders or mutation: the unchanged epitem analyser rejected the sample. Root-to-controller failure took 14.1 seconds. Failure collection then decoded binary logcat as strict UTF-8 and raised a second host exception | Do not attribute the pre-topology miss to raw holders. Make text evidence decoding loss-tolerant while preserving binary app artefacts byte-for-byte, then repeat from a fresh boot |
+| S075 | Repeat the unchanged full raw-holder candidate after fixing evidence decoding | Run `20260824-003211` reached the raw path, then the controller observed a bounded unlink/fake-node miss 6.73 seconds after harness dispatch and the watchdog confirmed `reboot,shell`. The reboot pre-empted the app-private tar archive, so the exact payload receipt was unavailable; controller hashes and the failure signature survived. No root window, action or success was claimed | Count this as a reliability failure, not a timing pass. Repeat the unchanged candidate from a fresh boot to obtain either a complete raw-holder pass or an intact exact miss receipt before changing allocator geometry |
+| S076 | Third full raw-holder sample | Run `20260824-003421` passed every gate in 32.332 seconds from Root tap to Prism foreground with visible Active. ReSukiSU resumed at 28.463 seconds and Prism at 29.310 seconds. All writes 1, 2, 5 and 6, one safely recovered write miss, rescue finalisation/unload, donor resumption, exact 128-context retirement and strict cleanup passed. Native root flow was 21.675 seconds | Accept this as the first full behavioural proof, not a reliability gate. Preserve the topology and remove structural serial work: 5.285 seconds disclosure, 5.058 seconds arbitrary-read/profile/arming, 8.892 seconds writes/action, and 1.493 seconds cleanup |
 | S071 | Perform exact raw-context teardown on CPU 0, then restore CPU 2 before reclaim | Fresh primitive probe `20260823-104028-897896` again passed both disclosures and raw retirement, but the first arbitrary-read unlink still returned the same safe `exact_payload=0` miss | Reject CPU placement as the cause. The direct victim-owner forwarding path imports every filler and anchor proxy into the victim process; its exit then frees roughly 1,500 refs immediately beside the victim node, unlike the old path where the harness sent fillers directly to holders. Split the root spray into direct support refs and victim-owned controlled refs so the victim imports only the 128 raw callback endpoints |
 | S072 | Split root delivery into direct filler/anchor transactions followed by one victim-node transaction per context | Four consecutive fresh probes (`20260823-104302-342323` through `20260823-104611-753102`) failed closed at node analysis before mutation. The split removed the victim's filler proxies but also removed the accepted single-transaction allocation geometry | Reject split delivery. Preserve one composite payload while avoiding Java `BinderProxy` materialisation: copy the remote victim handle directly from its export `Parcel`, validate its exact `BINDER_TYPE_HANDLE` layout in C++, append that object into each composite holder payload, and recycle the sole temporary handle before analysis |
 | S073 | Forward the victim handle as a validated raw `Parcel` object in the original composite payload | Fresh primitive probe `20260823-105030-129177` passed node analysis, retired all 128 raw contexts in 200 ms, reclaimed the exact fake-node payload, and passed arbitrary-read handoff and controlled-free gates. It then failed closed because the native unlink ledger still required the old isolated-process retirement state; no write occurred and the planned reboot completed | Accept zero-proxy composite forwarding. Publish a distinct native raw-context retirement receipt only after reconciling exactly 7,360 handle releases, 128 death-notification clears, 128 mappings, 128 descriptors, and 128 Java callback deaths. Let the existing unlink and terminal-cleanup ledger consume either the 64-process proof or the stronger 128-context proof explicitly |
@@ -667,9 +673,10 @@ a consumed carrier or weaken terminal repair receipts.
   `worker_index=-1`, `exact_payload=0` and `buffer_freed=0`; no semantic
   write occurred. The nonce- and boot-bound process-teardown watchdog then
   performed the expected controlled reboot.
-- The missed control allocation was at raw index 6,288. A 512-worker cohort
-  supplies 5,632 freshly allocated datagrams, so the miss was outside its
-  measured coverage rather than an ambiguous payload collision.
+- The miss reported `raw_index=6288`. This field is the masked low portion of
+  the unreclaimed original userspace pointer when no indexed payload matches;
+  it is not an allocation ordinal and must not be compared with the 5,632
+  prefilled datagrams. The earlier coverage interpretation was incorrect.
 - Widen only the initial arbitrary-read acquisition to 1,024 fresh workers.
   Keep all four semantic-write cohorts at 512 workers. Preserve dynamic
   exact-count checks in the split-decrement and hand-off gates.
@@ -683,8 +690,1092 @@ a consumed carrier or weaken terminal repair receipts.
   unload, donor resumption, Binder/process retirement, the ordered
   ReSukiSU-to-Prism lifecycle transition and visible Active result.
 - Accept the widened victim-0 acquisition as the new recoverable reliability
-  checkpoint. The five-run minimum is satisfied, but none of these runs meets
-  the 10-second performance target.
+  checkpoint on the evidence of the five-run gate only. Do not claim that its
+  width causally eliminates victim-0 misses. None of these runs meets the
+  10-second performance target.
+- A subsequent Perfetto run, `20260824-000609`, perturbed the allocator and
+  missed victim 0 with the same original pointer signature despite all 1,024
+  workers reaching the exact blocked state. The buffer remained unfreed, no
+  semantic write occurred and the bound process-teardown watchdog rebooted.
+  Reject full tracing for performance runs and continue to treat initial
+  acquisition reliability as unresolved.
 - The acceptance clock remains the instant before the Root tap through Prism
   being foreground with visible Active. Controller completion and native
   phase timings remain diagnostic only.
+
+## 2026-08-24 — Aggregate read coherence
+
+- Run `20260824-004218` passed strict cleanup in 33.207 seconds. Bracketing a
+  complete donor snapshot with exact credential-pointer checks reduced the
+  successful write-2 completion from 1.846 seconds to 0.446 seconds while
+  retaining two identical, complete snapshots.
+- Run `20260824-004519` passed strict cleanup in 33.049 seconds. Applying the
+  same rule to the pre-write identity gate reduced each gate from roughly
+  0.36–0.40 seconds to 0.025–0.031 seconds. Three safe allocator misses hid
+  the saving in the end-to-end result.
+- Run `20260824-004957` passed strict cleanup in 30.126 seconds with one safe
+  write miss. The helper's two 19-word snapshots now use beginning, middle
+  and end pointer checks, remain byte-for-byte equal, and retain every shell
+  identity, capability, namespace and SELinux field. The native root flow was
+  19.384 seconds; direct security profiling fell to 5 ms.
+- Keep the aggregate checks. They remove repeated transport reads, not state
+  invariants. The remaining no-miss native floor is still about 18 seconds:
+  approximately 6.7 seconds for both disclosures, 2.4 seconds for target and
+  rescue profiling, 5.5 seconds for four reclaim/write cycles and root-window
+  gates, 1.4 seconds for the action, and 1.7 seconds for terminal cleanup.
+- The upstream fix confirms that CVE-2024-46740 corrupts the transaction
+  offsets array and can unwind arbitrary Binder-node decrements. It does not
+  provide a second primitive that avoids the existing kmalloc-128 reclaim.
+  Continue to optimise the reclaim lifecycle and orchestration rather than
+  changing CVE identity.
+- Run `20260824-005649` passed every gate with no allocator miss in 28.684
+  seconds. The native root flow was 18.076 seconds. Non-zero target readbacks
+  and the first-write preparation now avoid zero-specific transport checks
+  while retaining exact equality; keep this change.
+- Run `20260824-005948` overlapped raw-holder bootstrap with first-owner
+  cleanup and failed at the first arbitrary-read reclaim before an accepted
+  write. The controller performed its required `reboot,shell`. Reject that
+  overlap because it changes the allocator history feeding victim 0. Retain
+  the sequential holder bootstrap.
+- Run `20260824-010239` isolated the deferred-client preparation move and
+  passed strict cleanup in 30.950 seconds with two safe write misses. The
+  preparation still completed at the same target-profile boundary because
+  it was already hidden behind profiling. Reject the move as no-gain
+  scheduler noise and restore its previous position after private-credential
+  isolation.
+
+## 2026-08-24 — Ordered lookup and native victim contexts
+
+- Replace exhaustive Binder reference-tree scans with the kernel's ordered
+  descriptor lookup and retain the exhaustive walk only as a fail-closed
+  fallback. Run `20260824-010608` reduced helper, security, direct and rescue
+  target lookup to 2–8 ms with 10 visited reference nodes. The run passed in
+  30.2 seconds despite two safe write misses and a slow action.
+- Parallelising transactions to the 18 Android victim services did not remove
+  their dominant 1.6-second process-bind cost. Run `20260824-011124` passed in
+  31.0 seconds with two safe write misses; starting preparation after the
+  arbitrary-read hand-off hid about 0.67 seconds but left about 0.93 seconds
+  on the critical path.
+- Reuse the proven independent raw `/dev/binder` route for the 18 extra
+  victims. Each context receives and explicitly retains one target handle,
+  performs its export on a native thread, queues the controlled transaction,
+  then uses exact `munmap` and descriptor-close receipts as its retirement
+  event. Terminal cleanup explicitly releases both handles for every unused
+  context before closing it.
+- Run `20260824-012349` is not native-context evidence: the runner does not
+  install the rebuilt APK, so it exercised the prior installed Android-client
+  implementation and passed in 28.8 seconds. Always perform a data-preserving
+  `adb install -r` after rebuilding a new APK candidate.
+- The first installed native-context attempt, `20260824-012628`, missed the
+  initial victim-0 arbitrary-read reclaim before native context preparation.
+  Its 477-byte progress record ended at the arbitrary-read free boundary and
+  the controller performed the required recovery reboot. Treat it as ordinary
+  acquisition variance, not evidence for or against native contexts.
+- Installed run `20260824-012927` proved the native-context lifecycle end to
+  end in 28.2 seconds: all four semantic writes, action, terminal context
+  release and strict cleanup passed. Context retirement took 2–3 ms, but only
+  four of 17 reclaimed nodes matched the indexed spray; 13 misses were safely
+  observed without freeing the buffer. Do not accept this as a reliability
+  candidate. Test a short post-close settle before expanding the victim pool.
+- A 20 ms settle run, `20260824-013313`, improved the observed hit rate to
+  four successes from eight contexts and passed strict cleanup in 29.8
+  seconds. Its action phase took an atypical 5.56 seconds, so the headline is
+  not a useful settle comparison. Test 50 ms, close to the former Android
+  Binder-death observation interval, before selecting the dwell.
+- The 50 ms run, `20260824-013855`, passed strict cleanup in 25.5 seconds and
+  established the current native-context speed best, aided by overlapping the
+  unchanged 1.25-second bridge stability interval with preflight work. It used
+  nine contexts for four writes, versus eight at 20 ms, so 50 ms provided no
+  reclaim-rate evidence and added 30 ms per attempt. Restore 20 ms.
+
+## 2026-08-24 — Shared C++ victim cohort and exact foreground clock
+
+- The acceptance duration is exclusively the host monotonic interval starting
+  immediately before the Root input event and ending after Prism is foreground
+  and its visible UI hierarchy contains Active. Internal chain and controller
+  timestamps are diagnostic only.
+- Replace lossy foreground snapshots as the primary transition evidence with a
+  live `wm_set_resumed_activity` event stream started before the tap. A run now
+  requires the ordered ReSukiSU-to-Prism round trip. Retain window snapshots as
+  corroboration and the event-buffer dump as a fail-closed fallback.
+- Extract the 18-context route, export, token collection, controlled retirement
+  and exact terminal release lifecycle into the standalone `VictimCohort` C++
+  module. The JNI layer is now an adapter over that module rather than a second
+  implementation. Parcel templates are exported once and all routes are opened
+  in parallel.
+- Installed run `20260824-015333` missed the original victim-0 arbitrary-read
+  reclaim before deferred cohort preparation or kernel mutation. It followed
+  the existing controlled reboot policy. This is not evidence against the new
+  cohort.
+- Installed run `20260824-015600` passed all four semantic writes (1, 2, 5 and
+  6), exact readbacks, ReSukiSU action, rescue finalisation and unload, donor
+  resumption, context/process retirement and strict cleanup. Root tap to visible
+  Active was 26.251 seconds. The live lifecycle stream observed ReSukiSU at
+  22.457 seconds and the return to Prism at 23.396 seconds.
+- The 18 shared-core victim brokers completed in about 44 ms. The pass used 12
+  contexts for four successful writes, including eight safely observed misses.
+  Route setup is no longer a material bottleneck. The remaining critical path
+  is approximately 3.6 seconds to harness dispatch, 6.9 seconds through initial
+  arbitrary-read establishment, 4.7 seconds across write attempts, 5.5 seconds
+  for action/cleanup/return, and 2.4 seconds for the current visible-UI proof.
+  Reaching 10 seconds requires moving the disclosure and write orchestration
+  behind the standalone C++ seam; further victim-route tuning cannot do it.
+
+## 2026-08-24 — Indexed C++ holder cohort
+
+- Replace the sequential 128-route holder bootstrap with a fixed-index
+  `HolderCohort` in `primitive_core`. A single exported start-Service Parcel
+  contains a unique holder-index sentinel; the core patches it for each route
+  and opens routes using 32 bounded workers. The service stores callbacks by
+  that explicit index, so ActivityManager scheduling cannot reorder the exact
+  20–27 filler profile.
+- Keep receive and release ownership in the C++ module. Full activation still
+  requires exact receipts for 128 contexts, 7,360 handles, 128 death
+  notifications, 128 mappings and 128 descriptor closes.
+- Disclosure-only run `20260824-021025` passed in 4.872 seconds host and 3.764
+  seconds of checkpoints. Holder bootstrap took 286,560 microseconds, down
+  from roughly 0.9–1.2 seconds. Both the 128-route prime and controlled sprays
+  retained their exact shape.
+- Full Root-tap run `20260824-021138` passed in 31.010 seconds. The lifecycle
+  stream observed ReSukiSU at +27.176 seconds and Prism at +28.080 seconds;
+  the visible Active endpoint and manager receipt completed at +31.010
+  seconds. Writes 1, 2, 5 and 6 and terminal cleanup all passed.
+- That run had 13 safe write misses and used victims 3, 7, 14 and 17. The main
+  intervals were approximately: tap to controller 5.5 seconds;
+  controller/harness plus disclosure 8.7 seconds; writes 7.7 seconds; action
+  4.8 seconds; cleanup/result 3.2 seconds; return 1.1 seconds. Even eliminating
+  every write miss cannot make the current app/service/file-poll path meet 10
+  seconds.
+- Batched freeing of the 2,048 first-owner buffers remains reliable, but the
+  disclosure data confirms that holder route bootstrap—not those ioctls—had
+  dominated that interval. Do not revisit buffer-free batching as a material
+  latency strategy.
+
+## 2026-08-24 — Warm bridge and reusable live cohort rejection
+
+- Reuse the same daemonised Shizuku user service for preflight and activation.
+  Fresh-boot run `20260824-021630` found the existing service record and passed
+  all action and cleanup gates in 29.7 seconds. Root tap to controller start
+  still took about 5.3 seconds, so cold user-service creation was not the
+  dominant preflight cost.
+- Live reusable write cohorts remain unsafe. Run `20260824-022633` retired the
+  idle cohort immediately after write 2 but later stalled before the post-action
+  security-ready checkpoint. A narrower pre-action-only candidate in run
+  `20260824-023118` completed all four writes and reached the final action, but
+  reproduced action child status 22 and wrapper errno 42 exactly.
+- This reproduces the three earlier failures even with no reusable idle worker
+  or socket alive during the action. The incompatibility is residual CVE/kernel
+  state, not merely resource lifetime. Keep one-shot live cohorts; do not retry
+  reusable cohorts without a new kernel-state explanation and an equivalent
+  cleanup proof.
+
+## 2026-08-24 — Honest visible-frame timing and mixed disclosure
+
+- The acceptance endpoint is the first completed Prism frame whose hierarchy
+  reports Active, after the live resumed-activity stream has observed ReSukiSU
+  and then Prism. Foreground snapshots alone are not accepted because they can
+  miss both transitions.
+- Fresh-boot process warming passed five runs, but the first strict full run
+  remained 20.0 seconds. Launching the manager return concurrently with
+  normalisation and postflight also retained every gate, but the next strict
+  run was 20.2 seconds because six safe write misses consumed about 2.4
+  seconds. Keep the manager overlap; it removes roughly 1.1 seconds of serial
+  return work even when variance hides it in the headline.
+- One CVE decrement can sometimes disclose both structures without weakening
+  either analyser. Run `20260824-035651` passed with 118 file candidates, 142
+  epitem candidates and an eight-hit controlled Binder identity. It omitted
+  the 4,096-ref pre-prime, retained the full 4,096 epitem-pair population and
+  added controlled refs afterwards.
+- This mixed topology is not yet reliable. Full epitems plus the original ref
+  spray produced zero epitem candidates when the pre-prime was present. Sparse
+  replacement windows, including contiguous and every-fourth layouts, varied
+  between zero epitem evidence and zero canonical pairs. Ref-first fine-grained
+  interleaving produced a strong 22-hit Binder identity but no epitem-shaped
+  record. Epitem-first populations below the full 4,096 pairs likewise produced
+  no epitem-shaped record.
+- A late 4,096-ref prime can be released exactly while keeping all 128 native
+  holder contexts. The core preserves unreleased handles after any partial
+  failure, so terminal route cleanup remains complete. Compact and phased
+  8+1 sprays still yielded only zero to two repeated controlled-node hits;
+  do not lower the unchanged eight-hit identity threshold.
+- The 20.2-second full trace spends about 6.1 seconds preparing the private
+  credential and another 2.2 seconds arming the root watchdog before the CVE
+  chain starts. These intervals are now larger than the possible saving from
+  merging the two disclosures and must be profiled and refactored for a
+  ten-second end-to-end result.
+
+## 2026-08-24 — Preparation trace and write-batch reassessment
+
+- Full run `20260824-041440` passed every semantic write, readback, action,
+  terminal cleanup and exact visible-frame gate in 17.813 seconds. Three safe
+  write misses were recovered. This is the current end-to-end best, measured
+  from immediately before the Root input through ReSukiSU, Prism and the first
+  completed visible Active frame.
+- Private command transport is not the former six-second bottleneck. In the
+  17.8-second trace its authenticated private-credential exchange took about
+  0.31 seconds and root-watchdog arming took about 0.08 seconds. The two
+  independent disclosures, write attempts, action and terminal proof remain
+  the material path.
+- Run `20260824-044523` tested independent app-bridge and app-cohort gates in
+  parallel with kernel-subject and helper preparation. It failed closed at the
+  unchanged pre-mutation fake-node check, but the preparation trace was
+  conclusive: Binder/service contention stretched the app-cohort proof from
+  about 0.49 to 1.14 seconds, leaving total preparation unchanged. Reject and
+  revert this overlap.
+- Retain one full `getprop` parse in each device-profile sample instead of six
+  property subprocesses. Retain exactly two postflight baseline samples, but
+  reuse the second sample's JobScheduler count for the receipt instead of
+  collecting a redundant third dump.
+- The old all-at-once four-carrier design is not a route to ten seconds. Its
+  qualified full-width reclaim needed 4,097 workers, took 3.436 seconds to
+  construct and activate, then 12.138 seconds to retire 4,092 rejected
+  workers. A smaller pool mapped only one of four victims and failed closed.
+  Do not enable `BATCHED_TERMINAL_WRITES`; serial one-shot victims retain the
+  only accepted safe-on-miss recovery semantics.
+- Full run `20260824-044829` passed in 21.1 seconds with three safe write
+  misses. Preparation took 1.905 seconds from controller entry to harness
+  dispatch. The two disclosures and arbitrary-read establishment took 6.176
+  seconds, the write/root-window phase took 3.485 seconds, the action took
+  3.869 seconds, terminal cleanup took 1.502 seconds and strict postflight
+  took 1.306 seconds. Launch the mandatory Manager foreground transition only
+  after all writes and rescue/host checks pass, but overlap its process launch
+  with the already independent final `ksud` action.
+
+## 2026-08-24 — Early Manager overlap and controlled-only mixed rejection
+
+- Dispatching the Manager foreground launch immediately after the four
+  semantic writes, rescue plan and host-side root-window checks are complete
+  is valid. A dispatch latch proves that ActivityManager received the launch
+  before the native action starts; the chain still withholds Active until the
+  action, normalisation, exact retirement, terminal cleanup and postflight all
+  pass. Strict runs reached 17.534 seconds (`20260824-050858`) and 16.916
+  seconds (`20260824-051611`). Keep this overlap.
+- The 16.916-second run observed ReSukiSU at +13.487 seconds, Prism at +16.683
+  seconds and the first completed visible Active frame at +16.916 seconds.
+  It had two safe write misses. Preparation took 1.938 seconds; the two
+  disclosures and arbitrary-read establishment took 5.622 seconds; the write
+  and root-window phase took 4.212 seconds; action plus verified terminal work
+  took 2.130 seconds; controller postflight and return took 1.478 seconds.
+- The epitem selected by the arbitrary reader is not at a fixed spray index.
+  Three fresh boots selected shared-spray indices 804, 731 and 851. Do not use
+  a guessed index to avoid the file-to-epitem linkage proof.
+- A controlled-only mixed spray with no filler Binder refs preserves the full
+  epitem population much better than earlier mixed geometries. At 512 holder
+  contexts, one run passed in 2.733 seconds of checkpoints with 96 file
+  candidates, 150 epitem candidates and a 202-hit Binder node candidate; all
+  512 contexts and handles retired exactly. The next fresh boot produced an
+  epitem-only leak with no node candidates, so it failed the consecutive gate.
+- Explicit epitem replacement windows made the trade-off deterministic within
+  a boot but not stable across cold boots. A 512-slot/512-ref window produced
+  513 exact controlled identity records and no file landmark. A 128-ref
+  window retained 140–152 file candidates but produced zero repeated node
+  identity. A 1,024-slot/512-ref window also varied between a node-only leak
+  and an epitem-only leak. Removing the late 8,192 shared-only epitems did not
+  stabilise placement. Reject this mixed path for activation; keep the normal
+  two-disclosure path enabled.
+
+## 2026-08-24 — Native dwell and split-disclosure experiments
+
+- Reducing the arbitrary-read split dwell and fake-control release settle from
+  200/500 ms to 20/20 ms retained every semantic write, action, cleanup and
+  visible-frame gate in strict run `20260824-054435`. The run took 18.684
+  seconds to the completed Active frame and incurred six recoverable write
+  misses. The saving was only about 130 ms in arbitrary-read preparation, so
+  retain this as a reliability candidate rather than treating it as the route
+  to ten seconds.
+- Closing all fake-control peers before joining their workers changed allocator
+  retirement order and caused the next fake-node acquisition to fail closed.
+  The controller performed its designed safety reboot; there was no root
+  window. Restore one-at-a-time close/join ordering and do not retry batching
+  without a new allocator proof.
+- A full 4,096-slot dense replacement window with 512 controlled refs produced
+  73 repeated Binder-node hits but no epitem candidates. Splitting the CVE
+  decrements 576/576 around the full epitem allocation produced 318 controlled
+  node hits but still no epitem candidates. Both disclosure-only runs retired
+  all 512 refs exactly and performed no kernel mutation.
+- The split path matches the proven syscall order but not its free-slab volume:
+  the normal epitem disclosure frees all 1,152 nodes before SCM pressure and
+  epitem allocation. Test a 1,024/128 split next, preserving most of the proven
+  epitem reclaim geometry while reserving 128 victim nodes for the controlled
+  Binder identity. Do not enable it for activation until it passes at least
+  five consecutive fresh boots.
+- The first 1,024/128 launch stopped before any decrement because the temporary
+  native API accepted only an equal 576/576 partition. Generalise the
+  experimental guard to accept exactly two batch-aligned, contiguous ranges
+  totalling 1,152 while preserving inventory identity and call-order checks;
+  repeat the same disclosure-only candidate.
+- The corrected 1,024/128 launch then produced a 32-hit controlled Binder
+  identity but no epitem landmark. Its receipt exposed two consecutive SCM
+  pressure cycles: the new range function performed one and the existing mixed
+  begin function performed another. The proven epitem disclosure uses exactly
+  one cycle. Defer pressure entirely from the range API and keep the mixed begin
+  call as the sole pressure phase before epitem allocation.
+- With one pressure cycle, the next fresh boot produced 112 repeated controlled
+  Binder hits but still no epitem landmark. The mixed path was also creating
+  all 512 Binder holder routes before the epitem reclaim, unlike the proven
+  first disclosure. Defer holder-route bootstrap until the full epitem
+  population is retained, then create the routes before decrementing the
+  reserved final 128 nodes.
+- Deferring holder bootstrap passed immediately, then passed five consecutive
+  fresh boots in `20260824-060913`. Host disclosure times were 3.898, 3.795,
+  3.658, 3.663 and 3.613 seconds. Controlled-node hits ranged from 60 to 166,
+  file candidates from 16 to 290 and epitem candidates from 55 to 443. Every
+  run retired all 512 routes and handles exactly, and no run enabled arbitrary
+  read or any kernel write.
+- The 512-route bootstrap costs about 1.29 seconds. The split reserves only 128
+  victim nodes for the controlled identity, and the observed hit margin is
+  large, so restore the production holder count of 128 and gate that smaller
+  topology separately before integrating the one-disclosure path into root.
+- The 128-holder topology passed five consecutive fresh boots in
+  `20260824-061636`, with host times of 2.571, 2.572, 2.479, 2.540 and 2.604
+  seconds. Controlled hits ranged from 47 to 341, file candidates from 158 to
+  222 and epitem candidates from 218 to 301. All 128 routes and handles retired
+  exactly on every run.
+- Promote this exact 1,024/128 chronology to `root-chain`: real raw-target and
+  client preparation, controlled-node export and kernel anchor remain enabled;
+  exact holder retirement still precedes the mutation checkpoint; arbitrary
+  read, semantic writes, action, normalisation and terminal cleanup remain
+  unchanged. Keep the package-free `chain-addresses` stage mutation-free.
+- First integrated run `20260824-062225` failed before the root window because
+  the compact root holder sender correctly rejected a missing filler-node
+  inventory. The controller performed a controlled `reboot,shell`; there was
+  no kernel crash or write. Fetch the unchanged filler inventory only after the
+  epitem population is retained, then bootstrap holders and decrement the final
+  128 nodes. This preserves the gated epitem allocator chronology.
+- Integrated run `20260824-062523` disproved that late fetch: progress stopped
+  after `mixed-epitem-early-pass` while synchronously fetching 1,536 filler
+  objects from the already decremented owner. The six-minute runner timeout
+  found the same boot, no arbitrary-read arm and no mutation. The five-run
+  disclosure gate had fetched filler objects before decrement. Restore that
+  exact ordering for root and do not transact for the inventory afterwards.
+- Run `20260824-063436` then completed without a hang but both disclosure
+  analysers missed and exact pre-window cleanup triggered a controlled
+  `reboot,shell`. Root alone had created the raw target/client cohort before the
+  epitem reclaim; the gated path did not. Move target/client preparation after
+  the epitem population is retained and before the final 128-node decrement,
+  matching its position between the two disclosures in the proven root chain.
+- Run `20260824-063701` still failed closed before the root window. The full
+  receipt showed 896 retained handles: compact root mode was sending the
+  controlled node, five filler nodes and the kernel anchor to every holder.
+  Only six controlled hits remained and the epitem landmark was gone. Make the
+  mutation-free `chain-addresses` stage exercise the same target/client,
+  controlled-node and anchor topology as root. Reduce compact root payloads to
+  the two semantically required objects (controlled node plus anchor), then
+  qualify this 256-handle disclosure before another root run.
+- The first root-topology probe stopped before sending holder payloads because
+  the old `chain-addresses` validator expected zero exported siblings while the
+  emulated root client correctly exported 95. Require the exact 95-sibling
+  cohort whenever mixed disclosure is active; keep the same uniqueness and
+  native cohort validation.
+- The corrected two-object root-topology probe retained the epitem proof (198
+  file and 323 epitem candidates) and retired all 256 handles exactly, but no
+  controlled Binder identity occupied the reserved 128 nodes. Test an 896/256
+  split so the second free partition matches the 256-object payload while the
+  first retains substantial epitem margin.
+- The 896/256 probe again retained strong epitem evidence but produced only two
+  controlled hits. Raw export was materialising and validating 95 cohort
+  siblings after the second decrement, consuming the reserved allocation
+  window before the holder payloads. Move the complete export and validation
+  before the second decrement, then send holder payloads immediately after it.
+- That reorder raised the controlled identity only to four hits. The mandatory
+  kernel anchor was still competing with the controlled node in the same
+  transaction. Send only the controlled node in the reclaim window. After both
+  unchanged analysers pass, send the anchor as a separately accounted holder
+  phase and prove its dedicated retention before arbitrary read. Exact native
+  release continues to cover handles from both phases.
+- Separating the anchor retained strong epitem evidence but the raw-client
+  controlled identity still produced only two hits. Re-test a balanced 576/576
+  split now that duplicate pressure, early holder bootstrap, post-decrement
+  cohort export and anchor competition have all been removed. Earlier balanced
+  results do not represent this corrected chronology.
+- The corrected balanced probe exposed 99 hits in the second-ranked candidate
+  but selected none: the sole controlled object was also the death-subscribed
+  object, and multi-cohort analysis deliberately excludes death-marked nodes.
+  Use no per-object death subscription for the one-object reclaim phase, as in
+  the reliable disclosure topology. Continue proving all 128 route-process
+  deaths independently. Terminal native accounting accepts only the exact old
+  7,360-handle/128-death profile or the new 256-handle/zero-object-death profile.
+- The first zero-death balanced probe passed both analysers, but the next fresh
+  boot retained 64 controlled hits and lost the epitem landmark. Restore the
+  896/256 split: its epitem proof was consistently strong, and its only prior
+  node failure was the now-corrected death-candidate exclusion.
+- The corrected 896/256 root-topology gate passed four fresh boots, then run 5
+  retained 122 controlled hits but lost its epitem landmark. Increase the
+  epitem partition to 1,024 and reserve 128 nodes, exactly matching the 128
+  zero-death controlled references. Earlier 1,024/128 root results predate the
+  export-order, anchor-phase and death-filter corrections.
+- The corrected 1,024/128 gate passed three fresh boots, then run 4 retained
+  strong epitem evidence but produced only two controlled hits. Increase the
+  holder cohort to 256 for reclaim coverage. Extend terminal proof with one
+  explicit exact profile: 256 contexts, 512 handles across controlled and
+  anchor phases, zero object-death subscriptions, and 256 callback deaths,
+  mappings and descriptors.
+- The 256-holder exact root-topology gate passed five consecutive fresh boots
+  in `20260824-070944`. Host times were 3.940, 4.094, 4.168, 3.995 and
+  3.888 seconds. Each run used the 1,024/128 split, validated the full raw
+  cohort and controlled template, passed both unchanged analysers, retained the
+  anchor only after analysis, and retired exactly 512 handles, 256 route
+  contexts, 256 callbacks, 256 mappings and 256 descriptors. Promote this
+  topology to one strict end-to-end root run.
+- The saved lifecycle evidence is authoritative, but the live console observer
+  was consuming old buffered `logcat` history before reaching current events.
+  Start the observer at the tail of the buffer so ReSukiSU and Prism foreground
+  transitions print when Android emits them. Continue measuring from just
+  before the Root input command through the first completed visible Active
+  frame; `dumpsys` focus samples are diagnostic only.
+- End-to-end run `20260824-071513` proved the one-disclosure arbitrary-read
+  path and exact 512-handle holder retirement, then failed closed at
+  `current-binder-proc` before the root window. Moving the kernel anchor until
+  after analysis had removed every leaked node owned by the Harness process;
+  after the raw client retired, the resolver had no live process cursor. Add a
+  distinct Harness-owned marker to exactly eight holder routes between the
+  controlled spray and leak analysis. Death-mark only those eight references
+  so analysis still selects the 256-reference zero-death controlled identity
+  but retains the marker in the ranked candidate set. Extend cleanup proof
+  only with exact 256-context profiles: 264 handles/eight death requests before
+  anchor retention, or 520/eight after it.
+- Marker probe `20260824-072319` wedged before stale-read enable because the
+  JNI receiver allowlist still rejected an eight-route phase and returned
+  before Java sent route 0. There was no arbitrary-read arm or mutation. Admit
+  the exact eight-route receiver in addition to the existing exact cohort
+  sizes; do not change receiver bounds or cleanup proof.
+- Corrected marker probe `20260824-072742` passed in 3.967 seconds, including
+  both unchanged leak analysers and exact retirement of 520 handles, eight
+  death requests and all 256 routes. The leak sampled only two marker records,
+  which is enough for the resolver but is not a robust margin. Increase marker
+  fan-out to 64 death-marked routes while retaining all 256 zero-death
+  controlled references. Replace the experimental marker cleanup profiles
+  with exact 320-handle/64-death pre-anchor and 576-handle/64-death post-anchor
+  profiles, then repeat the five-boot mutation-free gate.
+- The 64-route gate `20260824-072958` passed run 1 in 3.943 seconds, then
+  displaced the controlled identity on run 2: 49 death-marked records remained
+  while no zero-death controlled identity was identified. Exact pre-anchor
+  cleanup retired 320 handles and 64 death requests; no mutation occurred.
+  Reject the larger late fan-out. Restore eight routes and require both five
+  consecutive disclosure passes and non-zero death-marked leak evidence on
+  every run before returning to the root chain.
+- The restored eight-route gate `20260824-073345` passed five fresh boots in
+  3.911, 3.919, 4.151, 4.116 and 4.002 seconds. Every run retired exactly 520
+  handles and eight death requests and had non-zero death-marked records, but
+  run 5 had no repeated death-marked candidate (`second_hits=0`). Do not rely
+  on that ambiguous resolver input. Interleave the same eight marker objects
+  into the controlled phase at exact 32-route intervals. Keep the same exact
+  cleanup totals and eliminate the late marker allocation wave.
+- Initial interleaved probe `20260824-074137` wedged during the holder send,
+  before stale-read enable or mutation. `Parcel.appendFrom()` appended the raw
+  controlled object without advancing the write cursor, so the marker write
+  overwrote the payload and the exact receiver rejected route 0. Move the
+  cursor to `dataSize()` after the append and before writing the marker.
+- A second direct diagnostic run showed no interleaved receiver telemetry. The
+  receiver mode had been changed on the inactive legacy sender, while the
+  active root-shaped sender still declared one fixed object and sent two on
+  marker route 0. Restore the legacy declaration and apply `-1` only to the
+  root-shaped compact sender. Remove the temporary native diagnostics.
+- Corrected interleaving passed a direct probe with 121 controlled and six
+  repeated marker hits. The fresh-boot gate `20260824-075012` then passed four
+  runs in 3.858–4.094 seconds; run 5 retained a repeated marker but only six
+  controlled hits, below the unchanged hard threshold of eight. Exact
+  pre-anchor cleanup retired 264 handles/eight deaths and no mutation occurred.
+  Do not weaken the analyser. Increase the cohort to 384 controlled routes,
+  keep exactly eight evenly interleaved markers, and require exact 392/8
+  pre-anchor or 776/8 post-anchor handle/death retirement across 384 contexts.
+- The first 384-route direct probe failed cleanly at bootstrap because the JNI
+  route-creation allowlist still admitted only 128, 256 or 512 routes. The C++
+  cohort already supports any count up to 512. Add the explicit 384 entry to
+  route creation, matching the receiver and exact cleanup profiles.
+- The corrected 384-route topology passed five consecutive fresh boots in
+  `20260824-075727`: 4.331, 4.462, 4.446, 4.475 and 4.567 seconds. Controlled
+  hits were 128, 122, 50, 122 and 122 against the unchanged threshold of eight;
+  every run retained a repeated death-marked marker candidate and retired
+  exactly 776 handles, eight death requests and all 384 contexts, callbacks,
+  mappings and descriptors. Promote this exact qualified state to one strict
+  Root-input-to-visible-Active run.
+- Strict run `20260824-080256` completed the qualified disclosure and arbitrary
+  read but again failed closed at `current-binder-proc`; the controller issued
+  a normal `reboot,shell` before the root window. Repeated leak ranking does not
+  authoritatively identify the live Harness node. Extract the device-matched
+  5.10.198 kernel from the supplied `boot.img` with `vmlinux-to-elf`. Its
+  recovered symbols independently reproduce the existing `eventfd_fops`
+  (`0x02156800`), `fair_sched_class` (`0x022e6bc0`) and `init_cred`
+  (`0x027a0ae0`) offsets exactly, and place `binder_procs` at `0x02a61e90`.
+  After the existing kernel-base and init-credential validation succeeds, read
+  that global hlist head and traverse it with the existing exact Binder proc
+  PID/task/ref checks. Keep leak candidates only as a fallback cursor.
+- Strict run `20260824-080946` passed global current-proc discovery, then failed
+  closed at `credential-target-adopt` and performed a normal `reboot,shell`.
+  Each native holder route opens another Binder context, so 384 `binder_proc`
+  entries legitimately share the Harness PID. PID alone selected a holder
+  context without the Java credential-target handle. For each same-PID proc,
+  resolve that exact cached handle and additionally require its target proc PID
+  to equal the cached credential-target PID. Select only that structurally
+  bound Java Binder context.
+- Strict run `20260824-081308` passed the resolver, writes and guarded action.
+  ReSukiSU foreground appeared at +13.1 seconds and activation returned success;
+  ctlbuf restoration, donor resume and credential normalisation all passed.
+  The controller then waited 180 seconds without receiving terminal cleanup and
+  issued a normal `reboot,shell`. The exact native holder release and all 384
+  holder callback deaths occur before mutation, but their Android service
+  connections remained until the 10-second terminal Java retirement window.
+  Unbind exactly all 384 connections as part of that pre-mutation holder proof.
+  Also trace changing terminal checkpoints and stop immediately on an app-chain
+  failure so a later terminal fault is preserved rather than hidden by timeout.
+- A direct mutation-free probe disproved the connection hypothesis: the native
+  holder cohort does not populate Java's `isolatedConnections` list, so its
+  exact size is zero rather than 384. Revert the pre-mutation unbind requirement;
+  retain the improved terminal checkpoint and app-failure capture for the next
+  strict diagnostic run.
+- Strict run `20260824-083133` captured the actual failure within 11 seconds:
+  terminal Java retirement passed raw-target retirement, then timed out at
+  `owner-retire`. The Harness unbound bind-only `OwnerService2` before writing
+  its retirement request, allowing Android to terminate it before its 10 ms
+  file watcher observed the request. Keep the exact original Owner process
+  bound, write and validate its nonce/PID/start-time/boot-bound self-exit
+  receipt, then unbind the dead service connection. Preserve the existing
+  death barrier and complete identity-set retirement proof.
+- Strict run `20260824-083441` kept Owner2 bound but still timed out at the same
+  watcher stage. Replace file polling as the trigger with OwnerService's
+  existing same-UID, distinct-caller, exact PID/start-time terminal Binder
+  transaction. Extend it with the existing nonce, boot identity and
+  helper-retired marker; write the unchanged atomic self-exit receipt before
+  releasing references and killing the process. The Harness still validates
+  that receipt, the Binder death and the complete retired identity set before
+  unbinding.
+- Strict run `20260824-083935` proved the new Binder request was still rejected:
+  the action passed, raw-target retired, and Owner2 again produced no receipt
+  before the unchanged 10-second timeout. At this point Harness has adopted
+  root credentials, so Binder reports its transaction UID as 0 rather than the
+  package UID. Require that exact post-adoption UID, the distinct Binder caller
+  PID, and a matching live caller `/proc` start time, in addition to the already
+  bound Owner PID/start time, nonce, boot identity and helper-retired marker.
+  Do not loosen any receipt, death-barrier or identity-set proof.
+- Strict run `20260824-084352` still produced no Owner-side rejection receipt,
+  proving the terminal Binder request never ran: Owner2's Binder pool is not an
+  available terminal control plane. The earlier file watcher failed because an
+  atomic write after credential adoption replaced the command with a root-owned
+  inode that Owner2 could not read. Have Owner2 pre-create an empty app-owned
+  command inode during its authenticated terminal bind, then update that same
+  inode in place after helper retirement. The independent watcher ignores the
+  empty armed state and acts only on the exact nonce/PID/start-time/boot payload.
+- `20260824-084812` exposed a separate runner fault: the UI tap returned but no
+  controller for the new boot started, leaving the runner on stale prior-boot
+  files. Preserve the first-tap acceptance timestamp, require a current-boot
+  `controller-start` within two seconds, and retry the still-enabled Root button
+  at most twice without resetting the clock. Fail before mutation if dispatch
+  remains absent.
+- Strict run `20260824-085525` confirmed current-boot dispatch under that guard,
+  then missed safely at the unchanged root-unlink/fake-node analysis gate before
+  the root window. The controller performed its normal recovery reboot. Treat
+  this as ordinary primitive variance; do not weaken the analyser.
+- Creating and repeatedly reading the armed Owner command during the vulnerable
+  phase caused two further safe root-unlink misses (`20260824-085740` and
+  `20260824-090543`). A trigger-only watcher restored the previous primitive
+  shape in `20260824-090106`, which again reached the action but demonstrated
+  that Owner2 itself is not a dependable terminal co-ordinator. Replace its
+  self-retirement request with an exact PID/start-time guarded unbind and
+  `SIGKILL`; retain the already-armed Binder death barrier and complete original
+  identity-set retirement proof. Process exit performs Binder reference cleanup
+  in-kernel and removes the 10-second service-side scheduling dependency.
+- The first direct-kill integration attempt `20260824-090829` missed safely at
+  root-unlink. The new dispatch verifier had added 10 Hz ADB shell polling during
+  allocator shaping; move retries into the existing 500 ms observer so the
+  successful path adds no new polling. A separate mutation-free primitive run
+  `20260824-091030` then passed in 4.396 seconds (3.446 seconds by device
+  checkpoints), confirming the current 384-route C++ topology remains sound.
+
+## 2026-08-24 — First complete 384-route chain and 17.554-second baseline
+
+- Initial write reclaim with only 32 or 128 staged controls was too
+  probabilistic. A 512-control first wave produced five consecutive reclaim
+  successes (`20260824-091808` through `20260824-093004`), but two later safe
+  exact-payload misses showed that it was not a reliable final setting.
+- Keep the ordinary per-write batch at 512 controls, but stage all 1,024
+  already-prepared controls for the initial split-decrement reclaim. This does
+  not increase the pool or weaken the exact-payload gate. The first full run
+  with this split passed initial reclaim and the complete chain.
+- Owner2's terminal Binder request cannot be scheduled reliably and the
+  watcher changed allocator timing. The terminal path now unbinds the exact
+  bound Owner2 process, verifies its PID and `/proc` start time, sends
+  `SIGKILL`, waits for that exact identity to disappear, and records
+  `exit_signal=9`. Acceptance still requires the pre-armed Binder death,
+  complete original identity-set retirement, an independently parsed receipt,
+  and native `kill(pid, 0) == ESRCH`.
+- Correct the terminal proof to the actual qualified topology: 384 raw holder
+  contexts and 384 retired holder identities. Native cleanup passed with one
+  retained arbitrary-read carrier, 384 raw contexts and five controlled
+  unlink acknowledgements.
+- `register-shell` mutated the shared requested-stage field and caused a valid
+  root result to be labelled `root-unlink`. Capture the immutable chain stage
+  and have `runArbitraryRoot()` publish an explicit `stage=root-chain` wrapper.
+  This changes only result labelling, not success criteria.
+- Full artefact `artifacts/prism-runs/20260824-094039` is the first complete
+  accepted pass of this state. Root input to first completed visible Active
+  frame was 17.554 seconds. Android lifecycle evidence shows ReSukiSU at
+  +13.418 seconds, Prism at +17.321 seconds, and Active at +17.554 seconds.
+  Terminal cleanup, strict postflight and foreground ordering all passed.
+- Device critical path: controller start to harness dispatch 1.888 seconds;
+  native root flow to mixed disclosure analysis 3.692 seconds; arbitrary-read
+  establishment 1.191 seconds; credential and process profiling 1.065 seconds;
+  semantic writes, action and terminal cleanup about 6.15 seconds; cleanup to
+  visible Active about 3.54 seconds. The acceptance clock is unchanged and no
+  state is reported Active before the full proof chain completes.
+- Do not re-enable the old four-carrier batched-write path. Its qualified
+  4,097-worker form took 15.574 seconds for construction plus rejected-worker
+  retirement, and its smaller form failed exact mapping. It is slower than the
+  whole current activation and lacks the serial path's safe-on-miss recovery.
+
+## 2026-08-24 — Manager IPC acceptance and overlapped Prism return
+
+- Candidate `20260824-094950` first displayed Active at 15.936 seconds, with
+  ReSukiSU foreground at 12.155 seconds and Prism foreground at 14.654 seconds.
+  Starting Prism as soon as the action and terminal chain pass, while strict
+  postflight continues, saved about 1.6 seconds without exposing Active early.
+  The run is not qualified: foreground stability was disturbed after Active,
+  and ReSukiSU subsequently displayed **Not installed**.
+- Kernel-only evidence from that run was exact and positive: the `kernelsu`
+  module was live and `ksud debug info` reported version 35088, LKM true,
+  late-load true and runtime mode `late-load`. Source inspection at pinned
+  ReSukiSU commit `746686390b0cf2256818a97b2f620eadbd079995` showed that this
+  is separate from Manager IPC acceptance. The Manager says **Working** only
+  when its own process inherits `[ksu_driver]` and `Natives.isManager` passes.
+- The previous controller launched ReSukiSU before socket action 7 had returned,
+  so the already-running app process could miss descriptor injection. Move the
+  force-stop/start until after the exact accepted action frame. Preserve the
+  overlap with post-action normalisation and cleanup. Strengthen strict kernel
+  postflight from `debug version` to exact `debug info`, and separately require
+  the freshly spawned Manager UI to show **Working**, **LKM**, and **Jailbreak
+  mode**, with no root-grant warning.
+- `20260824-095558` and `20260824-095800` both missed safely at the unchanged
+  root-unlink/unlink-observe/fake-node gate before any kernel write. Each used
+  the controller's normal `reboot,shell` recovery. They are primitive variance,
+  not evidence about the corrected Manager launch order.
+
+## 2026-08-24 — Correct Manager state, prepared release, and 14.9-second best
+
+- `20260824-100332` is the first fully qualified Manager run after moving the
+  ReSukiSU launch behind the accepted action frame. It passed the exact KernelSU
+  `debug info` contract, then ReSukiSU displayed **Working**, **LKM** and
+  **Jailbreak mode**. Root input to visible Active was 16.8 seconds. Treat a
+  loaded kernel module without this Manager proof as a failure.
+- Split controller preparation from Root release. The user service, helper,
+  watchdog, donor and app cohort can now become ready before the tap, while the
+  Harness and CVE path cannot start until the authenticated session is released
+  by Root. Run `20260824-101153` proved this boundary and passed in 16.7 seconds;
+  two safe write misses masked the timing benefit.
+- Long-idle epitem-reader preparation was unreliable. Runs
+  `20260824-101603` and `20260824-101808` failed before mutation at epitem
+  analysis and the first arbitrary-read exact-payload gate respectively. The
+  reader prewarm was reverted. Do not repeat without a new allocator-lifetime
+  explanation.
+- Reorder the global `binder_procs` search so each holder context first checks
+  its known handle and PID, then performs structural validation only for the
+  matching process. This retains all validation but saved only about 31 ms.
+- `20260824-102429` is the current honest best: exact action, cleanup, KernelSU
+  postflight, Manager round trip and visible Active passed in 14.851 seconds.
+  It contained three safe write misses; the estimated no-miss duration is about
+  13.7 seconds. ReSukiSU appeared at +11.788 seconds, Prism at +13.469 seconds,
+  and the first completed Active frame at +14.851 seconds.
+- Warming extra Android owner/client processes before disclosure was rejected.
+  `20260824-102721` missed the Binder disclosure and `20260824-102912` passed
+  disclosure but missed the first arbitrary-read reclaim, both before mutation.
+  The warm-process calls were reverted.
+- The remaining no-miss path is roughly 3.8 seconds for mixed disclosure,
+  1.2 seconds for arbitrary-read establishment, 1.1 seconds for credential and
+  process profiling, 2.5 seconds for four writes, 1.3 seconds for action,
+  1.7 seconds for terminal work and 1.3 seconds for postflight/UI completion.
+  Small polling changes cannot close the gap. The next material candidate must
+  amortise several write-victim decrements while retaining exact per-victim
+  typed-reuse and safe cleanup proofs.
+
+## 2026-08-24 — Holder routing and prepared command transport
+
+- Raising native holder routing from 32 to 64 workers preserved the topology
+  and passed five consecutive fresh-boot primitive runs in
+  `20260824-104250`: 4.388, 4.516, 4.501, 4.420 and 4.418 seconds by the host
+  clock. The corresponding device checkpoint durations were 3.419, 3.478,
+  3.326, 3.419 and 3.314 seconds. Keep 64 workers.
+- Strict run `20260824-104810` passed exact cleanup, KernelSU and Manager
+  acceptance in 13.979 seconds despite one safe write miss. Holder bootstrap
+  fell from roughly 1.03 seconds with 32 workers to 0.90 seconds with 64.
+- Increasing interleaved current-process marker holders from 8 to 64 caused
+  primitive run `20260824-103937` to time out before the CVE during holder
+  receipt. Revert to 8; do not repeat this density change without a new Binder
+  allocation explanation.
+- Moving the complete private-credential handshake before Root is impossible:
+  the Harness Binder transaction creates that credential while also passing
+  the module and vendor descriptors. `20260824-105247` rejected the attempt
+  safely before release, with no CVE entry or mutation.
+- Prepare only the authenticated command socket before Root. Keep the private
+  credential request, identity proof, task snapshots, semantic gates and arm
+  after disclosure. Strict run `20260824-105502` passed with zero write misses
+  and exact Manager acceptance. The split removed about 158 ms from the
+  post-disclosure credential handshake. Its 15.583-second headline contained
+  about 1.8 seconds of unrelated ReSukiSU action variance, so retain the narrow
+  preparation but do not count the headline as a regression.
+- Route construction at 128 workers passed five fresh boots in
+  `20260824-110040`, but its 979.5 ms median holder bootstrap was 11.4 ms
+  slower than the qualified 64-worker median. Revert to 64: framework and
+  kernel serial work, rather than native worker availability, now bounds this
+  stage.
+
+## 2026-08-24 — Direct Manager registration and corrected native module load
+
+- Strict runs `20260824-112610` and `20260824-113106` passed the exact kernel,
+  cleanup and Manager gates at about 15.5 and 15.8 seconds. ReSukiSU displayed
+  **Working**, **LKM** and **Jailbreak mode**. Treat **Not installed** as an
+  unconditional failure even when the module and Prism result otherwise pass.
+- The pinned ReSukiSU module now accepts the already verified Prism Manager UID
+  as `lp3_manager_uid`, validates it, and registers it directly after throne
+  tracker initialisation. The original asynchronous package scan remains as a
+  fallback. This removes the package scan from the successful critical path
+  without weakening Manager IPC acceptance.
+- Initial fast-module runs rebooted immediately after action dispatch. Durable
+  action entry and controller-side task-state samples proved JNI entered but
+  never returned. Synchronous child phase logging was rejected because its
+  filesystem synchronisation perturbed the privileged path.
+- Root cause: the production C++ supervisor called `finit_module` with an empty
+  parameter string. The module therefore received UID zero, installed several
+  hooks, then rejected the UID late in initialisation. Pass the exact verified
+  Manager UID from the native supervisor, and reject invalid UIDs at the start
+  of module initialisation before installing any hooks. Keep direct Manager
+  registration after tracker/list initialisation.
+- Strict fresh-boot run `20260824-130158` is the first corrected fast-Manager
+  pass. ReSukiSU was observed foreground at +10.649 seconds and displayed
+  **Working**, **LKM** and **Jailbreak mode**; Prism returned at +12.729 seconds
+  and completed its first visible Active frame at +13.733 seconds. The action
+  itself returned in about 0.26 seconds. Two safely recovered write misses cost
+  about 0.6 seconds; the remaining material path is disclosure/acquisition,
+  four semantic write carriers, terminal cleanup and UI return.
+
+## 2026-08-24 — Early Prism return and reusable-carrier rejection
+
+- Launching Prism after the exact ReSukiSU action frame, in parallel with
+  normalisation and cleanup, is valid because Active remains withheld until the
+  full terminal and postflight contracts pass. Strict run `20260824-130942`
+  passed in 13.314 seconds with one safe write miss.
+- Deterministically starting and identity-validating three allocator processes
+  before Root passed once in `20260824-131527` at 12.99 seconds with no write
+  misses, but saved at most a few tenths and revisited a previously unreliable
+  allocator perturbation. Remove the pre-Root warm call; retain the proven
+  root-time process topology.
+- An `io_uring` probe on this kernel submitted 512 blocked `SENDMSG` operations
+  in about 1.5 ms after 23.8 ms preparation and reaped all of them in about
+  49.8 ms. It cannot safely replace the current pthread carriers: the rescue
+  module proves and repairs each blocked userspace `sendmsg` stack, whereas an
+  `io_uring` request has a different lifetime and saved-pointer representation.
+  Do not use it without a new, equally strict kernel-side rescue proof.
+- The old reusable pthread prototype failed because its task name was
+  `lp3-reuse-ctl`, while rescue deliberately accepts only `lp3-fake-ctl`.
+  Correcting the task identity allowed the full rescue, cleanup, KernelSU and
+  Manager contracts to pass in `20260824-132634`; this establishes that its
+  blocked stack shape is valid.
+- Reject that reusable topology as an optimisation. The run took 14.7 seconds
+  and incurred 11 safe write misses. Reusing hundreds of live socket and thread
+  objects perturbs the required kernel allocation sequence even though each
+  individual carrier is rescuable. Restore fresh serial 512-worker sprays.
+- Re-testing the historical 256-route, zero-marker topology against the current
+  chain did not reproduce its old gate. Full run `20260824-133414` reached all
+  four writes but rescue initialisation rejected the retained-carrier plan with
+  `EINVAL` and the watchdog performed a controlled `reboot,shell`. The next
+  mutation-free run in `20260824-133658` then missed both unchanged disclosure
+  analysers: the controlled identity had seven hits against the hard minimum of
+  eight, and there were zero file candidates. Restore the qualified 384-route,
+  eight-marker topology; the smaller cohort no longer has adequate margin.
+- Prestarting the real first `OwnerService` before Root constructs its Java
+  Binder inventory early without exporting nodes, but it still changes the
+  long-lived Binder process topology. Run `20260824-134402` passed disclosure
+  and arbitrary read, then failed the exact credential-target adoption gate
+  before the root window and performed controlled recovery. Revert; process
+  construction is part of the qualified topology even when kernel nodes are
+  lazy.
+- The rebuilt 384-route source did not expose Root in preflight run
+  `20260824-135003`. The shell controller reached its guarded `ready` phase in
+  about 3.25 seconds and made no kernel mutation, while the app UI remained on
+  **Preparing** until the 120-second preparation lease expired and clean
+  recovery passed. Diagnose the app snapshot/handle hand-off before treating
+  this as a primitive regression or running further activation experiments.
+- Fresh-boot attempt `20260824-135449` did not enter Prism preparation because
+  Shizuku's delayed boot receiver killed the manually started shell server
+  about four seconds after the runner's 2.5-second stability gate. Extend the
+  runner gate to five uninterrupted seconds and retain its bounded restart;
+  this is preflight reliability work and is outside the Root-to-Active clock.
+- Re-established 384-route run `20260824-135712` reached all four semantic
+  writes. Write 6 missed safely once and then passed, but the rescue module
+  rejected the five retained carriers with `EINVAL`; the action gate reported
+  failure and the watchdog completed a controlled reboot. Count this as a full
+  reliability failure. Repeat the unchanged baseline before attributing it to
+  the reverted source, because the exact zero-miss baseline previously passed
+  and this run used a different retained carrier after the safe retry.
+- Unchanged repeat `20260824-140045` again passed the four writes, after one
+  safe write-1 miss and two safe write-6 misses, then received the same rescue
+  `EINVAL` and performed a controlled reboot. This is a repeatable regression,
+  so add phase-specific errno mapping without relaxing any rescue predicate.
+- The first diagnostic-module run `20260824-140600` stopped at the earlier
+  ReSukiSU staging gate: the APK and Java asset size were updated to 119,712
+  bytes, but the native exact-size constant remained 119,648. The fail-closed
+  staging rejection and watchdog reboot were correct. Update the native size
+  constant before using this build to diagnose rescue initialisation.
+- Corrected diagnostic run `20260824-140903` reached all four writes with no
+  misses and returned mapped errno 76 (`ENOTUNIQ`) from
+  `lp3_prepare_repairs()`. The plan's five TIDs and five nodes were unique, so
+  inspection exposed the actual regression: the fresh serial sender function
+  had been reverted to task name `lp3-reuse-ctl`, while rescue deliberately
+  accepts only `lp3-fake-ctl`. Restore the qualified fresh-worker name and keep
+  `reusable = false`; this repairs identity validation without re-enabling the
+  rejected reusable topology.
+- Restored fresh-worker run `20260824-141142` passed every kernel, rescue,
+  cleanup, Manager and UI gate in 13.1 seconds with no write misses. ReSukiSU
+  became foreground at +10.2 seconds, Prism returned at +11.3 seconds and its
+  first complete Active frame rendered at +13.1 seconds. This re-establishes
+  the honest baseline after the rejected experiments.
+- Candidate: begin the read-only global `binder_procs` traversal immediately
+  after arbitrary-read establishment and await it after the independent
+  private-credential handshake. The target handle/PID and kernel read state are
+  already immutable at that point. Keep all existing result and timeout gates;
+  reject the overlap if it changes disclosure or write reliability.
+- Strict candidate run `20260824-141559` passed every kernel, rescue, cleanup,
+  foreground, Manager and UI gate in 12.5 seconds with no reported write miss.
+  ReSukiSU became foreground at +9.6 seconds, Prism returned at +10.7 seconds,
+  and the first complete Active frame rendered at +12.5 seconds. Retain the
+  read-only overlap for the final clean-build consistency gate; it changes no
+  mutation or recovery predicate.
+- The revised acceptance target is five consecutive strict fresh-boot runs
+  below 15 seconds. Remove temporary `PrismPrepareTiming` diagnostic logging,
+  rebuild and reinstall before starting the counted series so all five runs
+  exercise the exact candidate that will be committed.
+- The first strict series for that build passed at 12.5 and 12.2 seconds, then
+  run 3 (`20260824-141903`) missed the controlled Binder-node disclosure before
+  any kernel write. The controller correctly rejected the result and performed
+  a controlled `reboot,shell`. This resets the qualification series and shows
+  that 384 controlled routes no longer provide enough cold-boot margin.
+- Increase only the zero-death controlled route cohort from 384 to 512. Keep
+  the 1,024/128 decrement split, exactly eight interleaved death-marked current
+  process markers, the eight-hit analyser threshold, and exact native cleanup.
+  Extend successful cleanup acceptance to only the new exact 520-handle
+  pre-anchor and 1,032-handle post-anchor profiles across 512 contexts.
+- The mutation-free fresh-boot series `20260824-142712` passed five consecutive
+  disclosures. Device checkpoint durations were 3.761, 3.705, 3.801, 3.688
+  and 3.734 seconds. Controlled-node hits were 125, 140, 116, 138 and 78;
+  file candidates were 126–192 and epitem candidates were 167–315. Every run
+  retired exactly 1,032 handles, eight death notifications and all 512 route
+  contexts, mappings, descriptors and callbacks. Promote this exact APK to the
+  strict five-boot end-to-end gate without further code changes.
+- Strict series `20260824-143336` passed its first three fresh boots at 13.6,
+  13.2 and 13.4 seconds, then run 4 missed the initial arbitrary-read carrier
+  reclaim before any semantic write. The controlled-node disclosure had
+  already passed, so keep the 512-route topology and reset the strict count.
+- The failed boot produced the exact initial no-payload shape and the helper
+  armed its nonce/boot/PID-bound process-teardown watchdog. The controller did
+  not parse that proof because `ActivationProofs` still expected a historical
+  32-worker staged cohort and `isolated-retirement-proof-pass`, while the live
+  path uses all staged workers and `raw-holder-retirement-proof-pass`. Correct
+  those exact expectations; do not broaden the parser or accept a free buffer.
+- Use all 2,048 existing fake-control slots for the initial split-decrement
+  reclaim, rather than 1,024. Keep each exact indexed payload, the single
+  decrement, CPU choreography, state-2 barrier, hand-off validation and
+  one-retained-worker terminal proof unchanged. This increases only the
+  pre-mutation allocation coverage; qualify it through the primitive path
+  before restarting the strict five-boot series.
+- Reject carrier widening. The first 2,048-carrier primitive probe
+  (`primitive-probe-20260824-134415-806352.txt`) reached an exact prepared
+  2,048-worker/state-2 cohort but still observed the unreclaimed original
+  transaction payload. As earlier evidence warned, the masked `raw_index` is
+  not an allocation ordinal. Restore the 1,024-carrier width and do not spend
+  the timing margin on more equivalent allocations.
+- The enlarged disclosure path was retiring 1,032 holder handles, eight death
+  notifications and 512 complete Binder contexts immediately before victim-0
+  reclaim. Split the existing native holder lifecycle instead. After both leak
+  analysers pass, clear the eight marker deaths and release the exact 520
+  controlled/marker handles while retaining every empty route context. Then
+  retain the 512 kernel-anchor handles across victim-0 reclaim. Only after the
+  arbitrary-read carrier passes its exact indexed-payload hand-off should the
+  chain release those anchors, close all 512 contexts, observe all callback
+  deaths and publish the unchanged cumulative 1,032/8/512 retirement proof.
+  This moves allocator retirement without weakening final accounting or the
+  semantic-write boundary.
+- Update the initial-miss parser to the live 1,024 staged-worker fields and the
+  new `raw-holder-retirement-deferred` progress marker. It must still require
+  the exact no-free transaction shape and nonce/boot/PID-bound teardown token;
+  this repairs recovery evidence only and does not turn a miss into success.
+- The first split-lifecycle probe acquired and handed off the exact indexed
+  carrier, then correctly failed at `controlled-free-evidence`: the unlink
+  ledger only recognised fully retired holder cohorts. Add one exact
+  generation-bound `kReferencesReleased` state. It is reachable only after
+  the native core clears eight death notifications and releases exactly 520
+  handles. Only victim 0 may record its controlled free in this state. Later
+  write victims and terminal consumption still require `kProved`, which is
+  published only after the cumulative 1,032 handles, all 512 contexts,
+  mappings, descriptors and callback deaths reconcile.
+- The corrected split lifecycle passed five consecutive primitive probes on
+  their first attempts:
+  `primitive-probe-20260824-135439-102864.txt`,
+  `primitive-probe-20260824-135552-692616.txt`,
+  `primitive-probe-20260824-135658-854250.txt`,
+  `primitive-probe-20260824-135805-669098.txt` and
+  `primitive-probe-20260824-135912-595000.txt`. Every run reached
+  `arbitrary-read-pass`, completed root profiling through the retained carrier
+  and performed the planned clean reboot. Promote this exact APK to a fresh
+  strict five-run Root-to-visible-Active gate.
+- The first strict split-lifecycle run (`20260824-145943`) passed disclosure,
+  victim-0, full holder retirement, current-proc discovery and private
+  credential validation, then a read-only `ctlbuf-rescue-profile` call failed
+  before any semantic write. A direct root diagnostic
+  (`root-probe-20260824-140457-302356.txt`) then passed that exact profile,
+  both observed writes and the root window; its legacy host action later timed
+  out and the controlled reboot completed, so it is diagnostic evidence only.
+- Retry only the complete read-only ctlbuf rescue profile up to three times,
+  with no delay. Each attempt retains every existing pointer, fd-table, SELinux
+  label, epitem-link, donor and live-target predicate. Any pass is therefore a
+  full profile pass; three failures still stop before mutation. This adds only
+  a few milliseconds on a transient failure and does not retry a CVE decrement
+  or a kernel write.
+- Strict series `20260824-150615` passed its first three fresh boots at 14.398,
+  12.860 and 12.708 seconds. Run 4 completed the chain, Manager activation and
+  return to Prism, and the app visibly showed `Active` and ReSukiSU `Installed`,
+  but no `PrismVisibleState` frame-metrics event was emitted. The strict runner
+  timed out rather than inferring a timestamp, so reset the qualification
+  count. The Active layout can be computed while Prism is backgrounded and be
+  reused on resume without causing another measured frame. When an Active
+  layout is pending, explicitly schedule one decor-view invalidation on the
+  next animation frame. Continue to accept only the subsequent
+  `OnFrameMetricsAvailableListener` completion timestamp; do not substitute a
+  layout, lifecycle or UI-dump observation for a completed visible frame.
+- The redraw candidate's next strict series `20260824-151952` passed run 1 at
+  13.0 seconds, including a deterministic completed Active-frame event. Run 2
+  then missed victim-0 indexed carrier acquisition before any semantic write.
+  Its result followed the exact `root-unlink` → `unlink-observe` →
+  `fake-node-check` signature, and the bound process-teardown watchdog armed
+  and rebooted. This resets the count and confirms the remaining blocker is
+  primitive variance, not UI observation.
+- Test a two-wave initial carrier cohort: prepare 2,048 indexed workers, wake
+  the existing first 1,024 immediately after the exact decrement, require all
+  of them to remain blocked for the existing stability interval, then release
+  the other 1,024 through the existing global gate. This differs from the
+  rejected 2,048-at-once experiment by preserving the qualified first wave and
+  adding a second allocation window. Keep write cohorts at 512, retain one CVE
+  decrement and one victim observation, and reject any non-indexed payload.
+- Reject the two-wave carrier cohort. Four consecutive first-attempt primitive
+  probes passed, but the fifth artefact
+  `primitive-probe-20260824-144131-851413.txt` missed victim 0. Its preparation
+  proved all 2,048 workers blocked, with the first 1,024 stable before the
+  second wave, but the target still received the exact original pointer and
+  cookie. No buffer was freed and no semantic write occurred; the controlled
+  reboot completed. Restore 1,024 workers. Additional allocation coverage is
+  not causal because the node sometimes does not become reclaimable.
+- The acceptance target is now five consecutive strict runs below 15 seconds;
+  reliability and duration consistency take priority over further latency
+  reduction. Continue to require the real ReSukiSU foreground transition,
+  **Working**, **LKM**, **Jailbreak mode**, Prism foreground, and its first
+  completed visible **Active** frame.
+- Correct the previous node-lifetime diagnosis. Successful and failed cohort
+  observations both contain 81 Binder responses, no victim reference response
+  and the same transaction order. Across 145 saved successful observations,
+  140 indexed replacements were workers 0–31; five saved misses retained the
+  original pointer. The upstream KASAN trace frees the prematurely released
+  node in `binder_thread_read`, while the current implementation wakes every
+  spray worker before enabling that read. The nominally blocked cohort can
+  therefore succeed through incidental allocations that reach the kernel
+  after the target starts reading; widening an entirely pre-read cohort does
+  not address that race.
+- Candidate: retain exactly 1,024 indexed carriers and one decrement, but use
+  a 512/512 target-gated allocation overlap. Prove the first 512 entered and
+  remained stable, validate the exact `BR_NOOP`/`BR_FAILED_REPLY`, publish the
+  existing no-free and read gates, and hold the target immediately before its
+  Binder read. Only after that target-ready receipt, publish its read-go byte
+  and wake the remaining 512 workers. Require all 1,024 state-2 carriers,
+  the target-ready and read-go fields, the unchanged indexed-payload gate and
+  the same one-retained-worker cleanup. This changes allocation chronology,
+  not CVE count, payload semantics or failure acceptance.
+- Reject the first target-ready-only 512/512 overlap. It passed twice, then
+  `primitive-probe-20260824-150458-805687.txt` completed every overlap field
+  but still delivered the original pointer. Waking the late cohort near the
+  read does not prove the victim has already been freed.
+- Add an exact Binder-work boundary instead. The first attempted 68-byte and
+  72-byte boundary reads returned only `BR_NOOP` on this vendor kernel and
+  stopped safely before dequeuing work. Use the already proven 128-byte read:
+  it returns exactly `BR_NOOP`, `BR_INCREFS`, `BR_ACQUIRE`, `BR_INCREFS`,
+  `BR_ACQUIRE`, drains the victim work plus the following two tail-node
+  notifications, and cannot also fit the controlled transaction. Require the
+  first two pointer/cookie pairs to be the exact tail nodes, proving the victim
+  was released without a userspace reference notification. Migrate the target
+  from CPU 2 to CPU 1, wake and retain the second cohort on CPU 2, then publish
+  a separate continuation byte and migrate the target back before delivery.
+- The exact boundary candidate passed five consecutive first-attempt primitive
+  probes:
+  `primitive-probe-20260824-151458-990360.txt`,
+  `primitive-probe-20260824-151626-603665.txt`,
+  `primitive-probe-20260824-151743-400357.txt`,
+  `primitive-probe-20260824-151859-896178.txt` and
+  `primitive-probe-20260824-152013-825253.txt`. Every boundary reported
+  `victim_released=1`, `responses=5`, CPU `2->1`; final indexed workers were
+  6, 4, 13, 15 and 30; arbitrary read and root profiling passed; and every
+  planned recovery reboot was confirmed clean. Promote this exact APK to the
+  strict Root-to-completed-visible-Active five-run gate.
+- Strict series `20260824-162047` passed five consecutive fresh boots at
+  13.009, 13.283, 14.870, 12.855 and 13.074 seconds. Every run showed the
+  streamed ReSukiSU-to-Prism foreground round trip, a completed Active frame,
+  Manager **Working / LKM / Jailbreak mode**, four verified writes and exact
+  terminal cleanup. The 14.870-second tail contained five safely detected
+  write-reclaim misses; the retry path added about 1.57 seconds and recovered
+  without weakening any write predicate.
+- Do not treat that first series alone as final reliability evidence. An
+  unchanged confirmation series `20260824-163349` passed four boots at 12.603,
+  13.823, 13.696 and 12.552 seconds, then victim 0 missed before any semantic
+  write. Its exact five-response boundary still reported
+  `victim_released=1`, but the final transaction retained the original
+  pointer. The bound process-teardown watchdog performed the controlled
+  `reboot,shell`. This resets qualification.
+- Reject the 32/992 carrier split. The first actual primitive observation
+  showed worker 0 had replaced the freed node, proving that `state=2` is a
+  userspace pre-syscall marker rather than proof that an awakened worker has
+  already allocated. Removing that invalid index restriction exposed a real
+  original-pointer miss on the next probe. Restore the allocator-conditioning
+  512/512 split.
+- Extending the post-boundary dwell from 20 to 100 milliseconds passed five
+  consecutive first-attempt primitive probes, but strict series
+  `20260824-170244` failed on its second boot. The victim boundary was exact,
+  yet the delivered pointer and cookie were both zero. An unrelated allocator
+  had therefore consumed the freed slot during the target-file/coordinator-file
+  round trip. A longer fixed sleep cannot close the free-to-wake gap.
+- Replace that filesystem round trip with an eventfd created by the harness
+  process and transferred to the raw target through an explicit Binder
+  transaction. Immediately after the exact 128-byte boundary read, while
+  still on CPU 2, the target writes the eventfd. The coordinator is blocked on
+  that descriptor on CPU 1 and publishes the second spray gate before it
+  waits for the detailed file receipt. Continue only when both
+  `boundary_signal=1` and the ordered
+  `victim_released=1 early_reclaim=0 signal=1` record pass. The first attempt
+  to carry the descriptor in the bind Intent failed before the CVE because
+  Android rejected the descriptor transport; do not repeat it.
+- The Binder-transaction eventfd candidate passed five consecutive
+  first-attempt primitive probes:
+  `primitive-probe-20260824-161359-368575.txt`,
+  `primitive-probe-20260824-161516-372104.txt`,
+  `primitive-probe-20260824-161623-277224.txt`,
+  `primitive-probe-20260824-161732-012495.txt` and
+  `primitive-probe-20260824-161840-584537.txt`. All reached arbitrary read and
+  root profiling, then completed the planned clean reboot. The first retained
+  receipt showed `signal=1` and indexed worker 8.
+- Final strict series `20260824-171850` passed five consecutive fresh boots at
+  14.370, 13.149, 13.242, 14.761 and 12.513 seconds (mean 13.607, median
+  13.242). Indexed victim-0 workers were 26, 25, 32, 7 and 5. Every run had an
+  exact eventfd/free boundary, four of four verified writes, a real streamed
+  ReSukiSU-to-Prism foreground round trip, a completed visible Active frame,
+  Manager **Working / LKM / Jailbreak mode** with no **Not installed**, and
+  clean durable terminal proof with the module loaded, finalised and unloaded
+  and all primitive descriptors retired. Internal write misses were 4, 1, 1,
+  5 and 0; this explains the two slower runs without hiding them. This exact
+  candidate satisfies the revised under-15-second reliability target.
+- After adding `boundary_signal` to both ordered prepare-result parsers, rebuild
+  and qualify the exact shipped candidate again. APK SHA-256
+  `8d09bf39ba9b3051be8f49c4ce8e85f69303b74ecdb61039e533ef904220bee0`
+  passed strict series `20260824-173044` on five distinct fresh boots at
+  14.775, 13.230, 13.524, 13.099 and 12.694 seconds (mean 13.464, median
+  13.230, maximum 14.775). Indexed victim-0 workers were 31, 7, 9, 8 and 31;
+  internal write misses were 4, 1, 1, 0 and 0. Every run passed the exact
+  eventfd/free boundary, four verified writes, streamed ReSukiSU-to-Prism
+  foreground order, frame-metrics Active completion, Manager **Working / LKM /
+  Jailbreak mode** with no **Not installed**, durable normalisation and full
+  descriptor, object and watchdog retirement. The installed APK hash matched
+  the host build after the series, and the live Prism UI reported **Active**,
+  Shizuku **Running** and ReSukiSU **Installed**. This is the final qualifying
+  evidence set for the under-15-second target.

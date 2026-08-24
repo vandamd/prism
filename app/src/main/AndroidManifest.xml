@@ -63,13 +63,25 @@
             android:name=".OwnerService2"
             android:exported="false"
             android:process=":owner2" />
+        <service
+            android:name=".SecondOwnerWarmService"
+            android:exported="false"
+            android:process=":owner2" />
 
         <service
             android:name=".BatchClientService"
             android:exported="false"
             android:process=":client" />
         <service
+            android:name=".FirstClientWarmService"
+            android:exported="false"
+            android:process=":client" />
+        <service
             android:name=".BatchClient2Service"
+            android:exported="false"
+            android:process=":client2" />
+        <service
+            android:name=".SecondClientWarmService"
             android:exported="false"
             android:process=":client2" />
 

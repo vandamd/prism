@@ -1781,18 +1781,24 @@ static int __init lp3_ctlbuf_rescue_init(void)
 		return -EILSEQ;
 	result = lp3_loader_and_target_error();
 	if (result)
-		return result == -ESRCH ? -ENXIO : result;
+		return result == -ESRCH ? -ENXIO :
+			result == -EINVAL ? -EUCLEAN : result;
 	result = lp3_stabilise_carriers();
 	if (result)
-		return result == -ESRCH ? -ENODEV : result;
+		return result == -ESRCH ? -ENODEV :
+			result == -EINVAL ? -EREMOTEIO : result;
 	result = lp3_normalise_helper_real_cred();
 	if (result == -ESRCH)
 		result = -EOWNERDEAD;
+	else if (result == -EINVAL)
+		result = -EPROTO;
 	if (result)
 		goto fail;
 	result = lp3_prepare_repairs();
 	if (result == -ESRCH)
 		result = -EIDRM;
+	else if (result == -EINVAL)
+		result = -ENOTUNIQ;
 	if (result)
 		goto fail;
 	result = stop_machine(lp3_stop_and_repair, &context, NULL);
@@ -1800,6 +1806,10 @@ static int __init lp3_ctlbuf_rescue_init(void)
 		result = result == -ESRCH ? -ENOMSG : result;
 		context.error = context.error == -ESRCH ?
 			-EBADMSG : context.error;
+		if (result == -EINVAL)
+			result = -EBADR;
+		if (context.error == -EINVAL)
+			context.error = -EBADR;
 		result = result ? result : context.error;
 		goto fail;
 	}

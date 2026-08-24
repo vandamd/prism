@@ -117,7 +117,18 @@ class PrimitiveRuns:
                 encoding="utf-8",
             )
             self.require_disclosure_only(progress)
-            if not result.startswith("status=pass stage=chain-addresses "):
+            legacy_pass = result.startswith(
+                "status=pass stage=chain-addresses "
+            )
+            mixed_pass = (
+                result.startswith(
+                    "status=pass stage=mixed-disclosure-gate "
+                )
+                and "node=[status=pass stage=binder-ref-leak " in result
+                and "epitem=[status=pass stage=epitem-analysis " in result
+                and "release=[status=pass " in result
+            )
+            if not legacy_pass and not mixed_pass:
                 raise RunFailure("disclosure acquisition missed")
             self.adb.shell("am", "force-stop", PACKAGE)
             self.require_package_retired()

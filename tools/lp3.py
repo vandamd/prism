@@ -949,7 +949,9 @@ ISSUE_2_RESULT_PREPARE_FIELDS = (
     "write_enter_cpu", "write_return_cpu", "tid", "generation",
     "staged_generation", "generation_captured", "generation_valid", "expected",
     "staged_expected", "staged_active", "staged_wake", "staged_state2",
-    "staged_stable", "global_published", "all_entered", "all_state2", "blocked",
+    "staged_stable", "target_read_ready", "read_go", "boundary_signal",
+    "victim_work_ready",
+    "read_continue", "global_published", "all_entered", "all_state2", "blocked",
     "read_rc", "read_errno", "read_consumed", "read_write_consumed",
     "read_enter_cpu", "read_return_cpu", "read_tid", "poll_rc", "poll_errno",
     "poll_revents", "read_first", "read_second", "read_responses", "noop",
@@ -968,6 +970,7 @@ ISSUE_2_RESULT_COMPLETE_FIELDS = (
 ISSUE_2_OBSERVATION_FIELDS = (
     "status", "stage", "victim", "buffer", "ptr", "cookie", "worker_index",
     "raw_index", "exact_payload", "buffer_freed", "polling", "wait_cpu",
+    "read_go", "victim_boundary",
     "read_calls", "responses", "transactions", "last_response", "last_code",
     "flags", "data_size", "offsets_size", "refs_before_transaction",
     "victim_refs_before_transaction", "victim_ref_count", "last_ref_ptr",
@@ -1195,11 +1198,16 @@ def _issue_2_validate_prepare(
         "generation_captured": 1,
         "generation_valid": 1,
         "expected": 1024,
-        "staged_expected": 32,
-        "staged_active": 32,
+        "staged_expected": 512,
+        "staged_active": 512,
         "staged_wake": 1,
-        "staged_state2": 32,
+        "staged_state2": 512,
         "staged_stable": 1,
+        "target_read_ready": 1,
+        "read_go": 1,
+        "boundary_signal": 1,
+        "victim_work_ready": 1,
+        "read_continue": 1,
         "global_published": 1,
         "all_entered": 1,
         "all_state2": 1024,
@@ -1276,7 +1284,9 @@ def _issue_2_validate_observation(
         or not 0 <= int(record["cookie"]) < (1 << 39)
         or int(record["cookie"]) % 8 != 0
         or record.get("wait_cpu") != 1
-        or record.get("raw_index") != (int(record["ptr"]) & 0x3ff)
+        or record.get("read_go") != 1
+        or record.get("victim_boundary") != 1
+        or record.get("raw_index") != (int(record["ptr"]) & 0x1fff)
         or record.get("transactions") != 1
         or record.get("last_response") != ISSUE_2_INITIAL_LAST_RESPONSE
         or record.get("last_code") != 0x4266
@@ -2670,7 +2680,7 @@ def validate_proc_teardown_request(
     names = _issue_2_progress(progress)
     expected_tail = [
         "arbitrary-read-start",
-        "isolated-retirement-proof-pass",
+        "raw-holder-retirement-deferred",
         "arbitrary-read-reclaim-armed",
         "arbitrary-read-prepared",
         PROC_TEARDOWN_MARKER,

@@ -7,7 +7,11 @@ import android.content.pm.ApplicationInfo
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.util.Log
+import android.view.FrameMetrics
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -29,12 +33,28 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 class PrismActivity : ComponentActivity() {
     private val viewModel by viewModels<PrismViewModel>()
     private var requestedPackage: ReleasePackage? = null
     private var pendingApk: File? = null
     private var downloadJob: Job? = null
+    private val activeLayoutPending = AtomicBoolean()
+    private val activeFrameReported = AtomicBoolean()
+    private val activeStateLaidOut = AtomicBoolean()
+    private val frameMetricsHandler = Handler(Looper.getMainLooper())
+    private val frameMetricsListener =
+        android.view.Window.OnFrameMetricsAvailableListener { _, _, _ ->
+            if (activeLayoutPending.compareAndSet(true, false) &&
+                activeFrameReported.compareAndSet(false, true)
+            ) {
+                Log.i(
+                    "PrismVisibleState",
+                    "active_frame uptime_ns=${android.os.SystemClock.elapsedRealtimeNanos()}",
+                )
+            }
+        }
     private val packageInstaller =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
             ReleaseInstaller.delete(pendingApk)
@@ -60,6 +80,7 @@ class PrismActivity : ComponentActivity() {
         Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
         Shizuku.addBinderDeadListener(binderDeadListener)
         Shizuku.addRequestPermissionResultListener(permissionListener)
+        window.addOnFrameMetricsAvailableListener(frameMetricsListener, frameMetricsHandler)
         setContent {
             val state by viewModel.state.collectAsState()
             val isDark = isSystemInDarkTheme()
@@ -70,6 +91,10 @@ class PrismActivity : ComponentActivity() {
                     onActivationAction = viewModel::activate,
                     onActivationBack = viewModel::closeActivationLog,
                     onActivationShare = { state.activation?.let(::shareActivationReport) },
+                    onActiveLayout = {
+                        activeStateLaidOut.set(true)
+                        requestActiveFrameReport()
+                    },
                 )
             }
         }
@@ -81,6 +106,8 @@ class PrismActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        activeFrameReported.set(false)
+        if (activeStateLaidOut.get()) requestActiveFrameReport()
         val dark = resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
         window.statusBarColor = if (dark) Color.BLACK else Color.WHITE
@@ -90,11 +117,24 @@ class PrismActivity : ComponentActivity() {
         if (downloadJob?.isActive != true) viewModel.refresh()
     }
 
+    override fun onPause() {
+        activeLayoutPending.set(false)
+        activeFrameReported.set(false)
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        window.removeOnFrameMetricsAvailableListener(frameMetricsListener)
         Shizuku.removeBinderReceivedListener(binderReceivedListener)
         Shizuku.removeBinderDeadListener(binderDeadListener)
         Shizuku.removeRequestPermissionResultListener(permissionListener)
         super.onDestroy()
+    }
+
+    private fun requestActiveFrameReport() {
+        if (activeFrameReported.get()) return
+        activeLayoutPending.set(true)
+        window.decorView.postInvalidateOnAnimation()
     }
 
     private fun perform(action: PrismAction?) {

@@ -60,8 +60,8 @@ public final class ShellBridgeMain {
     private static final String RESCUE_MODULE_ENTRY =
             "assets/lp3_ctlbuf_rescue.ko";
     private static final String RESCUE_MODULE_SHA256 =
-            "f0be198e4a4d2da59691156593b463ec138ab96ea6558fb66f2a1551386343c3";
-    private static final int RESCUE_MODULE_SIZE = 119_648;
+            "ff4e063cc09b926c09b55a777705d386734a1d1db6428d3e41081486c07bbb86";
+    private static final int RESCUE_MODULE_SIZE = 119_712;
     private static byte[] rescueModuleBytes;
     private static FileDescriptor rescueModuleFd;
     private static FileDescriptor rescueVendorFd;
@@ -148,8 +148,8 @@ public final class ShellBridgeMain {
     private static final String RESUKISU_LOADER_PATH =
             "/data/local/tmp/lp3-resukisu-loader.so";
     private static final String RESUKISU_LOADER_SHA256 =
-            "e5afd38dbab906da06e6ce27d675545023bb8f53eb790c991a4da58b6f87a698";
-    private static final long RESUKISU_LOADER_SIZE = 1_301_272L;
+            "4922e1508c769c90f8734fd3914a31021aed4503f0743cb80b396c13a9f3e2ef";
+    private static final long RESUKISU_LOADER_SIZE = 1_323_008L;
     private static FileDescriptor reSukiFd;
     private static final String COMMAND_TOKEN =
             "/data/local/tmp/light-side-su.token";
@@ -219,6 +219,14 @@ public final class ShellBridgeMain {
             startProcessTeardownWatchdog();
         }
         registerTarget(securityPid, mode);
+        if ("hold".equals(mode)) {
+            String credential = NativeBridge.prepareProbeShellCredential();
+            if (!credential.startsWith("status=pass")) {
+                throw new IllegalStateException(
+                        "probe-shell-credential " + credential);
+            }
+            marker("PROBE_CREDENTIAL state=[" + credential + "]");
+        }
         if ("hold-partition-backup-hal".equals(mode)) {
             partitionBackupLoop();
             return;
