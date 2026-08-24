@@ -1114,25 +1114,34 @@ def _issue_2_root_chain(value: str) -> dict[str, str] | None:
     node_start, node_end = node_span
     if value[node_end:]:
         return None
-    outer = value[:node_start].strip()
-    epitem_span = _issue_2_bracket_span(outer, "epitem")
-    if epitem_span is None:
-        return None
-    epitem_start, epitem_end = epitem_span
-    if outer[epitem_end:]:
-        return None
-    outer_prefix = (
-        outer[:epitem_start] + outer[epitem_end:]
-    ).strip()
+    outer = value[:node_start]
+    outer_prefix = outer.strip()
     outer_record = _issue_2_record(
         outer_prefix, ("status", "stage"), {"status", "stage"}
     )
+    epitem_span = None
+    if outer_record is None:
+        epitem_span = _issue_2_bracket_span(outer, "epitem")
+        if epitem_span is None:
+            return None
+        epitem_start, epitem_end = epitem_span
+        if outer[epitem_end:].strip():
+            return None
+        outer_prefix = (
+            outer[:epitem_start] + outer[epitem_end:]
+        ).strip()
+        outer_record = _issue_2_record(
+            outer_prefix, ("status", "stage"), {"status", "stage"}
+        )
     if outer_record is None or outer_record["stage"] != "root-chain":
         return None
     expected_outer_prefix = (
         f"status={outer_record['status']} stage=root-chain"
     )
-    if outer[:epitem_start] != expected_outer_prefix + " ":
+    if epitem_span is None:
+        if outer != expected_outer_prefix + " ":
+            return None
+    elif outer[:epitem_start] != expected_outer_prefix + " ":
         return None
     node = value[node_start + len("node=["):node_end - 1]
     prepare_span = _issue_2_bracket_span(node, "prepare")

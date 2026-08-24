@@ -806,6 +806,7 @@ final class ActivationProofs {
                     "probe_epitems", 4096,
                     "control_blocks", 1024,
                     "expected_blocks", 1024,
+                    "prefilled", 11264,
                     "coordinator_cpu", 1,
                     "restored_cpu2", 1,
                     "thread_created", 1,
@@ -863,6 +864,19 @@ final class ActivationProofs {
                     "gate_unlinked_read", 0,
                     "reboot_required", 0);
 
+    private static final Map<String, BigInteger>
+            INITIAL_MISS_PREPARE_FAILURE_EXACT = overriddenNumbers(
+                    INITIAL_MISS_PREPARE_EXACT,
+                    "control_blocks", 0,
+                    "boundary_signal", 0,
+                    "victim_work_ready", 0,
+                    "read_continue", 0,
+                    "global_published", 0,
+                    "all_entered", 0,
+                    "all_state2", 0,
+                    "blocked", 0,
+                    "reboot_required", 1);
+
     private static final String[] INITIAL_MISS_PREPARE_POSITIVE_FIELDS = {
             "node",
             "file",
@@ -900,6 +914,14 @@ final class ActivationProofs {
             "raw-holder-retirement-deferred",
             "arbitrary-read-reclaim-armed",
             "arbitrary-read-prepared",
+            "arbitrary-read-proc-teardown-required"
+    };
+
+    private static final String[] INITIAL_PREPARE_FAILURE_PROGRESS_TAIL = {
+            "arbitrary-read-start",
+            "raw-holder-retirement-deferred",
+            "arbitrary-read-reclaim-armed",
+            "arbitrary-read-prepare-failed",
             "arbitrary-read-proc-teardown-required"
     };
 
@@ -1180,8 +1202,16 @@ final class ActivationProofs {
                 || !root.nodeTail.isEmpty()) {
             return null;
         }
-        ProofFields prepare = validateInitialMissPrepare(
-                parseIssueRecord(root.prepare, INITIAL_MISS_PREPARE_FIELDS));
+        ProofFields prepareRecord = parseIssueRecord(
+                root.prepare, INITIAL_MISS_PREPARE_FIELDS);
+        List<String> progressNames = parseProgress(progress);
+        if (root.first == null) {
+            return validateInitialMissPrepareFailure(prepareRecord) != null &&
+                    hasExactInitialPrepareFailureTail(progressNames) &&
+                    !hasForbiddenInitialMissProgress(progressNames)
+                    ? new InitialAcquisitionMissProof(token) : null;
+        }
+        ProofFields prepare = validateInitialMissPrepare(prepareRecord);
         if (prepare == null) {
             return null;
         }
@@ -1198,12 +1228,9 @@ final class ActivationProofs {
         ProofFields observation = validateInitialMissObservation(
                 parseIssueRecord(observationValue, INITIAL_MISS_OBSERVATION_FIELDS),
                 prepare);
-        if (observation == null
-                || !same(observation, "ptr", prepare, "raw_pointer")
-                || !same(observation, "cookie", prepare, "raw_cookie")) {
+        if (observation == null) {
             return null;
         }
-        List<String> progressNames = parseProgress(progress);
         if (!hasExactInitialMissTail(progressNames)
                 || hasForbiddenInitialMissProgress(progressNames)) {
             return null;
@@ -1290,7 +1317,7 @@ final class ActivationProofs {
         RootChain root = parseRootChain(result);
         ProofFields prepare = root == null ? null : validateInitialMissPrepare(
                 parseIssueRecord(root.prepare, INITIAL_MISS_PREPARE_FIELDS));
-        if (root == null || prepare == null ||
+        if (root == null || prepare == null || root.first == null ||
                 !"miss".equals(root.status) ||
                 !"miss".equals(root.nodeStatus) ||
                 !root.first.startsWith(
@@ -1694,22 +1721,32 @@ final class ActivationProofs {
         if (nodeSpan == null || nodeSpan.end != value.length()) {
             return null;
         }
-        String outer = stripWhitespace(value.substring(0, nodeSpan.start));
-        BracketSpan epitemSpan = bracketSpan(outer, "epitem");
-        if (epitemSpan == null || epitemSpan.end != outer.length()) {
-            return null;
-        }
-        String outerPrefix = stripWhitespace(
-                outer.substring(0, epitemSpan.start)
-                        + outer.substring(epitemSpan.end));
+        String outer = value.substring(0, nodeSpan.start);
+        String outerPrefix = stripWhitespace(outer);
         ProofFields outerRecord = parseIssueRecord(
                 outerPrefix, new String[] {"status", "stage"});
+        BracketSpan epitemSpan = null;
+        if (outerRecord == null) {
+            epitemSpan = bracketSpan(outer, "epitem");
+            if (epitemSpan == null ||
+                    !stripWhitespace(outer.substring(epitemSpan.end)).isEmpty()) {
+                return null;
+            }
+            outerPrefix = stripWhitespace(
+                    outer.substring(0, epitemSpan.start)
+                            + outer.substring(epitemSpan.end));
+            outerRecord = parseIssueRecord(
+                    outerPrefix, new String[] {"status", "stage"});
+        }
         if (outerRecord == null || !"root-chain".equals(outerRecord.raw.get("stage"))) {
             return null;
         }
         String status = outerRecord.raw.get("status");
         String expectedOuterPrefix = "status=" + status + " stage=root-chain";
-        if (!outer.substring(0, epitemSpan.start).equals(expectedOuterPrefix + " ")) {
+        if (epitemSpan == null
+                ? !outer.equals(expectedOuterPrefix + " ")
+                : !outer.substring(0, epitemSpan.start)
+                        .equals(expectedOuterPrefix + " ")) {
             return null;
         }
 
@@ -1717,13 +1754,18 @@ final class ActivationProofs {
                 nodeSpan.start + "node=[".length(), nodeSpan.end - 1);
         BracketSpan prepareSpan = bracketSpan(node, "prepare");
         BracketSpan firstSpan = bracketSpan(node, "first");
-        if (prepareSpan == null || firstSpan == null) {
+        if (prepareSpan == null) {
             return null;
         }
         String expectedNodePrefix = "status=" + status + " stage=root-unlink";
-        if (!node.substring(0, prepareSpan.start).equals(expectedNodePrefix + " ")
-                || prepareSpan.end > firstSpan.start
-                || !node.substring(prepareSpan.end, firstSpan.start).equals(" ")) {
+        if (!node.substring(0, prepareSpan.start)
+                        .equals(expectedNodePrefix + " ") ||
+                (firstSpan == null
+                        ? prepareSpan.end != node.length()
+                        : prepareSpan.end > firstSpan.start ||
+                                !node.substring(
+                                        prepareSpan.end, firstSpan.start)
+                                        .equals(" "))) {
             return null;
         }
         String nodePrefix = stripWhitespace(node.substring(0, prepareSpan.start));
@@ -1735,7 +1777,8 @@ final class ActivationProofs {
             return null;
         }
         String nodeStatus = nodePrefix.substring(0, nodeStatusEnd);
-        String nodeTail = node.substring(firstSpan.end);
+        String nodeTail = node.substring(
+                firstSpan == null ? prepareSpan.end : firstSpan.end);
         if (!nodeTail.isEmpty()) {
             return null;
         }
@@ -1747,7 +1790,7 @@ final class ActivationProofs {
                 node.substring(
                         prepareSpan.start + "prepare=[".length(),
                         prepareSpan.end - 1),
-                node.substring(
+                firstSpan == null ? null : node.substring(
                         firstSpan.start + "first=[".length(),
                         firstSpan.end - 1));
     }
@@ -1781,12 +1824,30 @@ final class ActivationProofs {
     }
 
     private static ProofFields validateInitialMissPrepare(ProofFields record) {
+        return validateInitialMissPrepare(
+                record, "pass", INITIAL_MISS_PREPARE_EXACT);
+    }
+
+    private static ProofFields validateInitialMissPrepareFailure(
+            ProofFields record) {
+        return validateInitialMissPrepare(
+                record, "fail", INITIAL_MISS_PREPARE_FAILURE_EXACT);
+    }
+
+    static boolean isRecoverableInitialPrepareMiss(String value) {
+        return validateInitialMissPrepareFailure(
+                parseIssueRecord(value, INITIAL_MISS_PREPARE_FIELDS)) != null;
+    }
+
+    private static ProofFields validateInitialMissPrepare(
+            ProofFields record, String status,
+            Map<String, BigInteger> exact) {
         if (record == null
-                || !"pass".equals(record.raw.get("status"))
+                || !status.equals(record.raw.get("status"))
                 || !"arb-read-prepare".equals(record.raw.get("stage"))) {
             return null;
         }
-        for (Map.Entry<String, BigInteger> entry : INITIAL_MISS_PREPARE_EXACT.entrySet()) {
+        for (Map.Entry<String, BigInteger> entry : exact.entrySet()) {
             if (!is(record, entry.getKey(), entry.getValue())) {
                 return null;
             }
@@ -1953,15 +2014,25 @@ final class ActivationProofs {
     }
 
     private static boolean hasExactInitialMissTail(List<String> names) {
+        return hasExactTail(names, INITIAL_MISS_PROGRESS_TAIL);
+    }
+
+    private static boolean hasExactInitialPrepareFailureTail(
+            List<String> names) {
+        return hasExactTail(names, INITIAL_PREPARE_FAILURE_PROGRESS_TAIL);
+    }
+
+    private static boolean hasExactTail(
+            List<String> names, String[] expected) {
         if (names == null) {
             return false;
         }
-        int start = names.indexOf(INITIAL_MISS_PROGRESS_TAIL[0]);
-        if (start < 0 || names.size() - start != INITIAL_MISS_PROGRESS_TAIL.length) {
+        int start = names.indexOf(expected[0]);
+        if (start < 0 || names.size() - start != expected.length) {
             return false;
         }
-        for (int index = 0; index < INITIAL_MISS_PROGRESS_TAIL.length; index++) {
-            if (!INITIAL_MISS_PROGRESS_TAIL[index].equals(names.get(start + index))) {
+        for (int index = 0; index < expected.length; index++) {
+            if (!expected[index].equals(names.get(start + index))) {
                 return false;
             }
         }
@@ -2205,6 +2276,18 @@ final class ActivationProofs {
             result.put(
                     (String) entries[index],
                     BigInteger.valueOf(((Number) entries[index + 1]).longValue()));
+        }
+        return Collections.unmodifiableMap(result);
+    }
+
+    private static Map<String, BigInteger> overriddenNumbers(
+            Map<String, BigInteger> source, Object... entries) {
+        Map<String, BigInteger> result = new LinkedHashMap<>(source);
+        for (int index = 0; index < entries.length; index += 2) {
+            result.put(
+                    (String) entries[index],
+                    BigInteger.valueOf(
+                            ((Number) entries[index + 1]).longValue()));
         }
         return Collections.unmodifiableMap(result);
     }
