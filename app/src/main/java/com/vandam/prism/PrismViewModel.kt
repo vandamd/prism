@@ -26,7 +26,8 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
     fun refresh() {
         if (refreshJob?.isActive == true ||
             activationJob?.isActive == true ||
-            mutableState.value.activationVisible
+            mutableState.value.activationVisible ||
+            preparedActivation != null
         ) {
             return
         }
@@ -34,10 +35,12 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
             resumeActivation(handle)
             return
         }
+        val retainedPreparation = bridge.pendingPreparedActivation()
         refreshJob =
             viewModelScope.launch {
                 val inspected = withContext(Dispatchers.IO) { inspect() }
                 if (inspected.action != PrismAction.Activate) {
+                    retainedPreparation?.let(bridge::discardPreparedActivation)
                     preparedActivation = null
                     mutableState.value = inspected
                     return@launch
@@ -45,7 +48,13 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
                 mutableState.value =
                     inspected.copy(actionLabel = "Preparing", actionEnabled = false)
                 val managerUid = installedUid(RESUKISU_PACKAGE)
-                var prepared: ShizukuBridge.PreparedActivationHandle? = null
+                var prepared =
+                    retainedPreparation?.takeIf {
+                        managerUid != null && awaitPreparedActivation(it)
+                    }
+                if (retainedPreparation != null && prepared == null) {
+                    bridge.discardPreparedActivation(retainedPreparation)
+                }
                 repeat(PREPARE_MAX_ATTEMPTS) {
                     if (prepared == null && managerUid != null) {
                         val candidate =
@@ -65,7 +74,11 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
                 if (prepared == null) {
                     preparedActivation = null
                     mutableState.value =
-                        inspected.copy(actionLabel = "Preparing", actionEnabled = false)
+                        inspected.copy(
+                            action = PrismAction.Retry,
+                            actionLabel = "Retry",
+                            actionEnabled = true,
+                        )
                     return@launch
                 }
                 preparedActivation = prepared
@@ -98,7 +111,11 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (activationJob?.isActive == true) return
-        val prepared = preparedActivation ?: return
+        val prepared = preparedActivation
+        if (prepared == null) {
+            refresh()
+            return
+        }
         preparedActivation = null
         activationJob = viewModelScope.launch {
             val current = mutableState.value

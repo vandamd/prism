@@ -120,19 +120,39 @@ class ShizukuBridge(context: Context) {
     suspend fun prepareReSukiSuActivation(managerUid: Int): PreparedActivationHandle {
         val nonce = randomNonce()
         val bootId = currentBootId()
-        if (bootId == null) {
+        if (bootId == null || !persistPreparedActivation(nonce, bootId)) {
             return PreparedActivationHandle(nonce, "", "status=fail reason=boot-id")
         }
         val preArm = PrismAppBridgeService.preArm(context, nonce)
         if (!preArm.startsWith("status=pass ")) {
-            return PreparedActivationHandle(nonce, bootId, preArm)
+            clearPreparedActivation(nonce)
+            val stale = BUSY_PREARM.matchEntire(preArm)
+                ?: return PreparedActivationHandle(nonce, bootId, preArm)
+            val staleSession = stale.groupValues[1]
+            val staleBootId = stale.groupValues[2]
+            if (!persistPreparedActivation(staleSession, staleBootId)) {
+                return PreparedActivationHandle(nonce, bootId, preArm)
+            }
+            return PreparedActivationHandle(
+                staleSession,
+                staleBootId,
+                "status=working session=$staleSession phase=reattaching terminal=0 unsafe=0",
+            )
         }
         val result = callService { it.prepareReSukiSuActivation(nonce, managerUid) }
+        if (!result.startsWith("status=working session=$nonce ")) {
+            clearPreparedActivation(nonce)
+        }
         return PreparedActivationHandle(nonce, bootId, result)
     }
 
-    suspend fun getPreparedActivationSnapshot(handle: PreparedActivationHandle): String =
-        callService { it.getActivationSnapshot(handle.nonce) }
+    suspend fun getPreparedActivationSnapshot(handle: PreparedActivationHandle): String {
+        val result = callService { it.getActivationSnapshot(handle.nonce) }
+        if (isTerminalSnapshot(result, handle.nonce)) {
+            clearPreparedActivation(handle.nonce)
+        }
+        return result
+    }
 
     suspend fun releasePreparedActivation(
         handle: PreparedActivationHandle,
@@ -141,6 +161,7 @@ class ShizukuBridge(context: Context) {
         if (handle.bootId != currentBootId() ||
             !persistPendingActivation(handle.nonce, handle.bootId, startedAtElapsedMillis)
         ) {
+            clearPreparedActivation(handle.nonce)
             return ActivationHandle(
                 handle.nonce,
                 "status=fail session=${handle.nonce} phase=pending-session terminal=1 unsafe=0",
@@ -148,12 +169,35 @@ class ShizukuBridge(context: Context) {
             )
         }
         val result = callService { it.releasePreparedActivation(handle.nonce) }
+        clearPreparedActivation(handle.nonce)
         if (isTerminalSnapshot(result, handle.nonce) ||
             !result.startsWith("status=working session=${handle.nonce} ")
         ) {
             clearPendingActivation(handle.nonce)
         }
         return ActivationHandle(handle.nonce, result, startedAtElapsedMillis)
+    }
+
+    fun pendingPreparedActivation(): PreparedActivationHandle? {
+        val preferences =
+            context.getSharedPreferences(PREPARED_PREFERENCES, Context.MODE_PRIVATE)
+        val nonce = preferences.getString(PREPARED_SESSION, null)
+        val bootId = preferences.getString(PREPARED_BOOT_ID, null)
+        if (nonce == null || !nonce.matches(Regex("[0-9a-f]{64}")) ||
+            bootId == null || bootId != currentBootId()
+        ) {
+            preferences.edit().clear().commit()
+            return null
+        }
+        return PreparedActivationHandle(
+            nonce,
+            bootId,
+            "status=working session=$nonce phase=reattaching terminal=0 unsafe=0",
+        )
+    }
+
+    fun discardPreparedActivation(handle: PreparedActivationHandle) {
+        clearPreparedActivation(handle.nonce)
     }
 
     suspend fun getActivationSnapshot(handle: ActivationHandle): String {
@@ -195,6 +239,22 @@ class ShizukuBridge(context: Context) {
             preferences.edit().clear().commit()
         }
     }
+
+    private fun clearPreparedActivation(nonce: String) {
+        val preferences =
+            context.getSharedPreferences(PREPARED_PREFERENCES, Context.MODE_PRIVATE)
+        if (nonce == preferences.getString(PREPARED_SESSION, null)) {
+            preferences.edit().clear().commit()
+        }
+    }
+
+    private fun persistPreparedActivation(nonce: String, bootId: String): Boolean =
+        context
+            .getSharedPreferences(PREPARED_PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .putString(PREPARED_SESSION, nonce)
+            .putString(PREPARED_BOOT_ID, bootId)
+            .commit()
 
     private fun persistPendingActivation(
         nonce: String,
@@ -284,6 +344,9 @@ class ShizukuBridge(context: Context) {
         private const val PENDING_SESSION = "session"
         private const val PENDING_BOOT_ID = "boot-id"
         private const val PENDING_STARTED_AT = "started-at-elapsed-millis"
+        private const val PREPARED_PREFERENCES = "prism-prepared-activation"
+        private const val PREPARED_SESSION = "session"
+        private const val PREPARED_BOOT_ID = "boot-id"
         private val mainHandler = Handler(Looper.getMainLooper())
         private val BUSY_PREARM = Regex(
             "^status=fail stage=app-bridge-prearm reason=busy " +
