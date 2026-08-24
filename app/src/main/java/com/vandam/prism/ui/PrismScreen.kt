@@ -34,6 +34,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -53,6 +54,7 @@ fun PrismScreen(
     onActivationAction: () -> Unit,
     onActivationBack: () -> Unit,
     onActivationShare: () -> Unit,
+    onActiveLayout: () -> Unit,
 ) {
     state.activation?.takeIf { state.activationVisible }?.let { activation ->
         val canLeaveActivation = activation.phase != ActivationPhase.Working
@@ -81,7 +83,11 @@ fun PrismScreen(
                     modifier = Modifier.align(Alignment.TopStart).padding(start = 26.dp),
                     verticalArrangement = Arrangement.spacedBy(33.5.dp),
                 ) {
-                    StatusItem(label = "Root Status", value = state.rootStatus.displayName)
+                    StatusItem(
+                        label = "Root Status",
+                        value = state.rootStatus.displayName,
+                        onLayout = onActiveLayout.takeIf { state.rootStatus == RootStatus.Active },
+                    )
                     StatusItem(label = "Shizuku Status", value = state.shizukuStatus.displayName)
                     StatusItem(label = "ReSukiSU Status", value = state.reSukiSUStatus.displayName)
                 }
@@ -176,6 +182,7 @@ private fun ActivationScreen(
 private fun StatusItem(
     label: String,
     value: String,
+    onLayout: (() -> Unit)? = null,
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -186,7 +193,11 @@ private fun StatusItem(
             style = PrismTheme.typography.statusLabel,
             modifier = Modifier.padding(top = 4.dp),
         )
-        Text(text = value, style = PrismTheme.typography.statusValue)
+        Text(
+            text = value,
+            style = PrismTheme.typography.statusValue,
+            modifier = Modifier.onGloballyPositioned { onLayout?.invoke() },
+        )
     }
 }
 

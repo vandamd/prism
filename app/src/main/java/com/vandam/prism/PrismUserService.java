@@ -81,6 +81,22 @@ public final class PrismUserService extends IPrismUserService.Stub {
     }
 
     @Override
+    public String prepareReSukiSuActivation(String nonce, int managerUid) {
+        if (activationController == null) {
+            return "status=fail reason=service-context";
+        }
+        return activationController.prepare(nonce, managerUid);
+    }
+
+    @Override
+    public String releasePreparedActivation(String nonce) {
+        if (activationController == null) {
+            return "status=fail reason=service-context";
+        }
+        return activationController.releasePrepared(nonce);
+    }
+
+    @Override
     public String getActivationSnapshot(String nonce) {
         if (activationController == null) {
             return "status=fail reason=service-context";

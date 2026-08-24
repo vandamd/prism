@@ -27,8 +27,10 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Owns Prism's fixed shell-side ReSukiSU activation operation.
@@ -44,6 +46,7 @@ final class ReSukiSuActivationController {
             "d3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64";
     private static final String NONCE_PATTERN = "[0-9a-f]{64}";
     private static final int MAX_SAME_BOOT_RETRIES = 5;
+    private static final long PREPARED_RELEASE_TIMEOUT_MILLIS = 120_000;
     private static final int MAX_LOG_LINES = 160;
     private static final int MAX_COMMAND_OUTPUT = 1024 * 1024;
     private static final Path BOOT_ID =
@@ -53,13 +56,13 @@ final class ReSukiSuActivationController {
             new Payload(
                     "lp3-resukisu-ksud",
                     "/data/local/tmp/lp3-resukisu-ksud",
-                    4_214_888L,
-                    "7765acff69651e31629433fa6095a41b7ca034b62e17f9180c2a820b1f177483"),
+                    4_215_752L,
+                    "ceb8f4741ef4fba52e080828105771080bf9a5325b8e56454e121a968fb83d60"),
             new Payload(
                     "lp3-resukisu-loader.so",
                     "/data/local/tmp/lp3-resukisu-loader.so",
-                    1_301_464L,
-                    "1fe42682ad736f43eb5acb42dc0ebba79828a6090f61e47970277b12fdb61275"),
+                    1_323_008L,
+                    "4922e1508c769c90f8734fd3914a31021aed4503f0743cb80b396c13a9f3e2ef"),
     };
 
     private final Context context;
@@ -73,12 +76,28 @@ final class ReSukiSuActivationController {
     private boolean terminal = true;
     private boolean unsafe;
     private int sequence;
+    private long runStartedElapsedMillis;
+    private Thread managerReturnThread;
+    private volatile Exception managerReturnFailure;
+    private Thread prismReturnThread;
+    private volatile Exception prismReturnFailure;
+    private CountDownLatch preparedRelease = new CountDownLatch(0);
+    private boolean preparedReleaseRequired;
 
     ReSukiSuActivationController(Context context) {
         this.context = context;
     }
 
     String start(String nonce, int managerUid) {
+        return begin(nonce, managerUid, false);
+    }
+
+    String prepare(String nonce, int managerUid) {
+        return begin(nonce, managerUid, true);
+    }
+
+    private String begin(
+            String nonce, int managerUid, boolean waitForRootRelease) {
         if (nonce == null || !nonce.matches(NONCE_PATTERN)) {
             return header("fail", safeSession(nonce), "request-nonce", true, false);
         }
@@ -95,11 +114,43 @@ final class ReSukiSuActivationController {
             terminal = false;
             unsafe = false;
             sequence = 0;
+            runStartedElapsedMillis = android.os.SystemClock.elapsedRealtime();
+            managerReturnThread = null;
+            managerReturnFailure = null;
+            prismReturnThread = null;
+            prismReturnFailure = null;
+            preparedRelease = new CountDownLatch(waitForRootRelease ? 1 : 0);
+            preparedReleaseRequired = waitForRootRelease;
             logLines.clear();
-            appendLocked("[*] Starting Prism activation");
+            appendLocked(waitForRootRelease
+                    ? "[*] Preparing guarded activation"
+                    : "[*] Starting Prism activation");
         }
         executor.execute(() -> runPreflight(nonce, managerUid));
         return header("working", nonce, "preflight", false, false);
+    }
+
+    String releasePrepared(String nonce) {
+        if (nonce == null || !nonce.matches(NONCE_PATTERN)) {
+            return header("fail", safeSession(nonce), "request-nonce", true, false);
+        }
+        if (Binder.getCallingUid() != prismUid()) {
+            return header("fail", nonce, "caller-identity", true, false);
+        }
+        CountDownLatch release;
+        synchronized (lock) {
+            if (!nonce.equals(session) || terminal ||
+                    !preparedReleaseRequired || !"ready".equals(phase)) {
+                return header("fail", nonce, "prepared-release", true, false);
+            }
+            preparedReleaseRequired = false;
+            phase = "release";
+            runStartedElapsedMillis = android.os.SystemClock.elapsedRealtime();
+            appendLocked("[*] Root input accepted; dispatching the CVE chain");
+            release = preparedRelease;
+        }
+        release.countDown();
+        return header("working", nonce, "release", false, false);
     }
 
     String snapshot(String nonce) {
@@ -352,36 +403,54 @@ final class ReSukiSuActivationController {
             requireCredentialLayoutProfile();
             append("Credential layout profile verified");
 
-            advance("jobs-gate", "Checking system job pressure");
-            int registeredJobs = registeredJobCount();
-            if (registeredJobs >= 1000) {
-                throw new GateException(
-                        "jobs-gate", "The registered JobScheduler count is unsafe");
-            }
-            append("Registered system jobs: " + registeredJobs);
-
-            advance("process-gate", "Checking for a stale activation helper");
-            requireNoExistingHelper();
-            append("No stale activation helper is running");
-
-            advance("payload-stage", "Verifying and staging signed-in payload bytes");
-            for (Payload payload : PAYLOADS) {
-                stagePayload(payload, nonce);
-            }
-            append("Signed activation payloads verified and staged");
-
             advance("app-bridge", "Checking the activation bridge");
             String bootId = new String(
                     Files.readAllBytes(BOOT_ID), StandardCharsets.UTF_8).trim();
             try (PrismAppBridgeClient appBridge =
                          PrismAppBridgeClient.connect(context, nonce, bootId)) {
+                long bridgeProbeStarted =
+                        android.os.SystemClock.elapsedRealtime();
                 String bridgeState = appBridge.probe();
                 if (!bridgeState.startsWith("status=pass ")) {
                     throw new GateException("app-bridge", bridgeState);
                 }
-                Thread.sleep(1_250);
+                long warmStableMillis = requireWarmBridgeReceipt(
+                        bridgeState, bootId);
+
+                advance("jobs-gate", "Checking system job pressure");
+                int registeredJobs = registeredJobCount();
+                if (registeredJobs >= 1000) {
+                    throw new GateException(
+                            "jobs-gate",
+                            "The registered JobScheduler count is unsafe");
+                }
+                append("Registered system jobs: " + registeredJobs);
+
+                advance(
+                        "process-gate",
+                        "Checking for a stale activation helper");
+                requireNoExistingHelper();
+                append("No stale activation helper is running");
+
+                advance(
+                        "payload-stage",
+                        "Verifying and staging signed-in payload bytes");
+                for (Payload payload : PAYLOADS) {
+                    stagePayload(payload, nonce);
+                }
+                append("Signed activation payloads verified and staged");
+
+                long remainingBridgeDwell = warmStableMillis >= 1_250
+                        ? 0 : 1_250 -
+                                (android.os.SystemClock.elapsedRealtime() -
+                                        bridgeProbeStarted);
+                if (remainingBridgeDwell > 0) {
+                    Thread.sleep(remainingBridgeDwell);
+                }
                 String idleState = appBridge.probe();
-                if (!idleState.startsWith("status=pass ")) {
+                if (!idleState.startsWith("status=pass ") ||
+                        requireWarmBridgeReceipt(idleState, bootId) <
+                                warmStableMillis) {
                     throw new GateException("app-bridge", idleState);
                 }
                 append("Activation bridge verified");
@@ -423,6 +492,21 @@ final class ReSukiSuActivationController {
                         public void log(String message) {
                             append(message);
                         }
+
+                        @Override
+                        public void beginManagerReturn() {
+                            ReSukiSuActivationController.this.beginManagerReturn();
+                        }
+
+                        @Override
+                        public void beginPrismReturn() {
+                            ReSukiSuActivationController.this.beginPrismReturn();
+                        }
+
+                        @Override
+                        public void awaitRootRelease() throws Exception {
+                            ReSukiSuActivationController.this.awaitRootRelease(nonce);
+                        }
                     };
             int retries = 0;
             while (true) {
@@ -458,6 +542,24 @@ final class ReSukiSuActivationController {
                     false,
                     "Preflight stopped: " + exception.getClass().getSimpleName());
         }
+    }
+
+    private void awaitRootRelease(String nonce) throws Exception {
+        CountDownLatch release;
+        synchronized (lock) {
+            if (!preparedReleaseRequired) {
+                return;
+            }
+            phase = "ready";
+            appendLocked("[+] Guarded activation is ready for Root input");
+            release = preparedRelease;
+        }
+        if (!release.await(PREPARED_RELEASE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+            throw new GateException(
+                    "prepared-release-timeout",
+                    "Prepared activation expired before Root was pressed");
+        }
+        requireSession(nonce);
     }
 
     private void closePrearmedBridge(String nonce, String bootId) {
@@ -513,6 +615,22 @@ final class ReSukiSuActivationController {
         if (Os.getuid() != Process.SHELL_UID || Os.getgid() != Process.SHELL_UID) {
             throw new GateException("shell-identity", "Shizuku service is not shell");
         }
+    }
+
+    private long requireWarmBridgeReceipt(
+            String state, String bootId) throws GateException {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                "^status=pass stage=app-bridge-probe uid=([0-9]+)" +
+                        " pid=([1-9][0-9]*) start=([1-9][0-9]*)" +
+                        " boot_id=" + java.util.regex.Pattern.quote(bootId) +
+                        " warm_stable_ms=(-?[0-9]+)$").matcher(state);
+        if (!matcher.matches() ||
+                Integer.parseInt(matcher.group(1)) != prismUid() ||
+                Long.parseLong(matcher.group(4)) < 0) {
+            throw new GateException(
+                    "app-bridge", "The warm app-process receipt is invalid");
+        }
+        return Long.parseLong(matcher.group(4));
     }
 
     private int prismUid() {
@@ -752,9 +870,17 @@ final class ReSukiSuActivationController {
     }
 
     private static String executeFixed(String... command) throws Exception {
+        return executeFixed((Runnable) null, command);
+    }
+
+    private static String executeFixed(
+            Runnable started, String... command) throws Exception {
         java.lang.Process process = new ProcessBuilder(command)
                 .redirectErrorStream(true)
                 .start();
+        if (started != null) {
+            started.run();
+        }
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         try (InputStream input = process.getInputStream()) {
             byte[] buffer = new byte[8192];
@@ -779,6 +905,10 @@ final class ReSukiSuActivationController {
         synchronized (lock) {
             phase = nextPhase;
             appendLocked("[*] " + message);
+            android.util.Log.i(
+                    "PrismPreflightTiming",
+                    "elapsed_ms=" + (android.os.SystemClock.elapsedRealtime() -
+                            runStartedElapsedMillis) + " phase=" + nextPhase);
         }
     }
 
@@ -827,6 +957,11 @@ final class ReSukiSuActivationController {
             terminal = true;
             appendLocked(("pass".equals(finalStatus) ? "[+] " :
                     finalUnsafe ? "[-] " : "[!] ") + message);
+            android.util.Log.i(
+                    "PrismPreflightTiming",
+                    "elapsed_ms=" + (android.os.SystemClock.elapsedRealtime() -
+                            runStartedElapsedMillis) + " phase=" + finalPhase +
+                            " terminal=1 status=" + finalStatus);
         }
         if ("pass".equals(finalStatus)) {
             returnToPrism();
@@ -836,17 +971,118 @@ final class ReSukiSuActivationController {
     private void returnToPrism() {
         DirectReSukiSuActivation.controllerTrace("return-to-prism-enter");
         try {
-            executeFixed(
-                    "/system/bin/am", "start", "--user", "0",
-                    "-f", "0x24000000", "-n",
-                    PRISM_PACKAGE + "/.PrismActivity");
-            DirectReSukiSuActivation.controllerTrace("return-to-prism-command-pass");
+            if (managerReturnThread == null) {
+                launchManager();
+            } else {
+                managerReturnThread.join();
+                if (managerReturnFailure != null) {
+                    throw managerReturnFailure;
+                }
+            }
+            DirectReSukiSuActivation.controllerTrace(
+                    "return-to-prism-manager-pass");
+        } catch (Exception exception) {
+            DirectReSukiSuActivation.controllerTrace(
+                    "return-to-prism-manager-fail type=" +
+                            exception.getClass().getSimpleName());
+            android.util.Log.w(
+                    "PrismActivation", "Could not open ReSukiSU", exception);
+        }
+        try {
+            if (prismReturnThread == null) {
+                launchPrism();
+            } else {
+                prismReturnThread.join();
+                if (prismReturnFailure != null) {
+                    throw prismReturnFailure;
+                }
+            }
+            DirectReSukiSuActivation.controllerTrace(
+                    "return-to-prism-command-pass");
         } catch (Exception exception) {
             DirectReSukiSuActivation.controllerTrace("return-to-prism-command-fail type=" +
                     exception.getClass().getSimpleName());
             android.util.Log.w(
                     "PrismActivation", "Could not return to Prism", exception);
         }
+    }
+
+    private void beginPrismReturn() {
+        if (prismReturnThread != null) {
+            return;
+        }
+        prismReturnThread = new Thread(() -> {
+            try {
+                if (managerReturnThread == null) {
+                    launchManager();
+                } else {
+                    managerReturnThread.join();
+                    if (managerReturnFailure != null) {
+                        throw managerReturnFailure;
+                    }
+                }
+                DirectReSukiSuActivation.controllerTrace(
+                        "early-return-to-prism-enter");
+                launchPrism();
+                DirectReSukiSuActivation.controllerTrace(
+                        "early-return-to-prism-pass");
+            } catch (Exception exception) {
+                prismReturnFailure = exception;
+            }
+        }, "PrismEarlyReturn");
+        prismReturnThread.start();
+    }
+
+    private static void launchPrism() throws Exception {
+        executeFixed(
+                "/system/bin/am", "start", "--user", "0",
+                "-f", "0x24010000", "-n",
+                PRISM_PACKAGE + "/.PrismActivity");
+    }
+
+    private void beginManagerReturn() {
+        if (managerReturnThread != null) {
+            return;
+        }
+        CountDownLatch dispatched = new CountDownLatch(1);
+        managerReturnThread = new Thread(() -> {
+            try {
+                DirectReSukiSuActivation.controllerTrace(
+                        "return-to-prism-manager-enter");
+                launchManager(dispatched);
+                DirectReSukiSuActivation.controllerTrace(
+                        "return-to-prism-manager-ready");
+            } catch (Exception exception) {
+                managerReturnFailure = exception;
+            } finally {
+                dispatched.countDown();
+            }
+        }, "PrismManagerReturn");
+        managerReturnThread.start();
+        try {
+            if (!dispatched.await(2, TimeUnit.SECONDS)) {
+                managerReturnFailure = new IllegalStateException(
+                        "Manager launch was not dispatched");
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            managerReturnFailure = exception;
+        }
+    }
+
+    private static void launchManager() throws Exception {
+        launchManager(null);
+    }
+
+    private static void launchManager(CountDownLatch dispatched)
+            throws Exception {
+        executeFixed(
+                "/system/bin/am", "force-stop", "--user", "0",
+                RESUKISU_PACKAGE);
+        executeFixed(dispatched == null ? null : dispatched::countDown,
+                "/system/bin/am", "start", "--user", "0", "-W",
+                "-f", "0x24000000", "-n",
+                RESUKISU_PACKAGE + "/.ui.MainActivity");
     }
 
     private static String header(

@@ -119,6 +119,7 @@ public class RawBClientService extends Service {
                             }
                         }
                     }
+                    reply.writeStrongBinder(rawNode);
                     return true;
                 }
                 if (code == TRANSACTION_RETAIN) {

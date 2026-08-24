@@ -38,13 +38,7 @@ class ShizukuBridge(context: Context) {
     suspend fun preflight(): String =
         withTimeout(15_000L) {
             suspendCancellableCoroutine { continuation ->
-                val arguments =
-                    Shizuku.UserServiceArgs(component)
-                        .daemon(false)
-                        .processNameSuffix("prism_shell")
-                        .debuggable(false)
-                        .version(userServiceVersion)
-                        .tag("prism-preflight")
+                val arguments = serviceArguments()
                 val unbindScheduled = AtomicBoolean()
                 val connection =
                     object : ServiceConnection {
@@ -58,7 +52,7 @@ class ShizukuBridge(context: Context) {
                                         .asInterface(service)
                                         .preflight(randomNonce())
                                 }.getOrElse { "status=fail reason=${it.javaClass.simpleName}" }
-                            scheduleUnbind(arguments, this, true, unbindScheduled)
+                            scheduleUnbind(arguments, this, false, unbindScheduled)
                             if (continuation.isActive) continuation.resume(result)
                         }
 
@@ -69,7 +63,7 @@ class ShizukuBridge(context: Context) {
                         }
                     }
                 continuation.invokeOnCancellation {
-                    scheduleUnbind(arguments, connection, true, unbindScheduled)
+                    scheduleUnbind(arguments, connection, false, unbindScheduled)
                 }
                 runCatching { Shizuku.bindUserService(arguments, connection) }
                     .onFailure {
@@ -121,6 +115,45 @@ class ShizukuBridge(context: Context) {
             clearPendingActivation(nonce)
         }
         return ActivationHandle(nonce, result, startedAtElapsedMillis)
+    }
+
+    suspend fun prepareReSukiSuActivation(managerUid: Int): PreparedActivationHandle {
+        val nonce = randomNonce()
+        val bootId = currentBootId()
+        if (bootId == null) {
+            return PreparedActivationHandle(nonce, "", "status=fail reason=boot-id")
+        }
+        val preArm = PrismAppBridgeService.preArm(context, nonce)
+        if (!preArm.startsWith("status=pass ")) {
+            return PreparedActivationHandle(nonce, bootId, preArm)
+        }
+        val result = callService { it.prepareReSukiSuActivation(nonce, managerUid) }
+        return PreparedActivationHandle(nonce, bootId, result)
+    }
+
+    suspend fun getPreparedActivationSnapshot(handle: PreparedActivationHandle): String =
+        callService { it.getActivationSnapshot(handle.nonce) }
+
+    suspend fun releasePreparedActivation(
+        handle: PreparedActivationHandle,
+        startedAtElapsedMillis: Long,
+    ): ActivationHandle {
+        if (handle.bootId != currentBootId() ||
+            !persistPendingActivation(handle.nonce, handle.bootId, startedAtElapsedMillis)
+        ) {
+            return ActivationHandle(
+                handle.nonce,
+                "status=fail session=${handle.nonce} phase=pending-session terminal=1 unsafe=0",
+                startedAtElapsedMillis,
+            )
+        }
+        val result = callService { it.releasePreparedActivation(handle.nonce) }
+        if (isTerminalSnapshot(result, handle.nonce) ||
+            !result.startsWith("status=working session=${handle.nonce} ")
+        ) {
+            clearPendingActivation(handle.nonce)
+        }
+        return ActivationHandle(handle.nonce, result, startedAtElapsedMillis)
     }
 
     suspend fun getActivationSnapshot(handle: ActivationHandle): String {
@@ -287,4 +320,11 @@ class ShizukuBridge(context: Context) {
         val startResult: String,
         internal val startedAtElapsedMillis: Long,
     )
+
+    class PreparedActivationHandle internal constructor(
+        internal val nonce: String,
+        internal val bootId: String,
+        val startResult: String,
+    )
+
 }

@@ -19,7 +19,7 @@
 #include <linux/uaccess.h>
 #include <asm/pointer_auth.h>
 
-#define LP3_EXPECTED_REPAIRS 7
+#define LP3_EXPECTED_REPAIRS 5
 #define LP3_CONTROL_SIZE 128
 #define LP3_MAX_FRAMES 64
 #define LP3_WORKER_COMM "lp3-fake-ctl"
@@ -171,6 +171,9 @@ module_param(borrowed_inode_security, ulong, 0400);
 static unsigned long borrowed_inode_security_word8;
 module_param(borrowed_inode_security_word8, ulong, 0400);
 
+static bool defer_inode_restore;
+module_param(defer_inode_restore, bool, 0400);
+
 /* The finalise record is supplied by the current run.  No value is
  * inferred from the existing arbitrary-read state. */
 static unsigned long finalise_owner_task;
@@ -304,12 +307,14 @@ static unsigned int finalise_snapshot_sid;
 
 static struct lp3_repair repairs[LP3_EXPECTED_REPAIRS];
 static bool carriers_stabilised;
+static bool inode_label_restored;
 static bool labels_restored;
 static bool repair_complete;
 static bool finalise_complete;
 static unsigned long finalise_successor;
 static bool finalise_successor_valid;
 static unsigned int finalise_request;
+static unsigned int inode_restore_request;
 static unsigned long resume_user_addr;
 module_param(resume_user_addr, ulong, 0400);
 
@@ -324,6 +329,14 @@ module_param(resume_cookie_lo, ulong, 0400);
 
 static int lp3_finalise_set(const char *value,
 				const struct kernel_param *param);
+static int lp3_inode_restore_set(const char *value,
+				const struct kernel_param *param);
+static const struct kernel_param_ops lp3_inode_restore_ops = {
+	.set = lp3_inode_restore_set,
+	.get = param_get_uint,
+};
+module_param_cb(inode_restore_request, &lp3_inode_restore_ops,
+		&inode_restore_request, 0600);
 static const struct kernel_param_ops lp3_finalise_ops = {
 		.set = lp3_finalise_set,
 		.get = param_get_uint,
@@ -378,7 +391,7 @@ static int lp3_private_cred_error(void)
 	    __kuid_val(cred->euid) != 2000 ||
 	    __kuid_val(cred->suid) != 2000 ||
 	    __kuid_val(cred->fsuid) != 2000)
-		return -EACCES;
+		return -EUCLEAN;
 	if (__kgid_val(cred->gid) != 2000 ||
 	    __kgid_val(cred->egid) != 2000 ||
 	    __kgid_val(cred->sgid) != 2000 ||
@@ -392,19 +405,198 @@ static int lp3_private_cred_error(void)
 	return cred->security != NULL ? 0 : -ENOKEY;
 }
 
-static int lp3_helper_borrowed_error(void)
+static int lp3_equivalent_cred_error(const struct cred *cred,
+				     unsigned long expected_cred)
 {
+	const struct cred *expected = (const struct cred *)expected_cred;
+	const struct group_info *groups;
+	const struct group_info *private_groups;
+	unsigned long security;
+	unsigned long expected_security;
+	int i;
+
+	if (!lp3_kernel_pointer((unsigned long)cred) ||
+	    !lp3_kernel_pointer(expected_cred))
+		return -EFAULT;
+	if (atomic_read(&cred->usage) < 1)
+		return -EUSERS;
+	if (!uid_eq(cred->uid, expected->uid) ||
+	    !uid_eq(cred->euid, expected->euid) ||
+	    !uid_eq(cred->suid, expected->suid) ||
+	    !uid_eq(cred->fsuid, expected->fsuid))
+		return -EUCLEAN;
+	if (!gid_eq(cred->gid, expected->gid) ||
+	    !gid_eq(cred->egid, expected->egid) ||
+	    !gid_eq(cred->sgid, expected->sgid) ||
+	    !gid_eq(cred->fsgid, expected->fsgid))
+		return -ENOTUNIQ;
+	if (cred->securebits != expected->securebits)
+		return -EBADSLT;
+	if (cred->user != expected->user)
+		return -EMULTIHOP;
+	if (cred->user_ns != expected->user_ns)
+		return -ENOLINK;
+	if (memcmp(&cred->cap_inheritable, &expected->cap_inheritable,
+		   sizeof(cred->cap_inheritable)) ||
+	    memcmp(&cred->cap_permitted, &expected->cap_permitted,
+		   sizeof(cred->cap_permitted)) ||
+	    memcmp(&cred->cap_effective, &expected->cap_effective,
+		   sizeof(cred->cap_effective)) ||
+	    memcmp(&cred->cap_bset, &expected->cap_bset,
+		   sizeof(cred->cap_bset)) ||
+	    memcmp(&cred->cap_ambient, &expected->cap_ambient,
+		   sizeof(cred->cap_ambient)))
+		return -EPERM;
+	groups = cred->group_info;
+	private_groups = expected->group_info;
+	if (groups == NULL || private_groups == NULL ||
+	    groups->ngroups != private_groups->ngroups)
+		return -EMEDIUMTYPE;
+	for (i = 0; i < groups->ngroups; ++i) {
+		if (!gid_eq(groups->gid[i], private_groups->gid[i]))
+			return -EBADRQC;
+	}
+	security = (unsigned long)cred->security;
+	expected_security = (unsigned long)expected->security;
+	if (!lp3_kernel_pointer(security) ||
+	    !lp3_kernel_pointer(expected_security))
+		return -ECHRNG;
+	if (READ_ONCE(*(unsigned long *)security) !=
+	    READ_ONCE(*(unsigned long *)expected_security) ||
+	    READ_ONCE(*(unsigned long *)(security + 8)) !=
+	    READ_ONCE(*(unsigned long *)(expected_security + 8)))
+		return -ENONET;
+	return 0;
+}
+
+static struct task_struct *lp3_helper_task_get(void)
+{
+	struct task_struct *task;
+	struct pid *pid;
+
 	if (helper_tid <= 0)
+		return NULL;
+	pid = find_get_pid(helper_tid);
+	if (pid == NULL)
+		return NULL;
+	task = get_pid_task(pid, PIDTYPE_PID);
+	put_pid(pid);
+	if (task == NULL)
+		return NULL;
+	if (task->pid != helper_tid || task->tgid != helper_tid ||
+	    (unsigned long)task != helper_task) {
+		put_task_struct(task);
+		return NULL;
+	}
+	return task;
+}
+
+static int lp3_helper_borrowed_task_error(struct task_struct *task)
+{
+	if (task == NULL)
 		return -EINVAL;
-	if (current->pid != helper_tid)
-		return -ESRCH;
-	if ((unsigned long)current != helper_task)
+	if (task->pid != helper_tid || task->tgid != helper_tid)
+		return -EBADR;
+	if ((unsigned long)task != helper_task)
 		return -EXDEV;
-	if ((unsigned long)current->real_cred != donor_cred)
-		return -EBADE;
-	if ((unsigned long)current->cred != donor_cred)
+	if ((unsigned long)READ_ONCE(task->real_cred) != donor_cred)
+		return -EHOSTDOWN;
+	if ((unsigned long)READ_ONCE(task->cred) != donor_cred)
 		return -EBADFD;
 	return lp3_private_cred_error();
+}
+
+static int lp3_helper_subjective_borrowed_task_error(
+	struct task_struct *task)
+{
+	if (task == NULL)
+		return -EINVAL;
+	if (task->pid != helper_tid || task->tgid != helper_tid)
+		return -ERANGE;
+	if ((unsigned long)task != helper_task)
+		return -EXDEV;
+	if ((unsigned long)READ_ONCE(task->real_cred) != private_cred)
+		return -EBADE;
+	if ((unsigned long)READ_ONCE(task->cred) != donor_cred)
+		return -EBADFD;
+	return lp3_private_cred_error();
+}
+
+static int lp3_helper_borrowed_error(void)
+{
+	return lp3_helper_borrowed_task_error(current);
+}
+
+static int lp3_loader_and_target_error(void)
+{
+	struct task_struct *parent = NULL;
+	struct task_struct *task;
+	int result;
+
+	if (current->pid == current->tgid) {
+		if (get_nr_threads(current) != 1)
+			return -EMLINK;
+		parent = READ_ONCE(current->real_parent);
+		if (parent == NULL || parent->tgid != helper_tid)
+			return -ECHILD;
+		if (parent->pid == helper_tid)
+			return -EALREADY;
+		if ((unsigned long)READ_ONCE(parent->real_cred) != donor_cred)
+			return -EREMOTE;
+		if ((unsigned long)READ_ONCE(parent->cred) != donor_cred)
+			return -EREMOTEIO;
+	} else {
+		if (current->tgid != helper_tid)
+			return -EPROTO;
+		if (current->pid == helper_tid)
+			return -EALREADY;
+	}
+	if ((unsigned long)current->real_cred != donor_cred &&
+	    (unsigned long)current->real_cred != private_cred) {
+		result = lp3_equivalent_cred_error(current->real_cred,
+						  private_cred);
+		if (result)
+			result = lp3_equivalent_cred_error(current->real_cred,
+						  donor_cred);
+		if (result)
+			return result;
+	}
+	if ((unsigned long)current->cred != donor_cred) {
+		result = lp3_equivalent_cred_error(current->cred, donor_cred);
+		if (result)
+			return result;
+	}
+	if ((unsigned long)((const struct cred *)donor_cred)->security !=
+	    borrowed_task_security)
+		return -EKEYREJECTED;
+	task = lp3_helper_task_get();
+	if (task == NULL)
+		return -ENXIO;
+	result = lp3_helper_subjective_borrowed_task_error(task);
+	put_task_struct(task);
+	return result;
+}
+
+static int lp3_normalise_helper_real_cred(void)
+{
+	struct task_struct *task;
+	int result;
+
+	task = lp3_helper_task_get();
+	if (task == NULL)
+		return -ENODEV;
+	result = lp3_helper_subjective_borrowed_task_error(task);
+	if (result)
+		goto out;
+	preempt_disable();
+	WRITE_ONCE(*(const struct cred **)&task->real_cred,
+		(const struct cred *)donor_cred);
+	smp_wmb();
+	preempt_enable();
+	result = lp3_helper_borrowed_task_error(task);
+out:
+	put_task_struct(task);
+	return result;
 }
 
 static bool lp3_helper_is_borrowed(void)
@@ -436,12 +628,14 @@ static int lp3_stabilise_carriers(void)
 
 	WRITE_ONCE(*task_word8, borrowed_task_security_word8);
 	WRITE_ONCE(*inode_word8, borrowed_inode_security_word8);
-	WRITE_ONCE(*inode_slot, inode_security_original);
+	if (!defer_inode_restore)
+		WRITE_ONCE(*inode_slot, inode_security_original);
 	smp_wmb();
 
 	if (READ_ONCE(*task_slot) != borrowed_task_security ||
 	    READ_ONCE(*task_word8) != borrowed_task_security_word8 ||
-	    READ_ONCE(*inode_slot) != inode_security_original ||
+	    READ_ONCE(*inode_slot) != (defer_inode_restore ?
+			borrowed_inode_security : inode_security_original) ||
 	    READ_ONCE(*inode_word8) != borrowed_inode_security_word8) {
 		WRITE_ONCE(*task_word8, borrowed_task_security_word8);
 		WRITE_ONCE(*inode_word8, borrowed_inode_security_word8);
@@ -454,9 +648,42 @@ static int lp3_stabilise_carriers(void)
 		    READ_ONCE(*inode_word8) != borrowed_inode_security_word8)
 			return -EIO;
 		labels_restored = true;
+		inode_label_restored = true;
 		return -EIO;
 	}
+	inode_label_restored = !defer_inode_restore;
 	carriers_stabilised = true;
+	return 0;
+}
+
+static int lp3_inode_restore_set(const char *value,
+				const struct kernel_param *param)
+{
+	unsigned long *task_slot = (unsigned long *)donor_security_slot;
+	unsigned long *task_word8 =
+		(unsigned long *)(borrowed_task_security + 8);
+	unsigned long *inode_slot = (unsigned long *)inode_security_slot;
+	unsigned long *inode_word8 =
+		(unsigned long *)(borrowed_inode_security + 8);
+	unsigned int request;
+
+	(void)param;
+	if (value == NULL || kstrtouint(value, 0, &request) || request != 1 ||
+	    inode_restore_request != 0 || !defer_inode_restore ||
+	    !carriers_stabilised || labels_restored || inode_label_restored)
+		return -EINVAL;
+	if (READ_ONCE(*task_slot) != borrowed_task_security ||
+	    READ_ONCE(*task_word8) != borrowed_task_security_word8 ||
+	    READ_ONCE(*inode_slot) != borrowed_inode_security ||
+	    READ_ONCE(*inode_word8) != borrowed_inode_security_word8)
+		return -ESTALE;
+	WRITE_ONCE(*inode_slot, inode_security_original);
+	smp_wmb();
+	if (READ_ONCE(*inode_slot) != inode_security_original ||
+	    READ_ONCE(*inode_word8) != borrowed_inode_security_word8)
+		return -EIO;
+	inode_label_restored = true;
+	inode_restore_request = request;
 	return 0;
 }
 
@@ -473,6 +700,14 @@ static int lp3_restore_task_label(void)
 
 	if (!carriers_stabilised)
 		return -ESTALE;
+	if (!inode_label_restored &&
+	    READ_ONCE(*inode_slot) == borrowed_inode_security &&
+	    READ_ONCE(*inode_word8) == borrowed_inode_security_word8) {
+		WRITE_ONCE(*inode_slot, inode_security_original);
+		smp_wmb();
+		inode_label_restored =
+			READ_ONCE(*inode_slot) == inode_security_original;
+	}
 	collateral_valid =
 		READ_ONCE(*task_slot) == borrowed_task_security &&
 		READ_ONCE(*task_word8) == borrowed_task_security_word8 &&
@@ -558,6 +793,7 @@ out:
 static bool lp3_carriers_still_stabilised(void)
 {
 	return carriers_stabilised && !labels_restored &&
+		inode_label_restored &&
 		READ_ONCE(*(unsigned long *)donor_security_slot) ==
 			borrowed_task_security &&
 		READ_ONCE(*(unsigned long *)(borrowed_task_security + 8)) ==
@@ -604,11 +840,11 @@ static int lp3_prepare_repairs(void)
 
 		pid = find_get_pid(tids[i]);
 		if (!pid)
-			return -ESRCH;
+			return -ENOENT;
 		task = get_pid_task(pid, PIDTYPE_PID);
 		put_pid(pid);
 		if (!task)
-			return -ESRCH;
+			return -ECHILD;
 		if (task->pid != tids[i] || task->tgid != expected_tgid ||
 		    strncmp(task->comm, LP3_WORKER_COMM, TASK_COMM_LEN) != 0) {
 			put_task_struct(task);
@@ -617,7 +853,7 @@ static int lp3_prepare_repairs(void)
 		repairs[i].stack = try_get_task_stack(task);
 		if (!repairs[i].stack) {
 			put_task_struct(task);
-			return -ESRCH;
+			return -EDEADLK;
 		}
 		repairs[i].tid = tids[i];
 		repairs[i].old_ctlbuf = nodes[i];
@@ -1543,17 +1779,37 @@ static int __init lp3_ctlbuf_rescue_init(void)
 	strscpy(repair_status, "validating", sizeof(repair_status));
 	if (!lp3_text_matches())
 		return -EILSEQ;
-	result = lp3_helper_borrowed_error();
+	result = lp3_loader_and_target_error();
 	if (result)
-		return result;
+		return result == -ESRCH ? -ENXIO :
+			result == -EINVAL ? -EUCLEAN : result;
 	result = lp3_stabilise_carriers();
 	if (result)
-		return result;
+		return result == -ESRCH ? -ENODEV :
+			result == -EINVAL ? -EREMOTEIO : result;
+	result = lp3_normalise_helper_real_cred();
+	if (result == -ESRCH)
+		result = -EOWNERDEAD;
+	else if (result == -EINVAL)
+		result = -EPROTO;
+	if (result)
+		goto fail;
 	result = lp3_prepare_repairs();
+	if (result == -ESRCH)
+		result = -EIDRM;
+	else if (result == -EINVAL)
+		result = -ENOTUNIQ;
 	if (result)
 		goto fail;
 	result = stop_machine(lp3_stop_and_repair, &context, NULL);
 	if (result || context.error) {
+		result = result == -ESRCH ? -ENOMSG : result;
+		context.error = context.error == -ESRCH ?
+			-EBADMSG : context.error;
+		if (result == -EINVAL)
+			result = -EBADR;
+		if (context.error == -EINVAL)
+			context.error = -EBADR;
 		result = result ? result : context.error;
 		goto fail;
 	}

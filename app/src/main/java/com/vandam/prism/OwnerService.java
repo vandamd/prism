@@ -57,7 +57,7 @@ public class OwnerService extends Service {
     static final int TRANSACTION_IDENTITY =
             IBinder.FIRST_CALL_TRANSACTION + 18;
     static final int COHORT_SIZE = 1152;
-    static final int FRAGMENT_COUNT = 8192;
+    static final int FRAGMENT_COUNT = 4096;
     static final int FRAGMENT_TRANSACTION_COUNT = 2304;
     static final int FILLER_REF_COUNT = 1536;
     static final int TRANSACTION_FRAGMENT_HOLD = 0x4265;
@@ -277,17 +277,55 @@ public class OwnerService extends Service {
                 return true;
             }
             if (code == TRANSACTION_TERMINAL_RETIRE) {
-                if ((flags & IBinder.FLAG_ONEWAY) == 0 ||
-                        Binder.getCallingUid() !=
-                                getApplicationInfo().uid ||
-                        Binder.getCallingPid() <= 0 ||
-                        Binder.getCallingPid() ==
-                                android.os.Process.myPid() ||
-                        data.readInt() != android.os.Process.myPid() ||
-                        data.readLong() !=
-                                ProcessIdentity.currentStartTime()) {
+                int expectedPid = data.readInt();
+                long expectedStartTime = data.readLong();
+                int expectedCallerPid = data.readInt();
+                long expectedCallerStartTime = data.readLong();
+                String expectedNonce = data.readString();
+                String expectedBootId = data.readString();
+                boolean hostHelperRetired = data.readInt() == 1;
+                int callerPid = Binder.getCallingPid();
+                int callerUid = Binder.getCallingUid();
+                boolean valid = (flags & IBinder.FLAG_ONEWAY) != 0 &&
+                        callerUid == 0 &&
+                        callerPid > 0 &&
+                        callerPid != android.os.Process.myPid() &&
+                        callerPid == expectedCallerPid &&
+                        expectedCallerStartTime > 0 &&
+                        ProcessIdentity.readStartTime(callerPid) ==
+                                expectedCallerStartTime &&
+                        terminalCleanup &&
+                        expectedPid == android.os.Process.myPid() &&
+                        expectedStartTime ==
+                                ProcessIdentity.currentStartTime() &&
+                        terminalNonce.equals(expectedNonce) &&
+                        terminalBootId.equals(expectedBootId) &&
+                        terminalBootId.equals(currentBootId()) &&
+                        hostHelperRetired;
+                if (!valid) {
+                    String rejection = "status=fail" +
+                            " stage=owner-terminal-retirement" +
+                            " reason=identity" +
+                            " caller_uid=" + callerUid +
+                            " caller_pid=" + callerPid +
+                            " expected_caller_pid=" + expectedCallerPid +
+                            " caller_start_time=" +
+                            ProcessIdentity.readStartTime(callerPid) +
+                            " expected_caller_start_time=" +
+                            expectedCallerStartTime;
+                    writeResult(new File(getFilesDir(),
+                            "owner-terminal-retirement.result"), rejection);
                     return false;
                 }
+                String state = "status=pass" +
+                        " stage=owner-terminal-retirement" +
+                        " nonce=" + terminalNonce +
+                        " owner_pid=" + android.os.Process.myPid() +
+                        " owner_start_time=" + terminalStartTime +
+                        " boot_id=" + terminalBootId +
+                        " self_exit=1";
+                writeResult(new File(getFilesDir(),
+                        "owner-terminal-retirement.result"), state);
                 releaseOwnedReferences();
                 new Thread(() -> android.os.Process.killProcess(
                         android.os.Process.myPid()),
@@ -358,6 +396,8 @@ public class OwnerService extends Service {
                 "owner-fragments-cleanup.ready");
         File terminalRequest = new File(getFilesDir(),
                 "owner-terminal-retire");
+        File terminalTrigger = new File(getFilesDir(),
+                "owner-terminal-retire.trigger");
         File terminalResult = new File(getFilesDir(),
                 "owner-terminal-retirement.result");
         while (resetWatcherRunning) {
@@ -390,26 +430,36 @@ public class OwnerService extends Service {
                 } catch (Exception ignored) {
                 }
             }
-            if (terminalCleanup && terminalRequest.exists()) {
+            if (terminalCleanup && terminalTrigger.exists()) {
                 String expected = "nonce=" + terminalNonce +
                         " owner_pid=" + android.os.Process.myPid() +
                         " owner_start_time=" + terminalStartTime +
                         " boot_id=" + terminalBootId +
                         " host_helper_retired=1";
-                boolean valid = expected.equals(
-                        readSmall(terminalRequest)) &&
-                        terminalBootId.equals(currentBootId());
-                releaseOwnedReferences();
-                String state = "status=" + (valid ? "pass" : "fail") +
-                        " stage=owner-terminal-retirement" +
-                        " nonce=" + terminalNonce +
-                        " owner_pid=" + android.os.Process.myPid() +
-                        " owner_start_time=" + terminalStartTime +
-                        " boot_id=" + terminalBootId +
-                        " self_exit=" + (valid ? 1 : 0);
-                writeResult(terminalResult, state);
-                android.os.Process.killProcess(android.os.Process.myPid());
-                return;
+                String observed = readSmall(terminalRequest);
+                if (!observed.isEmpty()) {
+                    boolean valid = expected.equals(observed) &&
+                            terminalBootId.equals(currentBootId());
+                    if (!valid) {
+                        String rejection = "status=fail" +
+                                " stage=owner-terminal-retirement" +
+                                " reason=request-identity";
+                        writeResult(terminalResult, rejection);
+                        return;
+                    }
+                    releaseOwnedReferences();
+                    String state = "status=pass" +
+                            " stage=owner-terminal-retirement" +
+                            " nonce=" + terminalNonce +
+                            " owner_pid=" + android.os.Process.myPid() +
+                            " owner_start_time=" + terminalStartTime +
+                            " boot_id=" + terminalBootId +
+                            " self_exit=1";
+                    writeResult(terminalResult, state);
+                    android.os.Process.killProcess(
+                            android.os.Process.myPid());
+                    return;
+                }
             }
             try {
                 Thread.sleep(10);

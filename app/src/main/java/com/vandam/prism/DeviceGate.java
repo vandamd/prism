@@ -13,7 +13,9 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public final class DeviceGate {
     private static final String PROFILE_FILE = "device_profiles.json";
@@ -28,6 +30,7 @@ public final class DeviceGate {
             JSONObject system = profile.getJSONObject("system");
             JSONObject kernel = profile.getJSONObject("kernel");
             JSONObject boot = profile.getJSONObject("required_boot_state");
+            Map<String, String> properties = properties();
 
             match(mismatches, "device", Build.DEVICE,
                     product.getString("device"));
@@ -37,14 +40,16 @@ public final class DeviceGate {
                     product.getString("manufacturer"));
             match(mismatches, "board", Build.BOARD,
                     product.getString("board"));
-            match(mismatches, "platform", property("ro.board.platform"),
+            match(mismatches, "platform", properties.getOrDefault(
+                            "ro.board.platform", ""),
                     product.getString("platform"));
             match(mismatches, "hardware", Build.HARDWARE,
                     product.getString("hardware"));
-            match(mismatches, "soc", property("ro.soc.model"),
+            match(mismatches, "soc", properties.getOrDefault(
+                            "ro.soc.model", ""),
                     product.getString("soc_model"));
             match(mismatches, "soc_manufacturer",
-                    property("ro.soc.manufacturer"),
+                    properties.getOrDefault("ro.soc.manufacturer", ""),
                     product.getString("soc_manufacturer"));
 
             match(mismatches, "display", Build.DISPLAY,
@@ -69,18 +74,21 @@ public final class DeviceGate {
                     Integer.toString(kernel.getInt("page_size")));
 
             match(mismatches, "verified_boot",
-                    property("ro.boot.verifiedbootstate"),
+                    properties.getOrDefault(
+                            "ro.boot.verifiedbootstate", ""),
                     boot.getString("verified_boot"));
             match(mismatches, "flash_locked",
-                    property("ro.boot.flash.locked"),
+                    properties.getOrDefault("ro.boot.flash.locked", ""),
                     boot.getBoolean("flash_locked") ? "1" : "0");
             match(mismatches, "vbmeta_state",
-                    property("ro.boot.vbmeta.device_state"), "locked");
+                    properties.getOrDefault(
+                            "ro.boot.vbmeta.device_state", ""), "locked");
             matchIfVisible(mismatches, "virtual_ab",
-                    property("ro.virtual_ab.enabled"),
+                    properties.getOrDefault("ro.virtual_ab.enabled", ""),
                     Boolean.toString(boot.getBoolean("virtual_ab")));
             match(mismatches, "dynamic_partitions",
-                    property("ro.boot.dynamic_partitions"),
+                    properties.getOrDefault(
+                            "ro.boot.dynamic_partitions", ""),
                     Boolean.toString(boot.getBoolean("dynamic_partitions")));
 
             if (mismatches.isEmpty()) {
@@ -109,20 +117,29 @@ public final class DeviceGate {
         }
     }
 
-    private static String property(String name) throws Exception {
-        Process process = new ProcessBuilder("/system/bin/getprop", name)
+    private static Map<String, String> properties() throws Exception {
+        Process process = new ProcessBuilder("/system/bin/getprop")
                 .redirectErrorStream(true)
                 .start();
-        String value;
+        Map<String, String> properties = new HashMap<>();
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(process.getInputStream(),
                         StandardCharsets.UTF_8))) {
-            value = reader.readLine();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                int separator = line.indexOf("]: [");
+                if (line.startsWith("[") && separator > 1 &&
+                        line.endsWith("]")) {
+                    properties.put(line.substring(1, separator),
+                            line.substring(separator + 4,
+                                    line.length() - 1));
+                }
+            }
         }
         if (process.waitFor() != 0) {
             throw new IllegalStateException("getprop");
         }
-        return value == null ? "" : value.trim();
+        return properties;
     }
 
     private static void match(List<String> mismatches, String name,

@@ -10,6 +10,7 @@ import android.content.SharedPreferences;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Process;
+import android.os.SystemClock;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -83,6 +84,11 @@ public final class PrismAppBridgeService extends Service {
     private static final String STATE_STRICT_CLEAN = "strict-clean";
     private static final String STATE_SAFE_RESET_PENDING = "safe-reset-pending";
     private static final Object CAPABILITY_LOCK = new Object();
+    private static final Object WARM_PROCESS_LOCK = new Object();
+    private static String warmProcessBootId = "";
+    private static int warmProcessPid = -1;
+    private static long warmProcessStart = -1;
+    private static long warmProcessElapsed = -1;
 
     private final Object lock = new Object();
     private static final ThreadLocal<Boolean> TRUSTED_LOCAL = new ThreadLocal<>();
@@ -131,6 +137,26 @@ public final class PrismAppBridgeService extends Service {
             return committed
                     ? "status=pass stage=app-bridge-prearm"
                     : "status=fail stage=app-bridge-prearm reason=storage";
+        }
+    }
+
+    static void recordWarmMainProcess() {
+        String currentBootId = readBootId();
+        int currentPid = Process.myPid();
+        long currentStart = ProcessIdentity.currentStartTime();
+        if (!currentBootId.matches(BOOT_ID_PATTERN) || currentPid <= 0 ||
+                currentStart <= 0) {
+            return;
+        }
+        synchronized (WARM_PROCESS_LOCK) {
+            if (!currentBootId.equals(warmProcessBootId) ||
+                    currentPid != warmProcessPid ||
+                    currentStart != warmProcessStart) {
+                warmProcessBootId = currentBootId;
+                warmProcessPid = currentPid;
+                warmProcessStart = currentStart;
+                warmProcessElapsed = SystemClock.elapsedRealtime();
+            }
         }
     }
 
@@ -549,7 +575,21 @@ public final class PrismAppBridgeService extends Service {
                             STATE_SAFE_RESET_PENDING)) {
                 return "status=fail stage=app-bridge-probe reason=binding";
             }
-            return "status=pass stage=app-bridge-probe uid=" + Process.myUid();
+            long currentStart = ProcessIdentity.currentStartTime();
+            long stableMillis;
+            synchronized (WARM_PROCESS_LOCK) {
+                stableMillis = requestedBootId.equals(warmProcessBootId) &&
+                        Process.myPid() == warmProcessPid &&
+                        currentStart == warmProcessStart &&
+                        warmProcessElapsed >= 0
+                        ? SystemClock.elapsedRealtime() - warmProcessElapsed
+                        : -1;
+            }
+            return "status=pass stage=app-bridge-probe uid=" + Process.myUid() +
+                    " pid=" + Process.myPid() +
+                    " start=" + currentStart +
+                    " boot_id=" + requestedBootId +
+                    " warm_stable_ms=" + stableMillis;
         }
 
         @Override
@@ -1333,7 +1373,8 @@ public final class PrismAppBridgeService extends Service {
                     "^version=1 kind=strict-clean" +
                             Pattern.quote(binding) +
                             " proof_sha256=([0-9a-f]{64})" +
-                            " dwell_ms=([1-9][0-9]*) jobs=([0-9]{1,3})" +
+                            " event_bound=1 baseline_samples=2" +
+                            " jobs=([0-9]{1,3})" +
                             " ksud=35088 profile=exact health=normal" +
                             " donor=unique helper=absent watchdog=absent$")
                     .matcher(receipt);
@@ -1341,8 +1382,7 @@ public final class PrismAppBridgeService extends Service {
                 return false;
             }
             try {
-                return Long.parseLong(matcher.group(2)) >= 10_000 &&
-                        Integer.parseInt(matcher.group(3)) < 1000;
+                return Integer.parseInt(matcher.group(2)) < 1000;
             } catch (NumberFormatException exception) {
                 return false;
             }

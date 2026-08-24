@@ -1,0 +1,100 @@
+diff --git a/userspace/ksud/src/android/cli.rs b/userspace/ksud/src/android/cli.rs
+index 8fd49999..273955fc 100755
+--- a/userspace/ksud/src/android/cli.rs
++++ b/userspace/ksud/src/android/cli.rs
+@@ -83,6 +83,10 @@ enum Commands {
+         /// Run synchronously and hand off to a recognised manager identity
+         #[arg(long, hide = true)]
+         foreground_manager_uid: Option<u32>,
++
++        /// Signal a supervising Light Phone worker after synchronous completion
++        #[arg(long, hide = true)]
++        lp3_completion_path: Option<PathBuf>,
+     },
+ 
+     /// Manage auto apply user custom umount configs
+@@ -729,6 +733,7 @@ pub fn run() -> Result<()> {
+             kmi,
+             package_name,
+             foreground_manager_uid,
++            lp3_completion_path,
+         } => {
+             if let Some(port) = magica {
+                 return crate::android::late_load::magica::run(port, &package_name, allow_shell)
+@@ -742,6 +747,7 @@ pub fn run() -> Result<()> {
+                 kmi,
+                 allow_shell,
+                 foreground_manager_uid,
++                lp3_completion_path.as_deref(),
+             );
+             if post_magica {
+                 info!("Restoring adb properties (post-magica cleanup)...");
+diff --git a/userspace/ksud/src/android/late_load/mod.rs b/userspace/ksud/src/android/late_load/mod.rs
+index cf5a8d4a..25f45721 100644
+--- a/userspace/ksud/src/android/late_load/mod.rs
++++ b/userspace/ksud/src/android/late_load/mod.rs
+@@ -1,6 +1,10 @@
+ pub mod magica;
+ 
+-use std::process::Command;
++use std::{
++    io::Write,
++    os::unix::fs::OpenOptionsExt,
++    path::Path,
++};
+ 
+ use anyhow::{Context, Result, bail};
+ use log::{info, warn};
+@@ -107,11 +111,37 @@ fn handoff_to_manager(uid: u32) -> Result<()> {
+     Ok(())
+ }
+ 
++fn write_lp3_completion(path: &Path) -> Result<()> {
++    const PREFIX: &str = "/data/local/tmp/lp3-ksud-completion.";
++    let text = path.to_str().context("Completion path is not UTF-8")?;
++    let nonce = text
++        .strip_prefix(PREFIX)
++        .context("Completion path prefix is invalid")?;
++    if nonce.len() != 32 ||
++        !nonce.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++    {
++        bail!("Completion path nonce is invalid");
++    }
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .truncate(true)
++        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
++        .open(path)
++        .context("Failed to open the pre-created completion inode")?;
++    file.write_all(b"LP3_KSUD_DONE\n")
++        .context("Failed to write completion record")?;
++    file.sync_all().context("Failed to sync completion record")?;
++    std::fs::write("/data/local/tmp/lp3-ksud-stage", b"completion-written\n")
++        .context("Failed to write completion stage")?;
++    Ok(())
++}
++
+ pub fn run(
+-    package_name: &String,
++    _package_name: &String,
+     kmi: Option<String>,
+     allow_shell: bool,
+     foreground_manager_uid: Option<u32>,
++    lp3_completion_path: Option<&Path>,
+ ) -> Result<()> {
+     if foreground_manager_uid.is_some() && allow_shell {
+         bail!("foreground manager hand-off cannot enable shell access");
+@@ -220,10 +250,8 @@ pub fn run(
+     // 14. Execute boot-completed stage scripts (non-blocking)
+     init_event::run_stage("boot-completed", false);
+ 
+-    // 15. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module
+-    info!("Restarting KernelSU Manager {package_name}...");
+-    let _ = Command::new("am")
+-        .args(["force-stop", package_name])
+-        .status();
++    if let Some(path) = lp3_completion_path {
++        write_lp3_completion(path)?;
++    }
+     Ok(())
+ }

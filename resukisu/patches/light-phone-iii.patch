@@ -173,6 +173,14 @@ index 040eb550..e97bff5b 100644
      // We need to reset stdin/stdout/stderr; otherwise, sending file descriptors via cmd transactions
      // will be blocked by SELinux because its fsec->sid is still u:r:su:s0 instead of u:r:ksu:s0.
      utils::reset_std()?;
+@@ -149,7 +227,3 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
+         .status();
+-    let _ = Command::new("am")
+-        .args(["start", "-n", &format!("{package_name}/.ui.MainActivity")])
+-        .status();
+-
+     Ok(())
+ }
 diff --git a/userspace/ksuinit/src/lib.rs b/userspace/ksuinit/src/lib.rs
 index 1a62d4c2..a98f620d 100644
 --- a/userspace/ksuinit/src/lib.rs
@@ -531,13 +539,12 @@ new file mode 100644
 index 00000000..9f95c665
 --- /dev/null
 +++ b/userspace/lp3_loader/src/lib.rs
-@@ -0,0 +1,489 @@
+@@ -0,0 +1,487 @@
 +mod symbols;
 +
 +use goblin::elf::{Elf, section_header, sym::Sym};
 +use scroll::{Pwrite, ctx::SizeWith};
 +use std::{
-+    ffi::CString,
 +    os::fd::RawFd,
 +    ptr,
 +    sync::atomic::{AtomicPtr, Ordering},
@@ -800,23 +807,23 @@ index 00000000..9f95c665
 +    0
 +}
 +
-+fn load_staged_module(rescue_fd: RawFd) -> Result<(), i32> {
++fn load_staged_module(_rescue_fd: RawFd) -> Result<(), i32> {
 +    let mut kmsg = ksuinit::open_kmsg_at_end().ok();
 +    let kernel_log_before = read_kernel_log().unwrap_or_default();
-+    let path = CString::new(format!("/proc/self/fd/{rescue_fd}")).map_err(|_| 41)?;
-+    let read_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-+    if read_fd < 0 {
-+        return Err(42);
-+    }
-+    let result = unsafe { libc::syscall(libc::SYS_finit_module, read_fd, c"".as_ptr(), 0) };
++    let mapping = mapped_rescue().ok_or(42)?;
++    let result = unsafe {
++        libc::syscall(
++            libc::SYS_init_module,
++            mapping.as_ptr(),
++            mapping.len(),
++            c"".as_ptr(),
++        )
++    };
 +    let load_error = if result == 0 {
 +        0
 +    } else {
 +        unsafe { *libc::__errno() }
 +    };
-+    unsafe {
-+        libc::close(read_fd);
-+    }
 +    let mut logs = kmsg
 +        .as_mut()
 +        .and_then(|file| ksuinit::read_new_kmsg(file).ok())

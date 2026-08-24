@@ -19,6 +19,7 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
     private val mutableState = MutableStateFlow(PrismState.Checking)
     private var refreshJob: Job? = null
     private var activationJob: Job? = null
+    private var preparedActivation: ShizukuBridge.PreparedActivationHandle? = null
 
     val state: StateFlow<PrismState> = mutableState.asStateFlow()
 
@@ -35,7 +36,40 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
         }
         refreshJob =
             viewModelScope.launch {
-                mutableState.value = withContext(Dispatchers.IO) { inspect() }
+                val inspected = withContext(Dispatchers.IO) { inspect() }
+                if (inspected.action != PrismAction.Activate) {
+                    preparedActivation = null
+                    mutableState.value = inspected
+                    return@launch
+                }
+                mutableState.value =
+                    inspected.copy(actionLabel = "Preparing", actionEnabled = false)
+                val managerUid = installedUid(RESUKISU_PACKAGE)
+                var prepared: ShizukuBridge.PreparedActivationHandle? = null
+                repeat(PREPARE_MAX_ATTEMPTS) {
+                    if (prepared == null && managerUid != null) {
+                        val candidate =
+                            withContext(Dispatchers.IO) {
+                                runCatching { bridge.prepareReSukiSuActivation(managerUid) }.getOrNull()
+                            }
+                        if (candidate != null &&
+                            candidate.startResult.startsWith("status=working ") &&
+                            awaitPreparedActivation(candidate)
+                        ) {
+                            prepared = candidate
+                        } else {
+                            delay(PREPARE_RETRY_MILLIS)
+                        }
+                    }
+                }
+                if (prepared == null) {
+                    preparedActivation = null
+                    mutableState.value =
+                        inspected.copy(actionLabel = "Preparing", actionEnabled = false)
+                    return@launch
+                }
+                preparedActivation = prepared
+                mutableState.value = inspected
             }
     }
 
@@ -64,6 +98,8 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (activationJob?.isActive == true) return
+        val prepared = preparedActivation ?: return
+        preparedActivation = null
         activationJob = viewModelScope.launch {
             val current = mutableState.value
             val reportId = ActivationDiagnostics.newReportId()
@@ -80,14 +116,14 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     activationVisible = true,
                 )
-            val managerUid = installedUid(RESUKISU_PACKAGE)
-            if (managerUid == null) {
-                showActivationFailure("ReSukiSU is not installed.")
-                return@launch
-            }
             val handle =
                 withContext(Dispatchers.IO) {
-                    runCatching { bridge.startReSukiSuActivation(managerUid) }.getOrNull()
+                    runCatching {
+                        bridge.releasePreparedActivation(
+                            prepared,
+                            SystemClock.elapsedRealtime(),
+                        )
+                    }.getOrNull()
                 }
             if (handle == null || !handle.startResult.startsWith("status=working ")) {
                 showActivationFailure("Could not start the Shizuku activation service.")
@@ -95,6 +131,28 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
             }
             pollActivation(handle)
         }
+    }
+
+    private suspend fun awaitPreparedActivation(
+        handle: ShizukuBridge.PreparedActivationHandle,
+    ): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + PREPARE_TIMEOUT_MILLIS
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val snapshot =
+                withContext(Dispatchers.IO) {
+                    runCatching { bridge.getPreparedActivationSnapshot(handle) }.getOrNull()
+                } ?: return false
+            val header = snapshot.lineSequence().firstOrNull().orEmpty()
+            val fields = header.split(' ').toSet()
+            if (fields.contains("phase=ready") && fields.contains("terminal=0")) {
+                return true
+            }
+            if (fields.contains("terminal=1")) {
+                return false
+            }
+            delay(PREPARE_POLL_MILLIS)
+        }
+        return false
     }
 
     private fun resumeActivation(handle: ShizukuBridge.ActivationHandle) {
@@ -280,6 +338,7 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun inspect(): PrismState {
+        PrismAppBridgeService.recordWarmMainProcess()
         val supported = DeviceGate.verify(getApplication()).startsWith("status=pass")
         val reSukiSUInstalled = packageInstalled(RESUKISU_PACKAGE)
         val shizukuInstalled = packageInstalled(SHIZUKU_PACKAGE)
@@ -359,6 +418,10 @@ class PrismViewModel(application: Application) : AndroidViewModel(application) {
         const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
         const val RESUKISU_PACKAGE = "com.resukisu.resukisu"
         private const val ACTIVATION_POLL_MILLIS = 350L
+        private const val PREPARE_POLL_MILLIS = 100L
+        private const val PREPARE_RETRY_MILLIS = 250L
+        private const val PREPARE_TIMEOUT_MILLIS = 30_000L
+        private const val PREPARE_MAX_ATTEMPTS = 12
     }
 
     private data class ShizukuInspection(
