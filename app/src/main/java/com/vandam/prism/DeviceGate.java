@@ -73,16 +73,19 @@ public final class DeviceGate {
                     Long.toString(Os.sysconf(OsConstants._SC_PAGESIZE)),
                     Integer.toString(kernel.getInt("page_size")));
 
+            boolean unlocked = "0".equals(properties.getOrDefault(
+                    "ro.boot.flash.locked", ""));
             match(mismatches, "verified_boot",
                     properties.getOrDefault(
                             "ro.boot.verifiedbootstate", ""),
-                    boot.getString("verified_boot"));
+                    unlocked ? "orange" : boot.getString("verified_boot"));
             match(mismatches, "flash_locked",
                     properties.getOrDefault("ro.boot.flash.locked", ""),
-                    boot.getBoolean("flash_locked") ? "1" : "0");
+                    unlocked ? "0" : (boot.getBoolean("flash_locked") ? "1" : "0"));
             match(mismatches, "vbmeta_state",
                     properties.getOrDefault(
-                            "ro.boot.vbmeta.device_state", ""), "locked");
+                            "ro.boot.vbmeta.device_state", ""),
+                    unlocked ? "unlocked" : "locked");
             matchIfVisible(mismatches, "virtual_ab",
                     properties.getOrDefault("ro.virtual_ab.enabled", ""),
                     Boolean.toString(boot.getBoolean("virtual_ab")));

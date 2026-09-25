@@ -51,6 +51,9 @@ public final class PrismUserService extends IPrismUserService.Stub {
     }
 
     private static boolean isReSukiSuActive() throws Exception {
+        if (!Files.isExecutable(Path.of("/data/local/tmp/lp3-resukisu-ksud"))) {
+            return false;
+        }
         java.lang.Process process = new ProcessBuilder(
                 "/data/local/tmp/lp3-resukisu-ksud", "debug", "version")
                 .redirectErrorStream(true)
@@ -68,7 +71,7 @@ public final class PrismUserService extends IPrismUserService.Stub {
             }
         }
         return process.waitFor() == 0 &&
-                "Kernel Version: 35088".equals(
+                "Kernel Version: 35171".equals(
                         output.toString(StandardCharsets.UTF_8.name()).trim());
     }
 

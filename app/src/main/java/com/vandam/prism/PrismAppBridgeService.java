@@ -1375,7 +1375,7 @@ public final class PrismAppBridgeService extends Service {
                             " proof_sha256=([0-9a-f]{64})" +
                             " event_bound=1 baseline_samples=2" +
                             " jobs=([0-9]{1,3})" +
-                            " ksud=35088 profile=exact health=normal" +
+                            " ksud=35171 profile=exact health=normal" +
                             " donor=unique helper=absent watchdog=absent$")
                     .matcher(receipt);
             if (!matcher.matches()) {

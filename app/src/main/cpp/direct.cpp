@@ -101,8 +101,8 @@ constexpr std::uint64_t kCredSecurityOffset = 120;
 constexpr std::uint64_t kKernelLinkBase = UINT64_C(0xffffffc008000000);
 constexpr char kActionSupervisorPath[] =
         "/data/local/tmp/prism-primitive";
-constexpr off_t kReSukiLoaderSize = 1'323'008;
-constexpr off_t kReSukiExecutableSize = 4'215'752;
+constexpr off_t kReSukiLoaderSize = 1'308'056;
+constexpr off_t kReSukiExecutableSize = 4'238'456;
 constexpr off_t kReSukiModuleSize = 119'712;
 constexpr off_t kReSukiEmbeddedRescueSize = 563'952;
 constexpr std::uint64_t kActionSupervisorReceiptMagic =

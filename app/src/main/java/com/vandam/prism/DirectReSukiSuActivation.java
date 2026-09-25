@@ -937,12 +937,13 @@ final class DirectReSukiSuActivation {
                     "postflight-confirmation");
             CommandResult version = runCommand(
                     "/data/local/tmp/lp3-resukisu-ksud", "debug", "info");
-            String expectedInfo = "version: 35088\n" +
-                    "full_version: v4.2.0-rc1-74668639-dirty@ReSukiSU\n" +
+            String expectedInfo = "version: 35171\n" +
+                    "full_version: v4.2.0-rc3-239e1e88-dirty@ReSukiSU\n" +
                     "flags: 0x5\n" +
-                    "uapi_version: 2\n" +
+                    "uapi_version: 4\n" +
                     "features: 0x5\n" +
                     "lkm: true\n" +
+                    "bundled: false\n" +
                     "late_load: true\n" +
                     "runtime_mode: late-load\n" +
                     "pr_build: false";
@@ -950,7 +951,7 @@ final class DirectReSukiSuActivation {
                             expectedInfo.equals(version.output.trim()),
                     "resukisu-active-proof", true,
                     "ReSukiSU did not remain active after cleanup");
-            reporter.log("ReSukiSU live late-load kernel 35088 verified");
+            reporter.log("ReSukiSU live late-load kernel 35171 verified");
             reporter.log("Registered system jobs after activation: " +
                     jobs);
             reporter.log("Device health after activation verified");
@@ -960,7 +961,7 @@ final class DirectReSukiSuActivation {
                             " proof_sha256=" + strictCleanProofDigest +
                             " event_bound=1 baseline_samples=2" +
                             " jobs=" + jobs +
-                            " ksud=35088 profile=exact health=normal" +
+                            " ksud=35171 profile=exact health=normal" +
                             " donor=unique helper=absent watchdog=absent";
             requirePass(
                     app.recordStrictCleanReceipt(strictCleanReceipt),

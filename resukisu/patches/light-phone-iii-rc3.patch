@@ -1,0 +1,1405 @@
+diff --git a/kernel/selinux/selinux.c b/kernel/selinux/selinux.c
+index bf9ba1f6..79cb9f58 100644
+--- a/kernel/selinux/selinux.c
++++ b/kernel/selinux/selinux.c
+@@ -61,7 +61,7 @@ static int transive_to_domain(const char *domain, struct cred *cred, bool clear_
+ 
+ void setup_selinux(const char *domain, struct cred *cred)
+ {
+-    if (transive_to_domain(domain, cred, false)) {
++    if (transive_to_domain(domain, cred, true)) {
+         pr_err("transive domain failed.\n");
+         return;
+     }
+@@ -69,7 +69,7 @@ void setup_selinux(const char *domain, struct cred *cred)
+ 
+ void setup_ksu_cred_selinux(void)
+ {
+-    if (ksu_cred && transive_to_domain(KERNEL_SU_CONTEXT, ksu_cred, false)) {
++    if (ksu_cred && transive_to_domain(KERNEL_SU_CONTEXT, ksu_cred, true)) {
+         pr_err("setup ksu cred selinux domain failed.\n");
+     }
+ }
+diff --git a/userspace/ksud/src/android/cli.rs b/userspace/ksud/src/android/cli.rs
+index 9c101aac..bc8e1a56 100755
+--- a/userspace/ksud/src/android/cli.rs
++++ b/userspace/ksud/src/android/cli.rs
+@@ -79,6 +79,14 @@ enum Commands {
+         /// manager package name
+         #[arg(long, default_value_t = String::from(defs::DEFAULT_PACKAGE_NAME))]
+         package_name: String,
++
++        /// Run synchronously and hand off to a recognised manager identity
++        #[arg(long, hide = true)]
++        foreground_manager_uid: Option<u32>,
++
++        /// Signal the supervising Light Phone worker after completion
++        #[arg(long, hide = true)]
++        lp3_completion_path: Option<PathBuf>,
+     },
+ 
+     /// Manage auto apply user custom umount configs
+@@ -735,6 +743,8 @@ pub fn run() -> Result<()> {
+             post_magica,
+             kmi,
+             package_name,
++            foreground_manager_uid,
++            lp3_completion_path,
+         } => {
+             if let Some(port) = magica {
+                 return crate::android::late_load::magica::run(port, &package_name, allow_shell)
+@@ -743,7 +753,7 @@ pub fn run() -> Result<()> {
+                         e
+                     });
+             }
+-            let result = crate::android::late_load::run(&package_name, kmi, allow_shell);
++            let result = crate::android::late_load::run(&package_name, kmi, allow_shell, foreground_manager_uid, lp3_completion_path.as_deref());
+             if post_magica {
+                 info!("Restoring adb properties (post-magica cleanup)...");
+                 if let Err(e) = crate::android::late_load::magica::disable_adb_root() {
+diff --git a/userspace/ksud/src/android/late_load/mod.rs b/userspace/ksud/src/android/late_load/mod.rs
+index f3783be6..2f0d4043 100644
+--- a/userspace/ksud/src/android/late_load/mod.rs
++++ b/userspace/ksud/src/android/late_load/mod.rs
+@@ -1,14 +1,18 @@
+ pub mod magica;
+ 
+-use std::process::Command;
++use std::{
++    io::Write,
++    os::unix::fs::OpenOptionsExt,
++    path::Path,
++};
+ 
+-use anyhow::{Context, Result};
++use anyhow::{Context, Result, bail};
+ use log::{info, warn};
+ use rustix::cstr;
+ 
+ use crate::{
+     android::{
+-        dynamic_manager, init_event,
++        dynamic_manager, init_event, ksucalls,
+         module::{handle_updated_modules, metamodule, prune_modules},
+         restorecon, utils,
+     },
+@@ -44,8 +48,107 @@ fn dump_process_info(label: &str) {
+     );
+ }
+ 
+-pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+-    utils::daemonize(false)?;
++fn selinux_context(value: &str) -> &str {
++    value.trim_matches(|character: char| {
++        character == '\0' || character.is_ascii_whitespace()
++    })
++}
++
++fn handoff_to_manager(uid: u32) -> Result<()> {
++    if !(10_000..20_000).contains(&uid) {
++        bail!("manager UID is outside the Android user 0 app range: {uid}");
++    }
++
++    let uid = uid as libc::uid_t;
++    let gid = uid as libc::gid_t;
++    unsafe {
++        if libc::setgroups(0, std::ptr::null()) != 0 {
++            return Err(std::io::Error::last_os_error()).context("Failed to clear groups");
++        }
++        if libc::setresgid(gid, gid, gid) != 0 {
++            return Err(std::io::Error::last_os_error()).context("Failed to adopt manager GID");
++        }
++        if libc::setresuid(uid, uid, uid) != 0 {
++            return Err(std::io::Error::last_os_error()).context("Failed to adopt manager UID");
++        }
++    }
++
++    if unsafe { libc::getuid() } != uid || unsafe { libc::getgid() } != gid {
++        bail!("manager identity hand-off did not take effect");
++    }
++
++    let mut recognised = false;
++    for _ in 0..100 {
++        let mut info = crate::android::uapi::ksu_get_info_cmd {
++            version: 0,
++            flags: 0,
++            features: 0,
++            uapi_version: 0,
++        };
++        if ksucalls::ksuctl(crate::android::uapi::KSU_IOCTL_GET_INFO, &raw mut info).is_ok()
++            && info.version != 0
++            && info.flags & crate::android::uapi::KSU_GET_INFO_FLAG_MANAGER_RUST != 0
++        {
++            recognised = true;
++            break;
++        }
++        std::thread::sleep(std::time::Duration::from_millis(50));
++    }
++    if !recognised {
++        bail!("KernelSU did not recognise UID {uid} as a manager");
++    }
++    ksucalls::ensure_uapi_version_matched()?;
++    ksucalls::grant_root().context("KernelSU manager root hand-off failed")?;
++
++    let context = std::fs::read_to_string("/proc/self/attr/current")
++        .context("Failed to read the post-hand-off SELinux context")?;
++    if unsafe { libc::getuid() } != 0
++        || unsafe { libc::getgid() } != 0
++        || selinux_context(&context) != "u:r:ksu:s0"
++    {
++        bail!("KernelSU manager root hand-off produced an unexpected identity");
++    }
++    Ok(())
++}
++
++fn write_lp3_completion(path: &Path) -> Result<()> {
++    const PREFIX: &str = "/data/local/tmp/lp3-ksud-completion.";
++    let text = path.to_str().context("Completion path is not UTF-8")?;
++    let nonce = text
++        .strip_prefix(PREFIX)
++        .context("Completion path prefix is invalid")?;
++    if nonce.len() != 32 ||
++        !nonce.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++    {
++        bail!("Completion path nonce is invalid");
++    }
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .truncate(true)
++        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
++        .open(path)
++        .context("Failed to open the pre-created completion inode")?;
++    file.write_all(b"LP3_KSUD_DONE\n")
++        .context("Failed to write completion record")?;
++    file.sync_all().context("Failed to sync completion record")?;
++    std::fs::write("/data/local/tmp/lp3-ksud-stage", b"completion-written\n")
++        .context("Failed to write completion stage")?;
++    Ok(())
++}
++
++pub fn run(
++    _package_name: &String,
++    kmi: Option<String>,
++    allow_shell: bool,
++    foreground_manager_uid: Option<u32>,
++    lp3_completion_path: Option<&Path>,
++) -> Result<()> {
++    if foreground_manager_uid.is_some() && allow_shell {
++        bail!("foreground manager hand-off cannot enable shell access");
++    }
++    if foreground_manager_uid.is_none() {
++        utils::daemonize(false)?;
++    }
+     info!("late-load command triggered!");
+     dump_process_info("late-load start");
+ 
+@@ -78,6 +181,11 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
+         dump_process_info("after load_module");
+     }
+ 
++    if let Some(uid) = foreground_manager_uid {
++        handoff_to_manager(uid)?;
++        dump_process_info("after manager root hand-off");
++    }
++
+     // We need to reset stdin/stdout/stderr; otherwise, sending file descriptors via cmd transactions
+     // will be blocked by SELinux because its fsec->sid is still u:r:su:s0 instead of u:r:ksu:s0.
+     utils::reset_std()?;
+@@ -143,14 +251,8 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
+     // 14. Execute boot-completed stage scripts (non-blocking)
+     init_event::run_stage("boot-completed", false);
+ 
+-    // 15. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module
+-    info!("Restarting KernelSU Manager {package_name}...");
+-    let _ = Command::new("am")
+-        .args(["force-stop", package_name])
+-        .status();
+-    let _ = Command::new("am")
+-        .args(["start", "-n", &format!("{package_name}/.ui.MainActivity")])
+-        .status();
+-
++    if let Some(path) = lp3_completion_path {
++        write_lp3_completion(path)?;
++    }
+     Ok(())
+ }
+diff --git a/userspace/ksuinit/src/lib.rs b/userspace/ksuinit/src/lib.rs
+index 1a62d4c2..a98f620d 100644
+--- a/userspace/ksuinit/src/lib.rs
++++ b/userspace/ksuinit/src/lib.rs
+@@ -85,7 +85,7 @@ pub fn for_each_kernel_symbols<F: FnMut(&(String, u64)) -> Result<bool>>(mut f:
+ 
+ const O_NONBLOCK: i32 = 0x800;
+ 
+-fn open_kmsg_at_end() -> Result<File> {
++pub fn open_kmsg_at_end() -> Result<File> {
+     let mut last_error = None;
+ 
+     for path in ["/dev/kmsg", "/kmsg"] {
+@@ -115,7 +115,7 @@ fn open_kmsg_at_end() -> Result<File> {
+     }
+ }
+ 
+-fn read_new_kmsg(file: &mut File) -> Result<String> {
++pub fn read_new_kmsg(file: &mut File) -> Result<String> {
+     let mut output = Vec::new();
+     let mut record = [0u8; 8192];
+ 
+@@ -200,7 +200,10 @@ fn write_elf64_word(
+     Ok(())
+ }
+ 
+-fn replace_module_vermagic(buffer: &mut Vec<u8>, required_vermagic: &str) -> Result<()> {
++pub fn replace_module_vermagic(
++    buffer: &mut Vec<u8>,
++    required_vermagic: &str,
++) -> Result<()> {
+     struct ModinfoLocation {
+         offset: usize,
+         size: usize,
+@@ -262,6 +265,12 @@ fn replace_module_vermagic(buffer: &mut Vec<u8>, required_vermagic: &str) -> Res
+ 
+     let old_modinfo = &buffer[location.offset..location.offset + location.size];
+     let replacement = format!("vermagic={required_vermagic}");
++    if old_modinfo
++        .split(|byte| *byte == 0)
++        .any(|entry| entry == replacement.as_bytes())
++    {
++        return Ok(());
++    }
+     let mut new_modinfo = Vec::with_capacity(old_modinfo.len().max(replacement.len() + 1));
+     let mut replaced = false;
+ 
+diff --git a/userspace/lp3_loader/Cargo.lock b/userspace/lp3_loader/Cargo.lock
+new file mode 100644
+index 00000000..b3d72562
+--- /dev/null
++++ b/userspace/lp3_loader/Cargo.lock
+@@ -0,0 +1,273 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "anyhow"
++version = "1.0.104"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
++
++[[package]]
++name = "bitflags"
++version = "2.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
++
++[[package]]
++name = "errno"
++version = "0.3.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
++dependencies = [
++ "libc",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "goblin"
++version = "0.10.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "17582616a7718cca54cec18e534a76c7c4aec11a8b9a85695712f262fd15a4c8"
++dependencies = [
++ "log",
++ "plain",
++ "scroll",
++]
++
++[[package]]
++name = "kernlog"
++version = "0.3.1"
++source = "git+https://github.com/ReSukiSU/kernlog.rs#68caa7bf1e27baea35b00ebba786cafae0bca90f"
++dependencies = [
++ "libc",
++ "log",
++]
++
++[[package]]
++name = "ksuinit"
++version = "2.0.0"
++dependencies = [
++ "anyhow",
++ "goblin",
++ "kernlog",
++ "log",
++ "rustix 0.38.34",
++ "scroll",
++ "syscalls",
++]
++
++[[package]]
++name = "libc"
++version = "0.2.189"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.4.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
++
++[[package]]
++name = "log"
++version = "0.4.33"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
++
++[[package]]
++name = "lp3-resukisu-loader"
++version = "0.1.0"
++dependencies = [
++ "goblin",
++ "ksuinit",
++ "libc",
++ "rustix 1.1.4",
++ "scroll",
++]
++
++[[package]]
++name = "plain"
++version = "0.2.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "rustix"
++version = "0.38.34"
++source = "git+https://github.com/ReSukiSU/rustix.git?rev=4a53fbc#4a53fbc7cb7a07cabe87125cc21dbc27db316259"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys 0.4.15",
++ "windows-sys 0.52.0",
++]
++
++[[package]]
++name = "rustix"
++version = "1.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys 0.12.1",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "scroll"
++version = "0.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c1257cd4248b4132760d6524d6dda4e053bc648c9070b960929bf50cfb1e7add"
++dependencies = [
++ "scroll_derive",
++]
++
++[[package]]
++name = "scroll_derive"
++version = "0.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed76efe62313ab6610570951494bdaa81568026e0318eaa55f167de70eeea67d"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "syscalls"
++version = "0.8.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "81c645a4de0d803ced6ef0388a2646aa1ef8467173b5d59a2c33c88de4ab76e7"
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "windows-sys"
++version = "0.52.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
++dependencies = [
++ "windows-targets",
++]
++
++[[package]]
++name = "windows-sys"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "windows-targets"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973"
++dependencies = [
++ "windows_aarch64_gnullvm",
++ "windows_aarch64_msvc",
++ "windows_i686_gnu",
++ "windows_i686_gnullvm",
++ "windows_i686_msvc",
++ "windows_x86_64_gnu",
++ "windows_x86_64_gnullvm",
++ "windows_x86_64_msvc",
++]
++
++[[package]]
++name = "windows_aarch64_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
++
++[[package]]
++name = "windows_aarch64_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
++
++[[package]]
++name = "windows_i686_gnu"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
++
++[[package]]
++name = "windows_i686_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
++
++[[package]]
++name = "windows_i686_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
++
++[[package]]
++name = "windows_x86_64_gnu"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
++
++[[package]]
++name = "windows_x86_64_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
++
++[[package]]
++name = "windows_x86_64_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+diff --git a/userspace/lp3_loader/Cargo.toml b/userspace/lp3_loader/Cargo.toml
+new file mode 100644
+index 00000000..2bbf06b9
+--- /dev/null
++++ b/userspace/lp3_loader/Cargo.toml
+@@ -0,0 +1,21 @@
++[package]
++name = "lp3-resukisu-loader"
++version = "0.1.0"
++edition = "2024"
++
++[lib]
++crate-type = ["cdylib"]
++
++[dependencies]
++goblin = "0.10.7"
++ksuinit = { path = "../ksuinit" }
++libc = "0.2"
++rustix = { version = "1.1.4", default-features = false, features = ["process"] }
++scroll = "0.13.0"
++
++[profile.release]
++strip = true
++opt-level = "z"
++lto = true
++codegen-units = 1
++panic = "abort"
+diff --git a/userspace/lp3_loader/src/lib.rs b/userspace/lp3_loader/src/lib.rs
+new file mode 100644
+index 00000000..9997ca0f
+--- /dev/null
++++ b/userspace/lp3_loader/src/lib.rs
+@@ -0,0 +1,506 @@
++mod symbols;
++
++use goblin::elf::{Elf, section_header, sym::Sym};
++use scroll::{Pwrite, ctx::SizeWith};
++use std::{
++    os::fd::RawFd,
++    ptr,
++    sync::atomic::{AtomicPtr, Ordering},
++    time::Duration,
++};
++use symbols::{HIDDEN_SYMBOLS, KERNEL_LINK_BASE, SYMBOL_LINK_ADDRESSES};
++
++const MODULE: &[u8] = include_bytes!("../../ksud/bin/aarch64/android12-5.10_kernelsu.ko");
++const RESCUE_MODULE: &[u8] = include_bytes!("../bin/lp3_ctlbuf_rescue.ko");
++const INSTALL_MAGIC_1: libc::c_ulong = 0xDEAD_BEEF;
++const INSTALL_MAGIC_2: libc::c_ulong = 0xCAFE_BABE;
++const IOCTL_GRANT_ROOT: libc::c_int = 0x4B01;
++const IOCTL_GET_INFO: libc::c_int = 0x8010_4B02_u32 as libc::c_int;
++const INFO_FLAG_MANAGER: u32 = 1 << 1;
++const UAPI_VERSION: u32 = 4;
++const TARGET_VERMAGIC: &str =
++    "5.10.198-android12-9-g1a2636627c17 SMP preempt mod_unload modversions aarch64";
++static STAGED_MODULE_MAPPING: AtomicPtr<libc::c_void> = AtomicPtr::new(ptr::null_mut());
++
++#[repr(C)]
++#[derive(Default)]
++struct GetInfo {
++    version: u32,
++    flags: u32,
++    features: u32,
++    uapi_version: u32,
++}
++
++fn driver_fd() -> RawFd {
++    let mut fd = -1;
++    unsafe {
++        libc::syscall(
++            libc::SYS_reboot,
++            INSTALL_MAGIC_1,
++            INSTALL_MAGIC_2,
++            0,
++            &raw mut fd,
++        );
++    }
++    fd
++}
++
++fn write_diagnostic(fd: RawFd, message: &str) {
++    if fd < 0 {
++        return;
++    }
++    let mut remaining = message.as_bytes();
++    while !remaining.is_empty() {
++        let written = unsafe { libc::write(fd, remaining.as_ptr().cast(), remaining.len()) };
++        if written <= 0 {
++            return;
++        }
++        remaining = &remaining[written as usize..];
++    }
++    unsafe {
++        libc::fsync(fd);
++    }
++}
++
++fn selinux_context(value: &str) -> &str {
++    value.trim_matches(|character: char| {
++        character == '\0' || character.is_ascii_whitespace()
++    })
++}
++
++fn read_kernel_log() -> Option<String> {
++    const SYSLOG_ACTION_READ_ALL: libc::c_int = 3;
++    const SYSLOG_ACTION_SIZE_BUFFER: libc::c_int = 10;
++    let size = unsafe {
++        libc::klogctl(SYSLOG_ACTION_SIZE_BUFFER, ptr::null_mut(), 0)
++    };
++    if size <= 0 {
++        return None;
++    }
++    let mut buffer = vec![0u8; size as usize + 1];
++    let length = unsafe {
++        libc::klogctl(
++            SYSLOG_ACTION_READ_ALL,
++            buffer.as_mut_ptr().cast(),
++            size,
++        )
++    };
++    if length <= 0 {
++        return None;
++    }
++    buffer.truncate(length as usize);
++    Some(String::from_utf8_lossy(&buffer).into_owned())
++}
++
++struct RelocationError {
++    code: i32,
++}
++
++fn relocation_error(code: i32, _message: impl Into<String>) -> RelocationError {
++    RelocationError { code }
++}
++
++fn relocate_module(kernel_base: u64) -> Result<Vec<u8>, RelocationError> {
++    if kernel_base < 0xffffffc000000000 || kernel_base & 0x1fffff != 0 {
++        return Err(relocation_error(16, "invalid runtime kernel base"));
++    }
++
++    let mut module = MODULE.to_vec();
++    let elf = Elf::parse(&module).map_err(|error| relocation_error(17, error.to_string()))?;
++    let context = *elf.syms.ctx();
++    let mut patches = Vec::with_capacity(SYMBOL_LINK_ADDRESSES.len());
++    let mut resolved = 0usize;
++    for (index, mut symbol) in elf.syms.iter().enumerate() {
++        if index == 0 || symbol.st_shndx != section_header::SHN_UNDEF as usize {
++            continue;
++        }
++        let name = elf
++            .strtab
++            .get_at(symbol.st_name)
++            .ok_or_else(|| relocation_error(18, "unnamed undefined module symbol"))?;
++        if HIDDEN_SYMBOLS.binary_search(&name).is_err() {
++            continue;
++        }
++        let map_index = SYMBOL_LINK_ADDRESSES
++            .binary_search_by_key(&name, |(candidate, _)| *candidate)
++            .map_err(|_| relocation_error(19, format!("missing symbol {name}")))?;
++        let link_address = SYMBOL_LINK_ADDRESSES[map_index].1;
++        let runtime_address =
++            kernel_base
++                .checked_add(link_address.checked_sub(KERNEL_LINK_BASE).ok_or_else(|| {
++                    relocation_error(20, format!("symbol below link base: {name}"))
++                })?)
++                .ok_or_else(|| relocation_error(21, format!("runtime symbol overflow: {name}")))?;
++        symbol.st_shndx = section_header::SHN_ABS as usize;
++        symbol.st_value = runtime_address;
++        let offset = elf.syms.offset() + index * Sym::size_with(elf.syms.ctx());
++        patches.push((offset, symbol));
++        resolved += 1;
++    }
++    if resolved != HIDDEN_SYMBOLS.len() {
++        return Err(relocation_error(
++            22,
++            format!(
++                "resolved {resolved} of {} symbols",
++                HIDDEN_SYMBOLS.len()
++            ),
++        ));
++    }
++    drop(elf);
++    for (offset, symbol) in patches {
++        module
++            .pwrite_with(symbol, offset, context)
++            .map_err(|error| relocation_error(23, error.to_string()))?;
++    }
++    ksuinit::replace_module_vermagic(&mut module, TARGET_VERMAGIC)
++        .map_err(|error| relocation_error(24, format!("{error:#}")))?;
++    Ok(module)
++}
++
++fn replace_fd(fd: RawFd, data: &[u8]) -> Result<(), i32> {
++    if unsafe { libc::ftruncate(fd, data.len() as libc::off_t) } != 0 {
++        return Err(unsafe { *libc::__errno() });
++    }
++    let mut offset = 0usize;
++    while offset < data.len() {
++        let count = unsafe {
++            libc::pwrite(
++                fd,
++                data[offset..].as_ptr().cast(),
++                data.len() - offset,
++                offset as libc::off_t,
++            )
++        };
++        if count < 0 && unsafe { *libc::__errno() } == libc::EINTR {
++            continue;
++        }
++        if count <= 0 {
++            return Err(if count == 0 {
++                libc::EIO
++            } else {
++                unsafe { *libc::__errno() }
++            });
++        }
++        offset += count as usize;
++    }
++    if unsafe { libc::fsync(fd) } != 0 {
++        return Err(unsafe { *libc::__errno() });
++    }
++    Ok(())
++}
++
++fn mapped_rescue() -> Option<&'static mut [u8]> {
++    let mapping = STAGED_MODULE_MAPPING.load(Ordering::Acquire);
++    if mapping.is_null() {
++        return None;
++    }
++    Some(unsafe {
++        std::slice::from_raw_parts_mut(mapping.cast::<u8>(), RESCUE_MODULE.len())
++    })
++}
++
++fn sync_mapping(mapping: &mut [u8]) -> Result<(), i32> {
++    if unsafe {
++        libc::msync(
++            mapping.as_mut_ptr().cast(),
++            mapping.len(),
++            libc::MS_SYNC,
++        )
++    } != 0
++    {
++        return Err(unsafe { *libc::__errno() });
++    }
++    Ok(())
++}
++
++fn restore_rescue_module() -> Result<(), i32> {
++    let mapping = mapped_rescue().ok_or(libc::ENXIO)?;
++    mapping.copy_from_slice(RESCUE_MODULE);
++    sync_mapping(mapping)?;
++    if mapping != RESCUE_MODULE {
++        return Err(libc::EIO);
++    }
++    Ok(())
++}
++
++fn stage_module(rescue_fd: RawFd, kernel_base: u64) -> i32 {
++    let module = match relocate_module(kernel_base) {
++        Ok(module) => module,
++        Err(error) => return error.code,
++    };
++    if module.len() > RESCUE_MODULE.len() ||
++        !STAGED_MODULE_MAPPING.load(Ordering::Acquire).is_null()
++    {
++        return 25;
++    }
++    if unsafe { libc::ftruncate(rescue_fd, RESCUE_MODULE.len() as libc::off_t) } != 0 {
++        return 26;
++    }
++    let mapping = unsafe {
++        libc::mmap(
++            ptr::null_mut(),
++            RESCUE_MODULE.len(),
++            libc::PROT_READ | libc::PROT_WRITE,
++            libc::MAP_SHARED,
++            rescue_fd,
++            0,
++        )
++    };
++    if mapping == libc::MAP_FAILED {
++        return 27;
++    }
++    let bytes = unsafe {
++        std::slice::from_raw_parts_mut(mapping.cast::<u8>(), RESCUE_MODULE.len())
++    };
++    bytes.fill(0);
++    bytes[..module.len()].copy_from_slice(&module);
++    if sync_mapping(bytes).is_err() {
++        unsafe {
++            libc::munmap(mapping, RESCUE_MODULE.len());
++        }
++        let _ = replace_fd(rescue_fd, RESCUE_MODULE);
++        return 28;
++    }
++    STAGED_MODULE_MAPPING.store(mapping, Ordering::Release);
++    0
++}
++
++fn load_staged_module(_rescue_fd: RawFd) -> Result<(), i32> {
++    let mut kmsg = ksuinit::open_kmsg_at_end().ok();
++    let kernel_log_before = read_kernel_log().unwrap_or_default();
++    let mapping = mapped_rescue().ok_or(42)?;
++    let result = unsafe {
++        libc::syscall(
++            libc::SYS_init_module,
++            mapping.as_ptr(),
++            mapping.len(),
++            c"".as_ptr(),
++        )
++    };
++    let load_error = if result == 0 {
++        0
++    } else {
++        unsafe { *libc::__errno() }
++    };
++    let mut logs = kmsg
++        .as_mut()
++        .and_then(|file| ksuinit::read_new_kmsg(file).ok())
++        .unwrap_or_default();
++    if let Some(kernel_log_after) = read_kernel_log() {
++        logs.push_str(
++            kernel_log_after
++                .strip_prefix(&kernel_log_before)
++                .unwrap_or(&kernel_log_after),
++        );
++    }
++    if load_error != 0 {
++        if logs.contains("Unknown symbol") {
++            return Err(36);
++        }
++        if logs.contains("version magic") {
++            return Err(37);
++        }
++        if logs.contains("disagrees about version") {
++            return Err(38);
++        }
++        if logs.contains("signature") || logs.contains("module verification") {
++            return Err(39);
++        }
++        if logs.contains("BTF") || logs.contains("btf") {
++            return Err(40);
++        }
++        if logs.contains("invalid ELF") || logs.contains("Invalid ELF") {
++            return Err(45);
++        }
++        if logs.contains("overflow in relocation") {
++            return Err(46);
++        }
++        if logs.contains("unsupported RELA relocation") {
++            return Err(47);
++        }
++        if logs.contains("module PLT section") {
++            return Err(48);
++        }
++        if logs.contains("module symtab section") {
++            return Err(49);
++        }
++        if logs.contains("invalid WRITE|EXEC") {
++            return Err(50);
++        }
++        if logs.contains("exports duplicate symbol") {
++            return Err(51);
++        }
++        if logs.contains("does not import it") {
++            return Err(52);
++        }
++        if logs.contains("module is already loaded") {
++            return Err(53);
++        }
++        if logs.contains("module has no symbols") {
++            return Err(54);
++        }
++        if logs.contains("No module found in object") {
++            return Err(55);
++        }
++        if logs.contains("module_emit_plt_entry") ||
++            logs.contains("plt_num_entries")
++        {
++            return Err(56);
++        }
++    }
++    match load_error {
++        0 => Ok(()),
++        libc::EPERM => Err(11),
++        libc::EINVAL => Err(12),
++        libc::ENOEXEC => Err(15),
++        libc::ENOKEY => Err(13),
++        libc::EKEYREJECTED => Err(14),
++        libc::EBADMSG => Err(30),
++        libc::EFAULT => Err(31),
++        libc::ENOENT => Err(32),
++        libc::ENOMEM => Err(33),
++        libc::EEXIST => Err(34),
++        _ => Err(load_error),
++    }
++}
++
++fn load(manager_uid: u32, diagnostic_fd: RawFd, rescue_fd: RawFd, _kernel_base: u64) -> i32 {
++    if !(10_000..20_000).contains(&manager_uid) {
++        return 1;
++    }
++
++    if !ksuinit::has_kernelsu() {
++        if let Err(code) = load_staged_module(rescue_fd) {
++            let restore = restore_rescue_module();
++            let restore_ok = restore.is_ok();
++            let restore_error = restore.err().unwrap_or(0);
++            write_diagnostic(
++                diagnostic_fd,
++                &format!(
++                    "LP3_RESUKISU_FINIT_ERROR code={code} restored={} restore_errno={}\n",
++                    i32::from(restore_ok),
++                    restore_error,
++                ),
++            );
++            return if restore_ok { code } else { 43 };
++        }
++    }
++
++    if let Err(error) = restore_rescue_module() {
++        write_diagnostic(
++            diagnostic_fd,
++            &format!("LP3_RESUKISU_RESTORE_ERROR errno={error}\n"),
++        );
++        return 44;
++    }
++
++    let uid = manager_uid as libc::uid_t;
++    let gid = manager_uid as libc::gid_t;
++    unsafe {
++        if libc::setgroups(0, std::ptr::null()) != 0 {
++            return 3;
++        }
++        if libc::setresgid(gid, gid, gid) != 0 {
++            return 4;
++        }
++        if libc::setresuid(uid, uid, uid) != 0 {
++            return 5;
++        }
++    }
++
++    let fd = driver_fd();
++    if fd < 0 {
++        return 6;
++    }
++    let mut recognised = false;
++    for _ in 0..100 {
++        let mut info = GetInfo::default();
++        let result = unsafe { libc::ioctl(fd, IOCTL_GET_INFO, &raw mut info) };
++        if result == 0
++            && info.version != 0
++            && info.flags & INFO_FLAG_MANAGER != 0
++            && info.uapi_version == UAPI_VERSION
++        {
++            recognised = true;
++            break;
++        }
++        std::thread::sleep(Duration::from_millis(50));
++    }
++    if !recognised {
++        unsafe { libc::close(fd) };
++        return 7;
++    }
++    if unsafe { libc::ioctl(fd, IOCTL_GRANT_ROOT, std::ptr::null_mut::<u8>()) } != 0 {
++        unsafe { libc::close(fd) };
++        return 8;
++    }
++    unsafe { libc::close(fd) };
++
++    let context = std::fs::read_to_string("/proc/self/attr/current").unwrap_or_default();
++    let uid = unsafe { libc::getuid() };
++    let gid = unsafe { libc::getgid() };
++    let context = selinux_context(&context);
++    if uid != 0 || gid != 0 || context != "u:r:ksu:s0"
++    {
++        write_diagnostic(
++            diagnostic_fd,
++            &format!(
++                "LP3_RESUKISU_IDENTITY_ERROR uid={uid} gid={gid} context={context:?}\n"
++            ),
++        );
++        return 9;
++    }
++    write_diagnostic(
++        diagnostic_fd,
++        &format!(
++            "LP3_RESUKISU_IDENTITY_PASS uid={uid} gid={gid} context={context}\n"
++        ),
++    );
++    0
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn lp3_resukisu_probe() -> u32 {
++    0x4C50_3352
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn lp3_resukisu_relocate_probe(kernel_base: u64) -> i32 {
++    match relocate_module(kernel_base) {
++        Ok(_) => 0,
++        Err(error) => error.code,
++    }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn lp3_resukisu_stage(rescue_fd: RawFd, kernel_base: u64) -> i32 {
++    stage_module(rescue_fd, kernel_base)
++}
++
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn lp3_resukisu_replace(data: *const u8, length: usize) -> i32 {
++    if data.is_null() || length == 0 || length > RESCUE_MODULE.len() {
++        return libc::EINVAL;
++    }
++    let Some(mapping) = mapped_rescue() else {
++        return libc::ENXIO;
++    };
++    let source = unsafe { std::slice::from_raw_parts(data, length) };
++    mapping[..length].copy_from_slice(source);
++    mapping[length..].fill(0);
++    match sync_mapping(mapping) {
++        Ok(()) => 0,
++        Err(error) => error,
++    }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn lp3_resukisu_load(
++    manager_uid: u32,
++    diagnostic_fd: RawFd,
++    rescue_fd: RawFd,
++    kernel_base: u64,
++) -> i32 {
++    load(manager_uid, diagnostic_fd, rescue_fd, kernel_base)
++
++}
+diff --git a/userspace/lp3_loader/src/symbols.rs b/userspace/lp3_loader/src/symbols.rs
+new file mode 100644
+index 00000000..72093939
+--- /dev/null
++++ b/userspace/lp3_loader/src/symbols.rs
+@@ -0,0 +1,309 @@
++pub const KERNEL_LINK_BASE: u64 = 0xffffffc008000000;
++
++pub const SYMBOL_LINK_ADDRESSES: &[(&str, u64)] = &[
++    ("__alloc_pages_nodemask", 0xffffffc0084afebc),
++    ("__arch_copy_from_user", 0xffffffc00801ecc0),
++    ("__arch_copy_to_user", 0xffffffc00801f280),
++    ("__arm64_sys_close", 0xffffffc00853c640),
++    ("__arm64_sys_setns", 0xffffffc00817f958),
++    ("__bitmap_andnot", 0xffffffc0089cc4fc),
++    ("__cfi_slowpath", 0xffffffc0083cdca4),
++    ("__check_object_size", 0xffffffc008537650),
++    ("__close_fd", 0xffffffc0085889a8),
++    ("__cpu_online_mask", 0xffffffc00a779dd8),
++    ("__flush_dcache_area", 0xffffffc0080162c0),
++    ("__flush_icache_range", 0xffffffc008016128),
++    ("__free_pages", 0xffffffc0084b1760),
++    ("__get_task_comm", 0xffffffc008550344),
++    ("__hashtab_insert", 0xffffffc0088d18e4),
++    ("__init_waitqueue_head", 0xffffffc0081cc384),
++    ("__kmalloc", 0xffffffc0084e2d20),
++    ("__list_add_valid", 0xffffffc0089f42f0),
++    ("__list_del_entry_valid", 0xffffffc0089f421c),
++    ("__mutex_init", 0xffffffc0081e19ac),
++    ("__num_online_cpus", 0xffffffc00a779de0),
++    ("__put_cred", 0xffffffc0081831b8),
++    ("__put_task_struct", 0xffffffc008125028),
++    ("__rcu_read_lock", 0xffffffc00823e744),
++    ("__rcu_read_unlock", 0xffffffc00823e4d4),
++    ("__set_fixmap", 0xffffffc0080acea0),
++    ("__stack_chk_fail", 0xffffffc00973e2a0),
++    ("__task_pid_nr_ns", 0xffffffc008175a30),
++    ("__tracepoint_sys_enter", 0xffffffc00a90c9b8),
++    ("__wake_up", 0xffffffc0081cc194),
++    ("_copy_to_iter", 0xffffffc0089d122c),
++    ("_raw_read_lock", 0xffffffc009a0fca8),
++    ("_raw_read_unlock", 0xffffffc009a0f8f0),
++    ("_raw_spin_lock", 0xffffffc009a0f658),
++    ("_raw_spin_lock_irq", 0xffffffc009a0f518),
++    ("_raw_spin_lock_irqsave", 0xffffffc009a0f454),
++    ("_raw_spin_unlock", 0xffffffc009a0f208),
++    ("_raw_spin_unlock_irq", 0xffffffc009a0f134),
++    ("_raw_spin_unlock_irqrestore", 0xffffffc009a0f094),
++    ("_raw_write_lock_irq", 0xffffffc009a0eecc),
++    ("_raw_write_unlock_irq", 0xffffffc009a0eb88),
++    ("abort_creds", 0xffffffc008183bec),
++    ("alloc_anon_inode", 0xffffffc0085a32e4),
++    ("alloc_file_pseudo", 0xffffffc0085446bc),
++    ("alloc_uid", 0xffffffc00814c550),
++    ("anon_inode_getfile", 0xffffffc0085f1b98),
++    ("arm64_const_caps_ready", 0xffffffc00a97dac0),
++    ("arm64_use_ng_mappings", 0xffffffc00a97dab8),
++    ("avc_has_perm", 0xffffffc0088ba56c),
++    ("avc_ss_reset", 0xffffffc0088b7e08),
++    ("avtab_alloc", 0xffffffc0088d48cc),
++    ("avtab_destroy", 0xffffffc0088d47d0),
++    ("avtab_insert_nonunique", 0xffffffc0088d429c),
++    ("avtab_search_node", 0xffffffc0088d4620),
++    ("avtab_search_node_next", 0xffffffc0088d4758),
++    ("bcmp", 0xffffffc008a7276c),
++    ("bin2hex", 0xffffffc0089dfa10),
++    ("bitmap_free", 0xffffffc0089cbd88),
++    ("bitmap_zalloc", 0xffffffc0089cb0a4),
++    ("change_pid", 0xffffffc008176924),
++    ("commit_creds", 0xffffffc0081843d0),
++    ("copy_from_user_nofault", 0xffffffc008414cb8),
++    ("copy_to_kernel_nofault", 0xffffffc008414a58),
++    ("copy_to_user_nofault", 0xffffffc008414fa8),
++    ("cpu_hwcap_keys", 0xffffffc00a97d5f8),
++    ("cpu_hwcaps", 0xffffffc00a97d5e8),
++    ("crypto_alloc_shash", 0xffffffc0088f81a4),
++    ("crypto_destroy_tfm", 0xffffffc0088ec080),
++    ("crypto_shash_digest", 0xffffffc0088f7d6c),
++    ("d_path", 0xffffffc0085c000c),
++    ("dentry_open", 0xffffffc00853ddf4),
++    ("do_syslog", 0xffffffc0081f59f4),
++    ("down_read", 0xffffffc009a09d80),
++    ("down_write", 0xffffffc009a08a34),
++    ("ebitmap_get_bit", 0xffffffc0088d0e30),
++    ("ebitmap_set_bit", 0xffffffc0088d0bf8),
++    ("ext4_unregister_sysfs", 0xffffffc00872e9c8),
++    ("fd_install", 0xffffffc0085888cc),
++    ("fget", 0xffffffc0085888a0),
++    ("filp_close", 0xffffffc00853d138),
++    ("filp_open", 0xffffffc00853d004),
++    ("find_next_bit", 0xffffffc0089d6ab0),
++    ("find_pid_ns", 0xffffffc008175978),
++    ("find_task_by_vpid", 0xffffffc008175890),
++    ("find_vpid", 0xffffffc0081757c0),
++    ("finish_wait", 0xffffffc0081cb440),
++    ("fput", 0xffffffc008543a98),
++    ("free_uid", 0xffffffc00814c184),
++    ("fsnotify_add_mark", 0xffffffc0085e8e6c),
++    ("fsnotify_alloc_group", 0xffffffc0085e685c),
++    ("fsnotify_destroy_mark", 0xffffffc0085e8194),
++    ("fsnotify_init_mark", 0xffffffc0085e9f24),
++    ("fsnotify_put_group", 0xffffffc0085e64a4),
++    ("fsnotify_put_mark", 0xffffffc0085e6cd8),
++    ("generic_file_llseek", 0xffffffc008542ac8),
++    ("get_pid_task", 0xffffffc00817539c),
++    ("get_random_bytes", 0xffffffc008bcb350),
++    ("get_task_cred", 0xffffffc008183a88),
++    ("get_unused_fd_flags", 0xffffffc008588858),
++    ("gic_nonsecure_priorities", 0xffffffc00aa48b18),
++    ("groups_alloc", 0xffffffc00818b220),
++    ("groups_free", 0xffffffc00818b8c8),
++    ("groups_sort", 0xffffffc00818b914),
++    ("ihold", 0xffffffc00858141c),
++    ("init_mm", 0xffffffc00a840428),
++    ("init_pid_ns", 0xffffffc00a7a07a0),
++    ("init_task", 0xffffffc00a78bec0),
++    ("init_wait_entry", 0xffffffc0081cb410),
++    ("install_session_keyring_to_cred", 0xffffffc0088a5910),
++    ("iput", 0xffffffc00857e3fc),
++    ("iterate_dir", 0xffffffc00856a5c8),
++    ("kallsyms_lookup", 0xffffffc0082ab388),
++    ("kallsyms_lookup_name", 0xffffffc0082abd08),
++    ("kallsyms_lookup_size_offset", 0xffffffc0082ac120),
++    ("kasan_flag_enabled", 0xffffffc00a9b2900),
++    ("kern_path", 0xffffffc00856046c),
++    ("kernel_read", 0xffffffc008542f1c),
++    ("kernel_write", 0xffffffc008543238),
++    ("kfree", 0xffffffc0084dd220),
++    ("kmalloc_caches", 0xffffffc00a2e7660),
++    ("kmem_cache_alloc_trace", 0xffffffc0084df400),
++    ("kmemdup", 0xffffffc00844ca2c),
++    ("kobject_del", 0xffffffc008a68ebc),
++    ("krealloc", 0xffffffc008461edc),
++    ("kstrdup", 0xffffffc00844c8e4),
++    ("kstrtouint", 0xffffffc0089e0054),
++    ("ksys_unshare", 0xffffffc0081279e8),
++    ("kthread_create_on_node", 0xffffffc00817d894),
++    ("ktime_get", 0xffffffc00826a090),
++    ("kvfree", 0xffffffc00844c720),
++    ("kvfree_call_rcu", 0xffffffc00823dd64),
++    ("kvmalloc_node", 0xffffffc00844ba94),
++    ("memchr", 0xffffffc00801f498),
++    ("memcpy", 0xffffffc00801f680),
++    ("memset", 0xffffffc00801f980),
++    ("memstart_addr", 0xffffffc00a2e7448),
++    ("mnt_drop_write", 0xffffffc0085970dc),
++    ("mnt_want_write", 0xffffffc008597054),
++    ("mntns_operations", 0xffffffc00a154660),
++    ("module_put", 0xffffffc0082a5f14),
++    ("mutex_lock", 0xffffffc009a08158),
++    ("mutex_lock_interruptible", 0xffffffc009a07f9c),
++    ("mutex_unlock", 0xffffffc009a047b0),
++    ("noop_llseek", 0xffffffc00854272c),
++    ("ns_get_path", 0xffffffc0085c4214),
++    ("override_creds", 0xffffffc0081848f4),
++    ("param_ops_bool", 0xffffffc00a13dfc0),
++    ("param_ops_string", 0xffffffc00a13dee0),
++    ("path_get", 0xffffffc0085607e4),
++    ("path_mount", 0xffffffc008593690),
++    ("path_put", 0xffffffc00855ffd0),
++    ("path_umount", 0xffffffc00858bd50),
++    ("policydb_destroy", 0xffffffc0088d5804),
++    ("policydb_filenametr_search", 0xffffffc0088d54cc),
++    ("policydb_load_isids", 0xffffffc0088d70d0),
++    ("policydb_read", 0xffffffc0088d74d8),
++    ("policydb_write", 0xffffffc0088db410),
++    ("prepare_creds", 0xffffffc008183cbc),
++    ("prepare_to_wait_event", 0xffffffc0081cb000),
++    ("printk", 0xffffffc0081f63ac),
++    ("put_unused_fd", 0xffffffc0085884b4),
++    ("queue_work_on", 0xffffffc008169f5c),
++    ("refcount_warn_saturate", 0xffffffc0089dd25c),
++    ("register_kprobe", 0xffffffc0082f308c),
++    ("register_kretprobe", 0xffffffc0082f2c60),
++    ("revert_creds", 0xffffffc008184a90),
++    ("schedule", 0xffffffc009a02ae4),
++    ("scnprintf", 0xffffffc008a79eac),
++    ("seccomp_filter_release", 0xffffffc0082f92b4),
++    ("security_compute_av_user", 0xffffffc0088dfa18),
++    ("security_context_str_to_sid", 0xffffffc0088e0574),
++    ("security_context_to_sid", 0xffffffc0088dff74),
++    ("security_inode_init_security_anon", 0xffffffc0088af2b8),
++    ("security_release_secctx", 0xffffffc0088b3d70),
++    ("security_secctx_to_secid", 0xffffffc0088b3cb4),
++    ("security_secid_to_secctx", 0xffffffc0088b3c00),
++    ("security_sid_to_context", 0xffffffc0088dfcd4),
++    ("selinux_blob_sizes", 0xffffffc00a2e81b8),
++    ("selinux_state", 0xffffffc00aa30b98),
++    ("selinux_status_update_policyload", 0xffffffc0088d06c0),
++    ("selnl_notify_policyload", 0xffffffc0088cf114),
++    ("set_fs_pwd", 0xffffffc0085c0844),
++    ("set_groups", 0xffffffc00818ba80),
++    ("sidtab_destroy", 0xffffffc0088d3b90),
++    ("snprintf", 0xffffffc008a79604),
++    ("sscanf", 0xffffffc008a794f8),
++    ("static_key_count", 0xffffffc0083fe194),
++    ("static_key_disable", 0xffffffc0083fdb78),
++    ("static_key_enable", 0xffffffc0083fe1b0),
++    ("stop_machine", 0xffffffc0082d7e54),
++    ("strchr", 0xffffffc00801fb08),
++    ("strcmp", 0xffffffc00801fb30),
++    ("strlen", 0xffffffc00801fc88),
++    ("strncmp", 0xffffffc00801fd10),
++    ("strncpy", 0xffffffc008a72150),
++    ("strncpy_from_user", 0xffffffc008a566dc),
++    ("strncpy_from_user_nofault", 0xffffffc008415298),
++    ("strnlen", 0xffffffc00801ff1c),
++    ("strscpy", 0xffffffc008a71f5c),
++    ("strsep", 0xffffffc008a71db8),
++    ("strstr", 0xffffffc008a71cd8),
++    ("symtab_insert", 0xffffffc0088d1db4),
++    ("symtab_search", 0xffffffc0088d1f6c),
++    ("synchronize_rcu", 0xffffffc00823b0f0),
++    ("synchronize_srcu", 0xffffffc008230600),
++    ("system_wq", 0xffffffc00a779e00),
++    ("task_work_add", 0xffffffc008177124),
++    ("tasklist_lock", 0xffffffc00a775040),
++    ("tracepoint_probe_register_prio", 0xffffffc0082fd7b0),
++    ("tracepoint_probe_unregister", 0xffffffc0082fd1bc),
++    ("tracepoint_srcu", 0xffffffc00a8235b0),
++    ("try_module_get", 0xffffffc0082a7a68),
++    ("unregister_kprobe", 0xffffffc0082f2a20),
++    ("unregister_kretprobe", 0xffffffc0082f24fc),
++    ("up_read", 0xffffffc0081e2f68),
++    ("up_write", 0xffffffc0081e2410),
++    ("vfree", 0xffffffc0084a8cac),
++    ("vmalloc", 0xffffffc0084a75e8),
++    ("wake_up_process", 0xffffffc00819955c),
++];
++
++pub const HIDDEN_SYMBOLS: &[&str] = &[
++    "__arm64_sys_close",
++    "__arm64_sys_setns",
++    "__flush_dcache_area",
++    "__hashtab_insert",
++    "__put_cred",
++    "__set_fixmap",
++    "__tracepoint_sys_enter",
++    "abort_creds",
++    "alloc_file_pseudo",
++    "alloc_uid",
++    "avc_has_perm",
++    "avc_ss_reset",
++    "avtab_alloc",
++    "avtab_destroy",
++    "avtab_insert_nonunique",
++    "avtab_search_node",
++    "avtab_search_node_next",
++    "change_pid",
++    "commit_creds",
++    "copy_from_user_nofault",
++    "copy_to_kernel_nofault",
++    "copy_to_user_nofault",
++    "dentry_open",
++    "do_syslog",
++    "ebitmap_get_bit",
++    "ebitmap_set_bit",
++    "ext4_unregister_sysfs",
++    "fsnotify_add_mark",
++    "fsnotify_alloc_group",
++    "fsnotify_destroy_mark",
++    "fsnotify_init_mark",
++    "fsnotify_put_group",
++    "fsnotify_put_mark",
++    "get_task_cred",
++    "groups_alloc",
++    "groups_free",
++    "groups_sort",
++    "init_mm",
++    "install_session_keyring_to_cred",
++    "iterate_dir",
++    "kallsyms_lookup",
++    "kallsyms_lookup_name",
++    "kallsyms_lookup_size_offset",
++    "kernel_read",
++    "kernel_write",
++    "ksys_unshare",
++    "mnt_drop_write",
++    "mnt_want_write",
++    "mntns_operations",
++    "ns_get_path",
++    "override_creds",
++    "path_get",
++    "path_mount",
++    "path_umount",
++    "policydb_destroy",
++    "policydb_filenametr_search",
++    "policydb_load_isids",
++    "policydb_read",
++    "policydb_write",
++    "prepare_creds",
++    "revert_creds",
++    "seccomp_filter_release",
++    "security_compute_av_user",
++    "security_context_str_to_sid",
++    "security_context_to_sid",
++    "security_inode_init_security_anon",
++    "security_release_secctx",
++    "security_secctx_to_secid",
++    "security_secid_to_secctx",
++    "security_sid_to_context",
++    "selinux_blob_sizes",
++    "selinux_state",
++    "selinux_status_update_policyload",
++    "selnl_notify_policyload",
++    "set_fs_pwd",
++    "set_groups",
++    "sidtab_destroy",
++    "static_key_count",
++    "static_key_enable",
++    "strncpy_from_user_nofault",
++    "symtab_insert",
++    "symtab_search",
++    "task_work_add",
++];

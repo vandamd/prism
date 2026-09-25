@@ -54,15 +54,20 @@ final class ReSukiSuActivationController {
 
     private static final Payload[] PAYLOADS = {
             new Payload(
+                    "prism-primitive",
+                    "/data/local/tmp/prism-primitive",
+                    899_472L,
+                    "c8f9a0ac3fda8da8ed6c7e943daed4cb5ac73fd6b348468d065d3e35e42e3042"),
+            new Payload(
                     "lp3-resukisu-ksud",
                     "/data/local/tmp/lp3-resukisu-ksud",
-                    4_215_752L,
-                    "ceb8f4741ef4fba52e080828105771080bf9a5325b8e56454e121a968fb83d60"),
+                    4_238_456L,
+                    "801c9ec9775f86b7dff1f0fe472ab1127684a4a18f1c8ff9692c0594a39b5db4"),
             new Payload(
                     "lp3-resukisu-loader.so",
                     "/data/local/tmp/lp3-resukisu-loader.so",
-                    1_323_008L,
-                    "4922e1508c769c90f8734fd3914a31021aed4503f0743cb80b396c13a9f3e2ef"),
+                    1_308_056L,
+                    "70e4d7458a327874f38c657ea60f65d31712cd481f994855d093b28b1eed7b0f"),
     };
 
     private final Context context;
@@ -837,7 +842,7 @@ final class ReSukiSuActivationController {
             throw new GateException(
                     "active-check", "Unable to query the ReSukiSU kernel state");
         }
-        if ("Kernel Version: 35088".equals(version)) {
+        if ("Kernel Version: 35171".equals(version)) {
             return true;
         }
         if ("Kernel Version: 0".equals(version)) {

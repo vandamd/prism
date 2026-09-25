@@ -57,8 +57,8 @@ std::uint64_t monotonic_nanoseconds() {
             : 0;
 }
 
-constexpr off_t kReSukiLoaderSize = 1'323'008;
-constexpr off_t kReSukiExecutableSize = 4'215'752;
+constexpr off_t kReSukiLoaderSize = 1'308'056;
+constexpr off_t kReSukiExecutableSize = 4'238'456;
 constexpr char kCompletionPrefix[] =
         "/data/local/tmp/lp3-ksud-completion.";
 constexpr std::uint64_t kKernelLinkBase = UINT64_C(0xffffffc008000000);

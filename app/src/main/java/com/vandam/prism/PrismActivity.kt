@@ -18,7 +18,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.activity.viewModels
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.collectAsState
 import androidx.core.content.FileProvider
@@ -83,8 +82,7 @@ class PrismActivity : ComponentActivity() {
         window.addOnFrameMetricsAvailableListener(frameMetricsListener, frameMetricsHandler)
         setContent {
             val state by viewModel.state.collectAsState()
-            val isDark = isSystemInDarkTheme()
-            PrismTheme(isDark = isDark) {
+            PrismTheme {
                 PrismScreen(
                     state = state,
                     onPrimaryAction = { perform(state.action) },
@@ -108,12 +106,9 @@ class PrismActivity : ComponentActivity() {
         super.onResume()
         activeFrameReported.set(false)
         if (activeStateLaidOut.get()) requestActiveFrameReport()
-        val dark = resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK ==
-            android.content.res.Configuration.UI_MODE_NIGHT_YES
-        window.statusBarColor = if (dark) Color.BLACK else Color.WHITE
-        window.navigationBarColor = if (dark) Color.BLACK else Color.WHITE
-        window.decorView.systemUiVisibility =
-            if (dark) 0 else android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
+        window.decorView.systemUiVisibility = 0
         if (downloadJob?.isActive != true) viewModel.refresh()
     }
 

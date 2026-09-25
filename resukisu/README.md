@@ -5,7 +5,13 @@ Light Phone III late-load payload. The workflow loads a module into the running
 kernel. It does not unlock the bootloader, flash a partition, or erase user
 data.
 
-## Exact inputs
+## Current rc3 build
+
+The bundled payload now targets the official ReSukiSU v4.2.0-rc3 manager and
+UAPI 4. See [the rc3 build notes](rc3.md) for the source patch, hashes and
+on-device validation. The rc1 recipe below is retained as historical context.
+
+## Previous rc1 build
 
 - ReSukiSU commit: `746686390b0cf2256818a97b2f620eadbd079995`
 - Device kernel: `5.10.198-android12-9-g1a2636627c17`

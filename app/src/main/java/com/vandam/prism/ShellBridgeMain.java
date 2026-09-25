@@ -143,13 +143,13 @@ public final class ShellBridgeMain {
     private static final String RESUKISU_PATH =
             "/data/local/tmp/lp3-resukisu-ksud";
     private static final String RESUKISU_SHA256 =
-            "ceb8f4741ef4fba52e080828105771080bf9a5325b8e56454e121a968fb83d60";
-    private static final long RESUKISU_SIZE = 4_215_752L;
+            "801c9ec9775f86b7dff1f0fe472ab1127684a4a18f1c8ff9692c0594a39b5db4";
+    private static final long RESUKISU_SIZE = 4_238_456L;
     private static final String RESUKISU_LOADER_PATH =
             "/data/local/tmp/lp3-resukisu-loader.so";
     private static final String RESUKISU_LOADER_SHA256 =
-            "4922e1508c769c90f8734fd3914a31021aed4503f0743cb80b396c13a9f3e2ef";
-    private static final long RESUKISU_LOADER_SIZE = 1_323_008L;
+            "70e4d7458a327874f38c657ea60f65d31712cd481f994855d093b28b1eed7b0f";
+    private static final long RESUKISU_LOADER_SIZE = 1_308_056L;
     private static FileDescriptor reSukiFd;
     private static final String COMMAND_TOKEN =
             "/data/local/tmp/light-side-su.token";

@@ -2,7 +2,6 @@ package com.vandam.prism
 
 import android.content.Context
 import android.content.pm.PackageManager
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -17,8 +16,8 @@ enum class ReleasePackage {
 object ReleaseInstaller {
     private const val SHIZUKU_RELEASE_URL =
         "https://api.github.com/repos/RikkaApps/Shizuku/releases/latest"
-    private const val RESUKISU_RELEASES_URL =
-        "https://api.github.com/repos/ReSukiSU/ReSukiSU/releases?per_page=10"
+    private const val RESUKISU_RELEASE_URL =
+        "https://api.github.com/repos/ReSukiSU/ReSukiSU/releases/tags/v4.2.0-rc3"
     private const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
     private const val RESUKISU_PACKAGE = "com.resukisu.resukisu"
     private const val SHIZUKU_CERTIFICATE =
@@ -72,13 +71,7 @@ object ReleaseInstaller {
     }
 
     private fun reSukiSURelease(): ReleaseAsset {
-        val releases = JSONArray(request(RESUKISU_RELEASES_URL))
-        val release =
-            (0 until releases.length())
-                .map(releases::getJSONObject)
-                .filterNot { it.getBoolean("draft") }
-                .maxByOrNull { it.getString("published_at") }
-                ?: error("ReSukiSU does not have a published release")
+        val release = JSONObject(request(RESUKISU_RELEASE_URL))
         return selectAsset(release) { name ->
             name.startsWith("ReSukiSU_") && name.endsWith("-arm64-v8a-release.apk")
         }

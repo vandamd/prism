@@ -2,6 +2,7 @@ package com.vandam.prism.ui
 
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.MaterialTheme
+import androidx.compose.material.darkColors
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Immutable
@@ -42,10 +43,9 @@ private val LocalPrismBackground = staticCompositionLocalOf { Color.Unspecified 
 @OptIn(ExperimentalTextApi::class)
 @Composable
 fun PrismTheme(
-    isDark: Boolean,
     content: @Composable () -> Unit,
 ) {
-    val textColour = if (isDark) Color.White else Color.Black
+    val textColour = Color.White
     val font = FontFamily(Font(R.font.public_sans))
     val logFont = FontFamily(Font(R.font.jetbrains_mono_regular))
     val typography =
@@ -84,9 +84,9 @@ fun PrismTheme(
 
     CompositionLocalProvider(
         LocalPrismTypography provides typography,
-        LocalPrismBackground provides if (isDark) Color.Black else Color.White,
+        LocalPrismBackground provides Color.Black,
     ) {
-        MaterialTheme(shapes = MaterialTheme.shapes.copy(medium = RoundedCornerShape(10.dp)), content = content)
+        MaterialTheme(colors = darkColors(), shapes = MaterialTheme.shapes.copy(medium = RoundedCornerShape(10.dp)), content = content)
     }
 }
 
